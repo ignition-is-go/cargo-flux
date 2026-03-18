@@ -4,7 +4,6 @@ use crate::tasks::TaskRegistry;
 use anyhow::{Result, anyhow, bail};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-use std::io::IsTerminal;
 
 #[derive(Debug)]
 pub struct WorkspaceGraph {
@@ -23,7 +22,7 @@ impl WorkspaceGraph {
     pub fn render_tree(&self) -> Result<String> {
         let _ = self.topological_order()?;
         let dependent_counts = self.dependent_counts();
-        let use_color = std::io::stdout().is_terminal();
+        let use_color = output_uses_color();
         let roots = self
             .packages
             .keys()
@@ -113,7 +112,7 @@ impl WorkspaceGraph {
         let roots = self.materialize_display_roots(&roots, &plan, tasks)?;
 
         let mut lines = Vec::new();
-        let use_color = std::io::stdout().is_terminal();
+        let use_color = output_uses_color();
         for (index, root) in roots.iter().enumerate() {
             let is_last_root = index + 1 == roots.len();
             self.render_plan_display_node(root, "", is_last_root, true, use_color, &mut lines);
@@ -933,6 +932,18 @@ impl WorkspaceGraph {
             let child_is_last = index + 1 == package.internal_dependencies.len();
             self.render_package(dep, &child_prefix, child_is_last, false, use_color, lines);
         }
+    }
+}
+
+fn output_uses_color() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+
+    #[cfg(not(test))]
+    {
+        std::io::stdout().is_terminal()
     }
 }
 
@@ -1948,8 +1959,8 @@ npm = ["npm", "run", "publish-docker"]
 
         let rust_dep = pkg("rust-dep", vec![], vec![], vec![]);
         let web = Package {
-            id: PackageId::new(Ecosystem::Js, "@myko/rs"),
-            name: "@myko/rs".into(),
+            id: PackageId::new(Ecosystem::Js, "@scope/web-bridge"),
+            name: "@scope/web-bridge".into(),
             ecosystem: Ecosystem::Js,
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
@@ -1964,7 +1975,7 @@ npm = ["npm", "run", "publish-docker"]
             manifest_path: PathBuf::from("app/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["publish-docker"]),
-            bridged_dependencies: vec![bridge("js:@myko/rs")],
+            bridged_dependencies: vec![bridge("js:@scope/web-bridge")],
             internal_dependencies: vec![],
         };
 
@@ -1995,23 +2006,23 @@ npm = ["npm", "run", "publish-docker"]
         .expect("write config");
 
         let rust_dep = Package {
-            id: PackageId::new(Ecosystem::Cargo, "myko-rs"),
-            name: "myko-rs".into(),
+            id: PackageId::new(Ecosystem::Cargo, "rust-bridge"),
+            name: "rust-bridge".into(),
             ecosystem: Ecosystem::Cargo,
-            manifest_path: PathBuf::from("myko-rs/Cargo.toml"),
+            manifest_path: PathBuf::from("rust-bridge/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: Default::default(),
             bridged_dependencies: vec![],
             internal_dependencies: vec![],
         };
         let web = Package {
-            id: PackageId::new(Ecosystem::Js, "@myko/rs"),
-            name: "@myko/rs".into(),
+            id: PackageId::new(Ecosystem::Js, "@scope/web-bridge"),
+            name: "@scope/web-bridge".into(),
             ecosystem: Ecosystem::Js,
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
-            bridged_dependencies: vec![bridge("cargo:myko-rs")],
+            bridged_dependencies: vec![bridge("cargo:rust-bridge")],
             internal_dependencies: vec![],
         };
         let app = Package {
@@ -2021,7 +2032,7 @@ npm = ["npm", "run", "publish-docker"]
             manifest_path: PathBuf::from("app/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["publish-docker"]),
-            bridged_dependencies: vec![bridge("js:@myko/rs")],
+            bridged_dependencies: vec![bridge("js:@scope/web-bridge")],
             internal_dependencies: vec![],
         };
 
@@ -2325,10 +2336,10 @@ npm = ["npm", "run", "build"]
 
     #[test]
     fn styles_task_labels_with_bridge_suffix_without_corrupting_brackets() {
-        let rendered = style_task_label("myko-rs:gen [cargo] (bridge cargo:myko-rs)", true);
+        let rendered = style_task_label("rust-bridge:gen [cargo] (bridge cargo:rust-bridge)", true);
 
-        assert!(rendered.contains("(bridge cargo:myko-rs)"));
-        assert!(!rendered.contains("(bridge cargo:myko-rs)]"));
+        assert!(rendered.contains("(bridge cargo:rust-bridge)"));
+        assert!(!rendered.contains("(bridge cargo:rust-bridge)]"));
     }
 
     fn pkg(

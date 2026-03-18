@@ -876,9 +876,9 @@ tasks = ["test"]
         fs::write(
             root.join("package.json"),
             r#"{
-  "name": "@rship/ui",
+  "name": "@scope/ui",
   "flux": {
-    "bridges": ["cargo:myko-rs"]
+    "bridges": ["cargo:rust-bridge"]
   }
 }"#,
         )
@@ -887,14 +887,14 @@ tasks = ["test"]
         let package = discover_packages(&root)
             .expect("discover packages")
             .into_iter()
-            .find(|pkg| pkg.name == "@rship/ui")
+            .find(|pkg| pkg.name == "@scope/ui")
             .expect("web package");
 
         assert_eq!(
             package.bridged_dependencies,
             vec![BridgeTarget {
                 ecosystem: Some(Ecosystem::Cargo),
-                package_name: "myko-rs".to_string(),
+                package_name: "rust-bridge".to_string(),
             }]
         );
     }
