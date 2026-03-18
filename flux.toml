@@ -1,0 +1,14 @@
+[tasks.build]
+cargo = ["cargo", "build"]
+npm = ["npm", "run", "build"]
+uv = ["uv", "run", "python", "-m", "build"]
+
+[tasks.test]
+cargo = ["cargo", "test"]
+npm = ["npm", "test"]
+uv = ["uv", "run", "pytest"]
+
+[tasks.lint]
+cargo = ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+npm = ["npm", "run", "lint"]
+uv = ["uv", "run", "ruff", "check", "."]
