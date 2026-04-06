@@ -164,7 +164,7 @@ Combine `version`, `stamp`, and a release task to create a self-publishing workf
 main = "production"
 
 [tasks.release]
-cargo = "VERSION=$(cargo flux version) && cargo flux stamp \"$VERSION\" && cargo fmt --all && git add -A && git commit -m \"chore(release): $VERSION\" && git tag \"v$VERSION\" -m \"Release $VERSION\" && git push origin HEAD \"v$VERSION\" && cargo publish"
+cargo = "VERSION=$(cargo flux version) && cargo flux stamp \"$VERSION\" && cargo update --workspace && cargo fmt --all && git add -A && git commit -m \"chore(release): $VERSION\" && git tag \"v$VERSION\" -m \"Release $VERSION\" && git push origin HEAD \"v$VERSION\" && cargo publish"
 ```
 
 Then run:
