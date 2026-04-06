@@ -83,12 +83,13 @@ pub struct BridgeTarget {
 impl BridgeTarget {
     pub fn parse(value: &str) -> Result<Self> {
         if let Some((prefix, package_name)) = value.split_once(':')
-            && let Ok(ecosystem) = prefix.parse::<Ecosystem>() {
-                return Ok(Self {
-                    ecosystem: Some(ecosystem),
-                    package_name: package_name.to_string(),
-                });
-            }
+            && let Ok(ecosystem) = prefix.parse::<Ecosystem>()
+        {
+            return Ok(Self {
+                ecosystem: Some(ecosystem),
+                package_name: package_name.to_string(),
+            });
+        }
 
         Ok(Self {
             ecosystem: None,
@@ -278,12 +279,16 @@ fn resolve_internal_dependencies(raw_packages: Vec<RawPackage>) -> WorkspaceDisc
         .into_iter()
         .map(|pkg| {
             let candidates = names_by_ecosystem.get(&pkg.id.ecosystem);
-            warnings.extend(pkg.warned_declared_dependencies.iter().filter(|&dep| candidates
-                    .is_some_and(|names| names.contains(&dep.name))).map(|dep| WorkspaceWarning {
+            warnings.extend(
+                pkg.warned_declared_dependencies
+                    .iter()
+                    .filter(|&dep| candidates.is_some_and(|names| names.contains(&dep.name)))
+                    .map(|dep| WorkspaceWarning {
                         package_id: pkg.id.clone(),
                         dependency_id: PackageId::new(pkg.id.ecosystem, dep.name.clone()),
                         section: dep.section.clone(),
-                    }));
+                    }),
+            );
             let internal_dependencies = pkg
                 .declared_dependencies
                 .into_iter()

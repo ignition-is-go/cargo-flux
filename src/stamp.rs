@@ -14,11 +14,10 @@ pub fn stamp_all(root: &Path, packages: &[Package], version: &str) -> Result<Vec
 
     // Stamp root Cargo.toml (handles virtual workspaces with [workspace.package] version)
     let root_cargo = root.join("Cargo.toml");
-    if root_cargo.exists()
-        && stamp_cargo_toml(&root_cargo, version)? {
-            modified.push(root_cargo.display().to_string());
-            stamped_paths.insert(root_cargo);
-        }
+    if root_cargo.exists() && stamp_cargo_toml(&root_cargo, version)? {
+        modified.push(root_cargo.display().to_string());
+        stamped_paths.insert(root_cargo);
+    }
 
     for package in packages {
         let path = &package.manifest_path;
@@ -50,10 +49,11 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
 
     // Update [package] version
     if let Some(pkg) = doc.get_mut("package").and_then(|p| p.as_table_mut())
-        && pkg.contains_key("version") {
-            pkg["version"] = toml_edit::value(version);
-            modified = true;
-        }
+        && pkg.contains_key("version")
+    {
+        pkg["version"] = toml_edit::value(version);
+        modified = true;
+    }
 
     // Update [workspace.package] version
     if let Some(ws_pkg) = doc
@@ -61,10 +61,11 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
         .and_then(|w| w.as_table_mut())
         .and_then(|w| w.get_mut("package"))
         .and_then(|p| p.as_table_mut())
-        && ws_pkg.contains_key("version") {
-            ws_pkg["version"] = toml_edit::value(version);
-            modified = true;
-        }
+        && ws_pkg.contains_key("version")
+    {
+        ws_pkg["version"] = toml_edit::value(version);
+        modified = true;
+    }
 
     // Update intra-workspace path dependency versions
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
@@ -93,10 +94,12 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
                     *modified = true;
                 }
             } else if let Some(table) = dep.as_table_mut()
-                && table.contains_key("path") && table.contains_key("version") {
-                    table["version"] = toml_edit::value(version);
-                    *modified = true;
-                }
+                && table.contains_key("path")
+                && table.contains_key("version")
+            {
+                table["version"] = toml_edit::value(version);
+                *modified = true;
+            }
         }
     }
 
@@ -167,9 +170,10 @@ fn stamp_deno_json(path: &Path, version: &str) -> Result<()> {
     if let Some(imports) = obj.get_mut("imports").and_then(|v| v.as_object_mut()) {
         for value in imports.values_mut() {
             if let Some(specifier) = value.as_str()
-                && let Some(updated) = update_jsr_specifier(specifier, version) {
-                    *value = serde_json::Value::String(updated);
-                }
+                && let Some(updated) = update_jsr_specifier(specifier, version)
+            {
+                *value = serde_json::Value::String(updated);
+            }
         }
     }
 
