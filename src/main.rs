@@ -46,7 +46,7 @@ fn main() -> Result<()> {
                 Some(v) => v,
                 None => calculate_version(&root, None)?,
             };
-            let modified = stamp::stamp_all(&discovery.packages, &version_str)?;
+            let modified = stamp::stamp_all(&root, &discovery.packages, &version_str)?;
             for path in &modified {
                 eprintln!("{}", path);
             }

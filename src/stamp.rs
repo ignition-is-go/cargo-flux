@@ -5,13 +5,27 @@ use std::path::Path;
 
 use crate::manifest::{Ecosystem, Package};
 
-/// Stamp a version string into all discovered workspace packages.
+/// Stamp a version string into all discovered workspace packages
+/// and the root workspace Cargo.toml if it exists.
 /// Returns the list of files that were modified.
-pub fn stamp_all(packages: &[Package], version: &str) -> Result<Vec<String>> {
+pub fn stamp_all(root: &Path, packages: &[Package], version: &str) -> Result<Vec<String>> {
     let mut modified = Vec::new();
+    let mut stamped_paths = std::collections::HashSet::new();
+
+    // Stamp root Cargo.toml (handles virtual workspaces with [workspace.package] version)
+    let root_cargo = root.join("Cargo.toml");
+    if root_cargo.exists() {
+        if stamp_cargo_toml(&root_cargo, version)? {
+            modified.push(root_cargo.display().to_string());
+            stamped_paths.insert(root_cargo);
+        }
+    }
 
     for package in packages {
         let path = &package.manifest_path;
+        if stamped_paths.contains(path) {
+            continue;
+        }
         let was_modified = match package.ecosystem {
             Ecosystem::Cargo => stamp_cargo_toml(path, version)?,
             Ecosystem::Js => stamp_package_json(path, version)?,
@@ -307,7 +321,7 @@ version = "0.1.0"
             },
         ];
 
-        let modified = stamp_all(&packages, "3.0.0").unwrap();
+        let modified = stamp_all(&root, &packages, "3.0.0").unwrap();
         assert_eq!(modified.len(), 2);
 
         let cargo_content = fs::read_to_string(root.join("Cargo.toml")).unwrap();
@@ -316,6 +330,31 @@ version = "0.1.0"
         let pkg_content = fs::read_to_string(root.join("package.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&pkg_content).unwrap();
         assert_eq!(parsed["version"], "3.0.0");
+    }
+
+    #[test]
+    fn stamps_virtual_workspace_root_cargo_toml() {
+        let root = temp_dir("stamp-virtual-ws");
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        // No packages discovered from root (virtual workspace has no [package])
+        let packages: Vec<Package> = vec![];
+        let modified = stamp_all(&root, &packages, "2.0.0").unwrap();
+        assert_eq!(modified.len(), 1);
+
+        let content = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(content.contains("version = \"2.0.0\""));
+        assert!(content.contains("edition = \"2024\""));
     }
 
     #[test]
@@ -341,7 +380,7 @@ version = "0.1.0"
             internal_dependencies: vec![],
         }];
 
-        let modified = stamp_all(&packages, "3.0.0").unwrap();
+        let modified = stamp_all(&root, &packages, "3.0.0").unwrap();
         assert!(modified.is_empty());
 
         let content = fs::read_to_string(root.join("pyproject.toml")).unwrap();
