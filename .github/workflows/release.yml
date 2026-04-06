@@ -15,26 +15,15 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - run: cargo install --path . --force
-      - name: Check for releasable commits
-        id: check
+      - name: Configure git
         run: |
-          VERSION=$(cargo flux version 2>&1) && echo "version=$VERSION" >> "$GITHUB_OUTPUT" || echo "skip=true" >> "$GITHUB_OUTPUT"
-      - name: Stamp, tag, and publish
-        if: steps.check.outputs.skip != 'true'
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Release
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.check.outputs.version }}"
-          cargo flux stamp "$VERSION"
-          cargo update --workspace
-          cargo fmt --all
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "chore(release): $VERSION"
-          git tag "v$VERSION" -m "Release $VERSION"
-          git push origin main "v$VERSION"
-          cargo publish
-          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --generate-notes
+        run: cargo flux run release
