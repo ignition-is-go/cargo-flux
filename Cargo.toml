@@ -10,7 +10,7 @@ keywords = ["cargo", "workspace", "monorepo", "task-runner", "polyglot"]
 categories = ["development-tools::cargo-plugins", "development-tools::build-utils"]
 
 [package.metadata.flux]
-tasks = ["build", "test", "lint"]
+tasks = ["build", "test", "lint", "release"]
 
 [dependencies]
 anyhow = "1.0"
