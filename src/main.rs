@@ -3,6 +3,7 @@ mod graph;
 mod manifest;
 mod plugins;
 mod tasks;
+mod version;
 
 use anyhow::Result;
 use clap::Parser;
