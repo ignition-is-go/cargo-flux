@@ -312,6 +312,82 @@ version = "0.1.0"
         assert!(content.contains("version = \"0.1.0\""));
     }
 
+    #[test]
+    fn stamps_sibling_deno_json_version() {
+        let root = temp_dir("stamp-deno");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@myko/rs",
+  "version": "0.1.0"
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("deno.json"),
+            r#"{
+  "name": "@myko/rs",
+  "version": "0.1.0",
+  "exports": "./index.ts"
+}"#,
+        )
+        .unwrap();
+
+        let modified = stamp_package_json(&root.join("package.json"), "2.0.0").unwrap();
+        assert!(modified);
+
+        let deno_content = fs::read_to_string(root.join("deno.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&deno_content).unwrap();
+        assert_eq!(parsed["version"], "2.0.0");
+    }
+
+    #[test]
+    fn stamps_deno_json_jsr_import_versions() {
+        let root = temp_dir("stamp-deno-imports");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@myko/ts",
+  "version": "0.1.0"
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("deno.json"),
+            r#"{
+  "name": "@myko/ts",
+  "version": "0.1.0",
+  "imports": {
+    "@myko/rs": "jsr:@myko/rs@0.1.0",
+    "rxjs": "npm:rxjs@^7.8.1"
+  }
+}"#,
+        )
+        .unwrap();
+
+        stamp_package_json(&root.join("package.json"), "2.0.0").unwrap();
+
+        let deno_content = fs::read_to_string(root.join("deno.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&deno_content).unwrap();
+        assert_eq!(parsed["version"], "2.0.0");
+        assert_eq!(parsed["imports"]["@myko/rs"], "jsr:@myko/rs@2.0.0");
+        // npm specifiers should be untouched
+        assert_eq!(parsed["imports"]["rxjs"], "npm:rxjs@^7.8.1");
+    }
+
+    #[test]
+    fn update_jsr_specifier_replaces_version() {
+        assert_eq!(
+            update_jsr_specifier("jsr:@myko/rs@0.1.0", "2.0.0"),
+            Some("jsr:@myko/rs@2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn update_jsr_specifier_ignores_npm() {
+        assert_eq!(update_jsr_specifier("npm:rxjs@^7.8.1", "2.0.0"), None);
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
