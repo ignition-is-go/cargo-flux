@@ -4,7 +4,8 @@
       "Bash(ls /home/trevor/Code/cargo-flux/LICENSE* /home/trevor/Code/cargo-flux/license*)",
       "Bash(cargo publish:*)",
       "Bash(cargo check:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(cargo run:*)"
     ]
   }
 }
