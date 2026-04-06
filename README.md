@@ -14,6 +14,8 @@ It does not try to replace each ecosystem's native build system. Instead, it coo
 
 The current implementation:
 
+- calculates next semantic version from git tags and conventional commits
+- stamps versions across all workspace manifests
 - discovers workspace packages
 - resolves native in-workspace dependencies
 - loads repo-defined logical tasks from `flux.toml`
@@ -52,6 +54,9 @@ cargo flux graph --root /path/to/repo
 cargo flux topo --root /path/to/repo
 cargo flux plan build --root /path/to/repo
 cargo flux run build --root /path/to/repo
+cargo flux version
+cargo flux stamp
+cargo flux stamp 1.2.3
 ```
 
 ### `graph`
@@ -86,6 +91,87 @@ Executes the planned tasks in dependency order.
 Flux prints a `[m/n]` progress prefix as tasks start. When an ecosystem plugin batches multiple ready tasks into one execution unit, Flux shows a range like `[3-7/20]`.
 
 By default, each task runs from its package directory. Ecosystem plugins may override that execution strategy for specific tasks when it is safe to do so. Today the Cargo plugin uses this hook for `workspace_batchable` tasks.
+
+### `version`
+
+Prints the next semantic version to stdout. Pure query, no side effects.
+
+Flux determines the version by:
+
+1. Finding the latest production git tag (`vX.Y.Z`, no prerelease suffix)
+2. Collecting all commit subjects since that tag
+3. Parsing conventional commits to determine the bump level:
+   - `fix:` commits produce a patch bump
+   - `feat:` commits produce a minor bump
+   - `feat!:`, `fix!:`, or `BREAKING CHANGE` produce a major bump
+4. Resolving the current branch to a release channel via `[channels]` in `flux.toml`
+5. For prerelease channels, appending `-channel.N` where N is one more than the highest existing tag
+
+```bash
+cargo flux version              # auto-detect channel from current branch
+cargo flux version --channel beta  # override channel
+```
+
+### `stamp [version]`
+
+Writes a version string into every discovered workspace manifest.
+
+- If a version argument is provided, stamps that literal string.
+- If omitted, calculates the next version the same way as `version`.
+
+Flux updates:
+
+- `Cargo.toml`: the `[package] version` field and any intra-workspace path dependency versions
+- `package.json`: the top-level `"version"` field
+
+Prints each modified file path to stderr and the stamped version to stdout.
+
+```bash
+cargo flux stamp            # calculate and stamp
+cargo flux stamp 2.0.0      # stamp an explicit version
+```
+
+## Release Channels
+
+Release channels map git branches to version strategies. They are configured in `flux.toml`:
+
+```toml
+[channels]
+main = "production"
+dev = "canary"
+
+[channels."release/beta"]
+channel = "beta"
+prerelease = true
+
+[channels."release/*"]
+channel = "rc"
+prerelease = true
+```
+
+Shorthand `branch = "channel-name"` implies `prerelease = false` and produces stable versions like `1.2.0`.
+
+Table form `{ channel = "...", prerelease = true }` produces prerelease versions like `1.2.0-beta.3`.
+
+Branch names support trailing `*` for glob matching. Exact matches take priority over globs.
+
+### Self-publishing example
+
+Combine `version`, `stamp`, and a release task to create a self-publishing workflow:
+
+```toml
+[channels]
+main = "production"
+
+[tasks.release]
+cargo = "VERSION=$(cargo flux version) && cargo flux stamp \"$VERSION\" && cargo fmt --all && git add -A && git commit -m \"chore(release): $VERSION\" && git tag \"v$VERSION\" -m \"Release $VERSION\" && git push origin HEAD \"v$VERSION\" && cargo publish"
+```
+
+Then run:
+
+```bash
+cargo flux run release
+```
 
 ## Core Model
 
