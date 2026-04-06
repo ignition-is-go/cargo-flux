@@ -89,11 +89,7 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
 
     // Update workspace dependency versions in non-inline tables too
     // (toml_edit distinguishes inline `{ version = "...", path = "..." }` from multi-line tables)
-    fn stamp_path_dep_versions(
-        deps: &mut toml_edit::Table,
-        version: &str,
-        modified: &mut bool,
-    ) {
+    fn stamp_path_dep_versions(deps: &mut toml_edit::Table, version: &str, modified: &mut bool) {
         for (_key, dep) in deps.iter_mut() {
             if let Some(table) = dep.as_inline_table_mut() {
                 if table.contains_key("path") && table.contains_key("version") {

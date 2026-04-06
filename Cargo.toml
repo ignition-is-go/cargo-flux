@@ -1,6 +1,6 @@
 [package]
 name = "cargo-flux"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Workspace topology and task orchestration for mixed-language repositories"
 license = "MIT"
