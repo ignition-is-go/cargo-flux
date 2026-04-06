@@ -43,6 +43,19 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
         }
     }
 
+    // Update [workspace.package] version
+    if let Some(ws_pkg) = doc
+        .get_mut("workspace")
+        .and_then(|w| w.as_table_mut())
+        .and_then(|w| w.get_mut("package"))
+        .and_then(|p| p.as_table_mut())
+    {
+        if ws_pkg.contains_key("version") {
+            ws_pkg["version"] = toml_edit::value(version);
+            modified = true;
+        }
+    }
+
     // Update intra-workspace path dependency versions
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(deps) = doc.get_mut(section).and_then(|d| d.as_table_mut()) {
@@ -178,6 +191,29 @@ edition = "2024"
         let content = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(content.contains("version = \"2.0.0\""));
         assert!(content.contains("name = \"my-crate\""));
+        assert!(content.contains("edition = \"2024\""));
+    }
+
+    #[test]
+    fn stamps_cargo_toml_workspace_package_version() {
+        let root = temp_dir("stamp-cargo-ws-pkg");
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+
+        let modified = stamp_cargo_toml(&root.join("Cargo.toml"), "2.0.0").unwrap();
+        assert!(modified);
+
+        let content = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(content.contains("version = \"2.0.0\""));
         assert!(content.contains("edition = \"2024\""));
     }
 
