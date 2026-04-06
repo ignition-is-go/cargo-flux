@@ -4,6 +4,7 @@ mod git;
 mod graph;
 mod manifest;
 mod plugins;
+mod stamp;
 mod tasks;
 mod version;
 
