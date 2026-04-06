@@ -8,6 +8,7 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct TaskRegistry {
     tasks: BTreeMap<String, TaskDefinition>,
+    channels: Option<toml::Value>,
 }
 
 impl TaskRegistry {
@@ -19,7 +20,12 @@ impl TaskRegistry {
             .with_context(|| format!("failed to parse task config {}", path.display()))?;
         Ok(Self {
             tasks: config.tasks.unwrap_or_default(),
+            channels: config.channels,
         })
+    }
+
+    pub fn channels(&self) -> Option<&toml::Value> {
+        self.channels.as_ref()
     }
 
     pub fn resolve(&self, package: &Package, task_name: &str) -> Result<ResolvedTask> {
@@ -292,6 +298,7 @@ fn infer_js_package_manager(label: &str) -> Option<JsPackageManager> {
 #[serde(deny_unknown_fields)]
 struct FluxConfig {
     tasks: Option<BTreeMap<String, TaskDefinition>>,
+    channels: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]

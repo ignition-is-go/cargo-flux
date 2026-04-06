@@ -1,3 +1,4 @@
+mod channels;
 mod cli;
 mod graph;
 mod manifest;
