@@ -66,6 +66,7 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
 }
 
 /// Stamp version into a package.json file.
+/// Also stamps a sibling deno.json if one exists.
 fn stamp_package_json(path: &Path, version: &str) -> Result<bool> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -90,7 +91,64 @@ fn stamp_package_json(path: &Path, version: &str) -> Result<bool> {
     std::fs::write(path, format!("{}\n", output))
         .with_context(|| format!("failed to write {}", path.display()))?;
 
+    // Stamp sibling deno.json if it exists
+    if let Some(dir) = path.parent() {
+        let deno_path = dir.join("deno.json");
+        if deno_path.exists() {
+            stamp_deno_json(&deno_path, version)?;
+        }
+    }
+
     Ok(true)
+}
+
+/// Stamp version into a deno.json file and update JSR import specifier versions.
+fn stamp_deno_json(path: &Path, version: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut json: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    let Some(obj) = json.as_object_mut() else {
+        return Ok(());
+    };
+
+    if obj.contains_key("version") {
+        obj.insert(
+            "version".to_string(),
+            serde_json::Value::String(version.to_string()),
+        );
+    }
+
+    // Update JSR import specifier versions (jsr:@scope/name@version → jsr:@scope/name@new_version)
+    if let Some(imports) = obj.get_mut("imports").and_then(|v| v.as_object_mut()) {
+        for value in imports.values_mut() {
+            if let Some(specifier) = value.as_str() {
+                if let Some(updated) = update_jsr_specifier(specifier, version) {
+                    *value = serde_json::Value::String(updated);
+                }
+            }
+        }
+    }
+
+    let output = serde_json::to_string_pretty(&json)
+        .with_context(|| format!("failed to serialize {}", path.display()))?;
+    std::fs::write(path, format!("{}\n", output))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    eprintln!("  stamped {}", path.display());
+    Ok(())
+}
+
+/// Update a JSR specifier's version: `jsr:@scope/name@old` → `jsr:@scope/name@new`
+fn update_jsr_specifier(specifier: &str, version: &str) -> Option<String> {
+    let rest = specifier.strip_prefix("jsr:")?;
+    let at_idx = rest.rfind('@')?;
+    // Ensure we're not splitting at the scope @ (e.g. @myko/rs)
+    if at_idx == 0 {
+        return None;
+    }
+    Some(format!("jsr:{}@{}", &rest[..at_idx], version))
 }
 
 #[cfg(test)]
