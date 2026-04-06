@@ -1,5 +1,6 @@
 mod channels;
 mod cli;
+mod git;
 mod graph;
 mod manifest;
 mod plugins;
