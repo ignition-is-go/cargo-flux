@@ -21,8 +21,8 @@ pub fn parse_channels(table: &toml::Value) -> HashMap<String, ChannelConfig> {
     for (key, value) in table {
         let config = if let Some(channel) = value.as_str() {
             ChannelConfig {
+                prerelease: channel != "production",
                 channel: channel.to_string(),
-                prerelease: false,
             }
         } else if let Some(table) = value.as_table() {
             ChannelConfig {
