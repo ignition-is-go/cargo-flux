@@ -43,7 +43,7 @@ pub fn get_commits_since(tag: Option<&str>) -> Vec<String> {
         None => "HEAD".to_string(),
     };
 
-    exec(&format!("git log {} --pretty=format:\"%s\"", range))
+    exec(&format!("git log {} --pretty=format:%s", range))
         .unwrap_or_default()
         .lines()
         .filter(|s| !s.is_empty())
