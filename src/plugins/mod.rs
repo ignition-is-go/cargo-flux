@@ -42,7 +42,7 @@ pub(crate) fn batch_execution_units(
     }
 
     units.extend(cargo::batch_execution_units(cargo_group, tasks, root)?);
-    units.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+    units.sort_by_key(|left| left.sort_key());
     Ok(units)
 }
 

@@ -4,6 +4,7 @@ use crate::tasks::TaskRegistry;
 use anyhow::{Result, anyhow, bail};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+#[cfg(not(test))]
 use std::io::IsTerminal;
 
 #[derive(Debug)]
@@ -245,6 +246,7 @@ impl WorkspaceGraph {
         Ok((included, restricted))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_task_nodes(
         &self,
         id: &PackageId,
@@ -362,6 +364,7 @@ impl WorkspaceGraph {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_bridged_task_nodes(
         &self,
         id: &PackageId,
@@ -587,6 +590,7 @@ impl WorkspaceGraph {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_bridge_target_task(
         &self,
         source_id: &PackageId,

@@ -59,11 +59,10 @@ pub fn resolve_channel(
 
     // Glob match (trailing * only)
     for (pattern, config) in channels {
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            if branch.starts_with(prefix) {
+        if let Some(prefix) = pattern.strip_suffix('*')
+            && branch.starts_with(prefix) {
                 return Some(config.clone());
             }
-        }
     }
 
     None

@@ -129,7 +129,7 @@ fn calculate_version(root: &std::path::Path, channel_override: Option<String>) -
     } else {
         let branch = git::get_current_branch()?;
         let channels_map = channels_table
-            .map(|t| channels::parse_channels(t))
+            .map(channels::parse_channels)
             .unwrap_or_default();
         channels::resolve_channel(&branch, &channels_map).ok_or_else(|| {
             anyhow::anyhow!(
