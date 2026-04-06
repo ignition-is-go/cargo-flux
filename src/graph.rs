@@ -4,6 +4,7 @@ use crate::tasks::TaskRegistry;
 use anyhow::{Result, anyhow, bail};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::io::IsTerminal;
 
 #[derive(Debug)]
 pub struct WorkspaceGraph {

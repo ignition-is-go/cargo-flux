@@ -258,6 +258,7 @@ pub fn discover_workspace(root: &Path) -> Result<WorkspaceDiscovery> {
     Ok(resolve_internal_dependencies(raw_packages))
 }
 
+#[cfg(test)]
 pub fn discover_packages(root: &Path) -> Result<Vec<Package>> {
     Ok(discover_workspace(root)?.packages)
 }
