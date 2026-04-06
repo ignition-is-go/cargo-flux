@@ -441,6 +441,50 @@ cargo = ["cargo", "check"]
         }
     }
 
+    #[test]
+    fn parses_version_command() {
+        let cli = Cli::parse_from(["cargo-flux", "version"]);
+        match cli.command {
+            Command::Version { channel } => {
+                assert!(channel.is_none());
+            }
+            other => panic!("expected version command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_version_command_with_channel_override() {
+        let cli = Cli::parse_from(["cargo-flux", "version", "--channel", "beta"]);
+        match cli.command {
+            Command::Version { channel } => {
+                assert_eq!(channel.as_deref(), Some("beta"));
+            }
+            other => panic!("expected version command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_stamp_command_with_explicit_version() {
+        let cli = Cli::parse_from(["cargo-flux", "stamp", "1.2.3"]);
+        match cli.command {
+            Command::Stamp { version } => {
+                assert_eq!(version.as_deref(), Some("1.2.3"));
+            }
+            other => panic!("expected stamp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_stamp_command_without_version() {
+        let cli = Cli::parse_from(["cargo-flux", "stamp"]);
+        match cli.command {
+            Command::Stamp { version } => {
+                assert!(version.is_none());
+            }
+            other => panic!("expected stamp command, got {other:?}"),
+        }
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
