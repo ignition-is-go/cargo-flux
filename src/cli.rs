@@ -31,4 +31,15 @@ pub enum Command {
         /// Logical task name to execute.
         task: String,
     },
+    /// Print the next calculated semantic version.
+    Version {
+        /// Override the release channel instead of auto-detecting from branch.
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Stamp a version into all workspace manifests.
+    Stamp {
+        /// Version to stamp. If omitted, calculates the next version automatically.
+        version: Option<String>,
+    },
 }

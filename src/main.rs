@@ -34,64 +34,136 @@ fn main() -> Result<()> {
         }
         eprintln!();
     }
-    let graph = WorkspaceGraph::new(discovery.packages);
-
     match cli.command {
-        Command::Graph => {
-            println!("{}", graph.render_tree()?);
+        Command::Version { channel } => {
+            let version_str = calculate_version(&root, channel)?;
+            println!("{}", version_str);
         }
-        Command::Topo => {
-            for package in graph.topological_order()? {
-                println!(
-                    "{} [{}] {}",
-                    package.name,
-                    package.display_label(),
-                    package.manifest_path.display()
-                );
+        Command::Stamp {
+            version: explicit_version,
+        } => {
+            let version_str = match explicit_version {
+                Some(v) => v,
+                None => calculate_version(&root, None)?,
+            };
+            let modified = stamp::stamp_all(&discovery.packages, &version_str)?;
+            for path in &modified {
+                eprintln!("{}", path);
             }
+            println!("{}", version_str);
         }
-        Command::Plan { task, ordered } => {
-            let tasks = TaskRegistry::load(&root)?;
-            if ordered {
-                for (index, resolved) in graph.task_plan(&tasks, &task)?.into_iter().enumerate() {
-                    println!(
-                        "{}. {}",
-                        index + 1,
-                        resolved.render_colored(stdout_is_terminal)
-                    );
+        command => {
+            let graph = WorkspaceGraph::new(discovery.packages);
+            match command {
+                Command::Graph => {
+                    println!("{}", graph.render_tree()?);
                 }
-            } else {
-                println!("{}", graph.render_task_plan_tree(&tasks, &task)?);
-            }
-        }
-        Command::Run { task } => {
-            let tasks = TaskRegistry::load(&root)?;
-            let groups = graph.task_ready_groups(&tasks, &task)?;
-            let total_tasks = groups.iter().map(Vec::len).sum::<usize>();
-            let mut started = 0usize;
-            for group in groups {
-                for unit in batch_execution_units(group, &tasks, &root)? {
-                    let count = unit.task_count();
-                    started += count;
-                    println!(
-                        "{}",
-                        render_run_start(
-                            &unit.display_label(stdout_is_terminal),
-                            started + 1 - count,
-                            started,
-                            total_tasks,
-                            stdout_is_terminal
-                        )
-                    );
-                    if let Err(error) = execute_unit(&unit, &root) {
-                        handle_unit_failure(&unit, error, use_color)?;
+                Command::Topo => {
+                    for package in graph.topological_order()? {
+                        println!(
+                            "{} [{}] {}",
+                            package.name,
+                            package.display_label(),
+                            package.manifest_path.display()
+                        );
                     }
                 }
+                Command::Plan { task, ordered } => {
+                    let tasks = TaskRegistry::load(&root)?;
+                    if ordered {
+                        for (index, resolved) in
+                            graph.task_plan(&tasks, &task)?.into_iter().enumerate()
+                        {
+                            println!(
+                                "{}. {}",
+                                index + 1,
+                                resolved.render_colored(stdout_is_terminal)
+                            );
+                        }
+                    } else {
+                        println!("{}", graph.render_task_plan_tree(&tasks, &task)?);
+                    }
+                }
+                Command::Run { task } => {
+                    let tasks = TaskRegistry::load(&root)?;
+                    let groups = graph.task_ready_groups(&tasks, &task)?;
+                    let total_tasks = groups.iter().map(Vec::len).sum::<usize>();
+                    let mut started = 0usize;
+                    for group in groups {
+                        for unit in batch_execution_units(group, &tasks, &root)? {
+                            let count = unit.task_count();
+                            started += count;
+                            println!(
+                                "{}",
+                                render_run_start(
+                                    &unit.display_label(stdout_is_terminal),
+                                    started + 1 - count,
+                                    started,
+                                    total_tasks,
+                                    stdout_is_terminal
+                                )
+                            );
+                            if let Err(error) = execute_unit(&unit, &root) {
+                                handle_unit_failure(&unit, error, use_color)?;
+                            }
+                        }
+                    }
+                }
+                Command::Version { .. } | Command::Stamp { .. } => unreachable!(),
             }
         }
     }
 
     Ok(())
+}
+
+fn calculate_version(root: &std::path::Path, channel_override: Option<String>) -> Result<String> {
+    let tasks = TaskRegistry::load(root)?;
+    let channels_table = tasks.channels();
+
+    let channel_config = if let Some(override_channel) = channel_override {
+        channels::ChannelConfig {
+            channel: override_channel.clone(),
+            prerelease: override_channel != "production",
+        }
+    } else {
+        let branch = git::get_current_branch()?;
+        let channels_map = channels_table
+            .map(|t| channels::parse_channels(t))
+            .unwrap_or_default();
+        channels::resolve_channel(&branch, &channels_map).ok_or_else(|| {
+            anyhow::anyhow!(
+                "branch '{}' is not mapped to a release channel in flux.toml [channels]",
+                branch
+            )
+        })?
+    };
+
+    let latest_tag = git::get_latest_production_tag();
+    let commits = git::get_commits_since(latest_tag.as_deref());
+
+    anyhow::ensure!(!commits.is_empty(), "no commits since last production tag");
+
+    let current = latest_tag
+        .as_ref()
+        .map(|t| version::Version::parse(t))
+        .unwrap_or(version::Version {
+            major: 0,
+            minor: 0,
+            patch: 0,
+        });
+
+    let next = version::calculate_next_version(current, &commits);
+    let base = next.format();
+
+    let full_version = if channel_config.prerelease {
+        let count = git::get_existing_prerelease_count(&base, &channel_config.channel) + 1;
+        format!("{}-{}.{}", base, channel_config.channel, count)
+    } else {
+        base
+    };
+
+    Ok(full_version)
 }
 
 fn execute_task(command: &TaskCommand, cwd: &std::path::Path) -> Result<()> {
