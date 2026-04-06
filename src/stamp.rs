@@ -73,12 +73,37 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
     // Update intra-workspace path dependency versions
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(deps) = doc.get_mut(section).and_then(|d| d.as_table_mut()) {
-            for (_key, dep) in deps.iter_mut() {
-                if let Some(table) = dep.as_inline_table_mut() {
-                    if table.contains_key("path") && table.contains_key("version") {
-                        table.insert("version", toml_edit::value(version).into_value().unwrap());
-                        modified = true;
-                    }
+            stamp_path_dep_versions(deps, version, &mut modified);
+        }
+    }
+
+    // Update [workspace.dependencies] path dependency versions
+    if let Some(ws_deps) = doc
+        .get_mut("workspace")
+        .and_then(|w| w.as_table_mut())
+        .and_then(|w| w.get_mut("dependencies"))
+        .and_then(|d| d.as_table_mut())
+    {
+        stamp_path_dep_versions(ws_deps, version, &mut modified);
+    }
+
+    // Update workspace dependency versions in non-inline tables too
+    // (toml_edit distinguishes inline `{ version = "...", path = "..." }` from multi-line tables)
+    fn stamp_path_dep_versions(
+        deps: &mut toml_edit::Table,
+        version: &str,
+        modified: &mut bool,
+    ) {
+        for (_key, dep) in deps.iter_mut() {
+            if let Some(table) = dep.as_inline_table_mut() {
+                if table.contains_key("path") && table.contains_key("version") {
+                    table.insert("version", toml_edit::value(version).into_value().unwrap());
+                    *modified = true;
+                }
+            } else if let Some(table) = dep.as_table_mut() {
+                if table.contains_key("path") && table.contains_key("version") {
+                    table["version"] = toml_edit::value(version);
+                    *modified = true;
                 }
             }
         }
@@ -229,6 +254,36 @@ edition = "2024"
         let content = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(content.contains("version = \"2.0.0\""));
         assert!(content.contains("edition = \"2024\""));
+    }
+
+    #[test]
+    fn stamps_workspace_dependencies_path_dep_versions() {
+        let root = temp_dir("stamp-ws-deps");
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = "1.0"
+my-lib = { version = "0.1.0", path = "crates/my-lib" }
+"#,
+        )
+        .unwrap();
+
+        let modified = stamp_cargo_toml(&root.join("Cargo.toml"), "2.0.0").unwrap();
+        assert!(modified);
+
+        let content = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        // workspace.package version updated
+        assert!(content.contains("[workspace.package]\nversion = \"2.0.0\""));
+        // workspace.dependencies path dep updated
+        assert!(content.contains("my-lib = { version = \"2.0.0\", path = \"crates/my-lib\" }"));
+        // external dep unchanged
+        assert!(content.contains("serde = \"1.0\""));
     }
 
     #[test]
