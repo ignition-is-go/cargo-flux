@@ -1,3 +1,6 @@
+[channels]
+main = "production"
+
 [tasks.build]
 cargo = ["cargo", "build"]
 npm = ["npm", "run", "build"]
@@ -12,3 +15,6 @@ uv = ["uv", "run", "pytest"]
 cargo = ["cargo", "clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
 npm = ["npm", "run", "lint"]
 uv = ["uv", "run", "ruff", "check", "."]
+
+[tasks.release]
+cargo = "VERSION=$(cargo flux version) && cargo flux stamp \"$VERSION\" && cargo fmt --all && git add -A && git commit -m \"chore(release): $VERSION\" && git tag \"v$VERSION\" -m \"Release $VERSION\" && git push origin HEAD \"v$VERSION\" && cargo publish"
