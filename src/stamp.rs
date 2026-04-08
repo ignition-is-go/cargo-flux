@@ -174,10 +174,10 @@ fn stamp_workspace_dep_versions(
         if !workspace_package_names.contains(name.as_str()) {
             continue;
         }
-        if let Some(specifier) = value.as_str() {
-            if let Some(resolved) = resolve_dep_specifier(specifier, version) {
-                *value = serde_json::Value::String(resolved);
-            }
+        if let Some(specifier) = value.as_str()
+            && let Some(resolved) = resolve_dep_specifier(specifier, version)
+        {
+            *value = serde_json::Value::String(resolved);
         }
     }
 }
