@@ -12,6 +12,12 @@ pub fn stamp_all(root: &Path, packages: &[Package], version: &str) -> Result<Vec
     let mut modified = Vec::new();
     let mut stamped_paths = std::collections::HashSet::new();
 
+    let js_package_names: std::collections::HashSet<&str> = packages
+        .iter()
+        .filter(|p| p.ecosystem == Ecosystem::Js)
+        .map(|p| p.name.as_str())
+        .collect();
+
     // Stamp root Cargo.toml (handles virtual workspaces with [workspace.package] version)
     let root_cargo = root.join("Cargo.toml");
     if root_cargo.exists() && stamp_cargo_toml(&root_cargo, version)? {
@@ -26,7 +32,7 @@ pub fn stamp_all(root: &Path, packages: &[Package], version: &str) -> Result<Vec
         }
         let was_modified = match package.ecosystem {
             Ecosystem::Cargo => stamp_cargo_toml(path, version)?,
-            Ecosystem::Js => stamp_package_json(path, version)?,
+            Ecosystem::Js => stamp_package_json(path, version, &js_package_names)?,
             Ecosystem::Uv => false,
         };
         if was_modified {
@@ -111,9 +117,13 @@ fn stamp_cargo_toml(path: &Path, version: &str) -> Result<bool> {
     Ok(modified)
 }
 
-/// Stamp version into a package.json file.
+/// Stamp version into a package.json file, updating workspace dependency versions.
 /// Also stamps a sibling deno.json if one exists.
-fn stamp_package_json(path: &Path, version: &str) -> Result<bool> {
+fn stamp_package_json(
+    path: &Path,
+    version: &str,
+    workspace_package_names: &std::collections::HashSet<&str>,
+) -> Result<bool> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let mut json: serde_json::Value = serde_json::from_str(&content)
@@ -132,6 +142,13 @@ fn stamp_package_json(path: &Path, version: &str) -> Result<bool> {
         serde_json::Value::String(version.to_string()),
     );
 
+    // Update versioned workspace dependency references
+    for section in ["dependencies", "devDependencies", "peerDependencies"] {
+        if let Some(deps) = obj.get_mut(section).and_then(|v| v.as_object_mut()) {
+            stamp_workspace_dep_versions(deps, version, workspace_package_names);
+        }
+    }
+
     let output = serde_json::to_string_pretty(&json)
         .with_context(|| format!("failed to serialize {}", path.display()))?;
     std::fs::write(path, format!("{}\n", output))
@@ -146,6 +163,47 @@ fn stamp_package_json(path: &Path, version: &str) -> Result<bool> {
     }
 
     Ok(true)
+}
+
+fn stamp_workspace_dep_versions(
+    deps: &mut serde_json::Map<String, serde_json::Value>,
+    version: &str,
+    workspace_package_names: &std::collections::HashSet<&str>,
+) {
+    for (name, value) in deps.iter_mut() {
+        if !workspace_package_names.contains(name.as_str()) {
+            continue;
+        }
+        if let Some(specifier) = value.as_str() {
+            if let Some(resolved) = resolve_dep_specifier(specifier, version) {
+                *value = serde_json::Value::String(resolved);
+            }
+        }
+    }
+}
+
+/// Resolve a dependency specifier to a concrete version for publishing.
+/// Handles both `workspace:` protocol and plain semver ranges.
+/// Returns None for path-like specifiers (`file:`, `link:`, `portal:`).
+fn resolve_dep_specifier(specifier: &str, version: &str) -> Option<String> {
+    // Strip workspace: prefix if present, then resolve the inner specifier
+    let inner = specifier.strip_prefix("workspace:").unwrap_or(specifier);
+    match inner {
+        "*" => Some(version.to_string()),
+        "^" => Some(format!("^{version}")),
+        "~" => Some(format!("~{version}")),
+        s if s.starts_with("file:")
+            || s.starts_with("link:")
+            || s.starts_with("portal:") =>
+        {
+            None
+        }
+        _ => {
+            // Extract the range operator prefix (^, ~, >=, etc.) before the version digits
+            let version_start = inner.find(|c: char| c.is_ascii_digit())?;
+            Some(format!("{}{}", &inner[..version_start], version))
+        }
+    }
 }
 
 /// Stamp version into a deno.json file and update JSR import specifier versions.
@@ -318,7 +376,8 @@ serde = "1"
         )
         .unwrap();
 
-        let modified = stamp_package_json(&root.join("package.json"), "2.0.0").unwrap();
+        let modified =
+            stamp_package_json(&root.join("package.json"), "2.0.0", &Default::default()).unwrap();
         assert!(modified);
 
         let content = fs::read_to_string(root.join("package.json")).unwrap();
@@ -457,7 +516,8 @@ version = "0.1.0"
         )
         .unwrap();
 
-        let modified = stamp_package_json(&root.join("package.json"), "2.0.0").unwrap();
+        let modified =
+            stamp_package_json(&root.join("package.json"), "2.0.0", &Default::default()).unwrap();
         assert!(modified);
 
         let deno_content = fs::read_to_string(root.join("deno.json")).unwrap();
@@ -489,7 +549,7 @@ version = "0.1.0"
         )
         .unwrap();
 
-        stamp_package_json(&root.join("package.json"), "2.0.0").unwrap();
+        stamp_package_json(&root.join("package.json"), "2.0.0", &Default::default()).unwrap();
 
         let deno_content = fs::read_to_string(root.join("deno.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&deno_content).unwrap();
@@ -510,6 +570,263 @@ version = "0.1.0"
     #[test]
     fn update_jsr_specifier_ignores_npm() {
         assert_eq!(update_jsr_specifier("npm:rxjs@^7.8.1", "2.0.0"), None);
+    }
+
+    #[test]
+    fn resolves_workspace_caret_version() {
+        assert_eq!(
+            resolve_dep_specifier("workspace:^1.0.0", "2.0.0"),
+            Some("^2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_tilde_version() {
+        assert_eq!(
+            resolve_dep_specifier("workspace:~1.0.0", "2.0.0"),
+            Some("~2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_exact_version() {
+        assert_eq!(
+            resolve_dep_specifier("workspace:1.0.0", "2.0.0"),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_star() {
+        assert_eq!(
+            resolve_dep_specifier("workspace:*", "2.0.0"),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_caret_shorthand() {
+        assert_eq!(
+            resolve_dep_specifier("workspace:^", "2.0.0"),
+            Some("^2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_tilde_shorthand() {
+        assert_eq!(
+            resolve_dep_specifier("workspace:~", "2.0.0"),
+            Some("~2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_plain_caret_version() {
+        assert_eq!(
+            resolve_dep_specifier("^1.0.0", "2.0.0"),
+            Some("^2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_plain_tilde_version() {
+        assert_eq!(
+            resolve_dep_specifier("~1.0.0", "2.0.0"),
+            Some("~2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_plain_exact_version() {
+        assert_eq!(
+            resolve_dep_specifier("1.0.0", "2.0.0"),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_file_specifier() {
+        assert_eq!(resolve_dep_specifier("file:../shared", "2.0.0"), None);
+    }
+
+    #[test]
+    fn ignores_link_specifier() {
+        assert_eq!(resolve_dep_specifier("link:../shared", "2.0.0"), None);
+    }
+
+    #[test]
+    fn resolves_workspace_deps_in_package_json() {
+        let root = temp_dir("stamp-pkg-ws-deps");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@repo/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@repo/shared": "workspace:^1.0.0",
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "@repo/tools": "workspace:~1.0.0"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let workspace_names: std::collections::HashSet<&str> =
+            ["@repo/shared", "@repo/tools"].into_iter().collect();
+        let modified =
+            stamp_package_json(&root.join("package.json"), "2.0.0", &workspace_names).unwrap();
+        assert!(modified);
+
+        let content = fs::read_to_string(root.join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["version"], "2.0.0");
+        assert_eq!(parsed["dependencies"]["@repo/shared"], "^2.0.0");
+        assert_eq!(parsed["dependencies"]["lodash"], "^4.17.21");
+        assert_eq!(parsed["devDependencies"]["@repo/tools"], "~2.0.0");
+    }
+
+    #[test]
+    fn resolves_plain_semver_deps_for_workspace_packages() {
+        let root = temp_dir("stamp-pkg-plain-deps");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@repo/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@repo/shared": "^1.0.0",
+    "lodash": "^4.17.21"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let workspace_names: std::collections::HashSet<&str> =
+            ["@repo/shared"].into_iter().collect();
+        let modified =
+            stamp_package_json(&root.join("package.json"), "2.0.0", &workspace_names).unwrap();
+        assert!(modified);
+
+        let content = fs::read_to_string(root.join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["version"], "2.0.0");
+        assert_eq!(parsed["dependencies"]["@repo/shared"], "^2.0.0");
+        // External dep unchanged
+        assert_eq!(parsed["dependencies"]["lodash"], "^4.17.21");
+    }
+
+    #[test]
+    fn resolves_workspace_shorthand_specifiers() {
+        let root = temp_dir("stamp-pkg-ws-shorthand");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@repo/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@repo/shared": "workspace:*",
+    "@repo/utils": "workspace:^"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let workspace_names: std::collections::HashSet<&str> =
+            ["@repo/shared", "@repo/utils"].into_iter().collect();
+        let modified =
+            stamp_package_json(&root.join("package.json"), "2.0.0", &workspace_names).unwrap();
+        assert!(modified);
+
+        let content = fs::read_to_string(root.join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["version"], "2.0.0");
+        assert_eq!(parsed["dependencies"]["@repo/shared"], "2.0.0");
+        assert_eq!(parsed["dependencies"]["@repo/utils"], "^2.0.0");
+    }
+
+    #[test]
+    fn leaves_file_specifiers_for_workspace_packages() {
+        let root = temp_dir("stamp-pkg-file-dep");
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@repo/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@repo/shared": "file:../shared"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let workspace_names: std::collections::HashSet<&str> =
+            ["@repo/shared"].into_iter().collect();
+        stamp_package_json(&root.join("package.json"), "2.0.0", &workspace_names).unwrap();
+
+        let content = fs::read_to_string(root.join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["dependencies"]["@repo/shared"], "file:../shared");
+    }
+
+    #[test]
+    fn stamp_all_resolves_js_workspace_deps() {
+        let root = temp_dir("stamp-all-js-ws-deps");
+        fs::create_dir_all(root.join("packages/shared")).unwrap();
+        fs::create_dir_all(root.join("packages/app")).unwrap();
+
+        fs::write(
+            root.join("packages/shared/package.json"),
+            r#"{
+  "name": "@repo/shared",
+  "version": "1.0.0"
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("packages/app/package.json"),
+            r#"{
+  "name": "@repo/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@repo/shared": "workspace:^1.0.0"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let packages = vec![
+            Package {
+                id: PackageId::new(Ecosystem::Js, "@repo/shared"),
+                name: "@repo/shared".to_string(),
+                ecosystem: Ecosystem::Js,
+                manifest_path: root.join("packages/shared/package.json"),
+                js_package_manager: None,
+                task_opt_ins: BTreeMap::new(),
+                bridged_dependencies: vec![],
+                internal_dependencies: vec![],
+            },
+            Package {
+                id: PackageId::new(Ecosystem::Js, "@repo/app"),
+                name: "@repo/app".to_string(),
+                ecosystem: Ecosystem::Js,
+                manifest_path: root.join("packages/app/package.json"),
+                js_package_manager: None,
+                task_opt_ins: BTreeMap::new(),
+                bridged_dependencies: vec![],
+                internal_dependencies: vec![],
+            },
+        ];
+
+        let modified = stamp_all(&root, &packages, "2.0.0").unwrap();
+        assert_eq!(modified.len(), 2);
+
+        let app_content =
+            fs::read_to_string(root.join("packages/app/package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&app_content).unwrap();
+        assert_eq!(parsed["version"], "2.0.0");
+        assert_eq!(parsed["dependencies"]["@repo/shared"], "^2.0.0");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
