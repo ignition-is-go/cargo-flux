@@ -192,12 +192,7 @@ fn resolve_dep_specifier(specifier: &str, version: &str) -> Option<String> {
         "*" => Some(version.to_string()),
         "^" => Some(format!("^{version}")),
         "~" => Some(format!("~{version}")),
-        s if s.starts_with("file:")
-            || s.starts_with("link:")
-            || s.starts_with("portal:") =>
-        {
-            None
-        }
+        s if s.starts_with("file:") || s.starts_with("link:") || s.starts_with("portal:") => None,
         _ => {
             // Extract the range operator prefix (^, ~, >=, etc.) before the version digits
             let version_start = inner.find(|c: char| c.is_ascii_digit())?;
@@ -822,8 +817,7 @@ version = "0.1.0"
         let modified = stamp_all(&root, &packages, "2.0.0").unwrap();
         assert_eq!(modified.len(), 2);
 
-        let app_content =
-            fs::read_to_string(root.join("packages/app/package.json")).unwrap();
+        let app_content = fs::read_to_string(root.join("packages/app/package.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&app_content).unwrap();
         assert_eq!(parsed["version"], "2.0.0");
         assert_eq!(parsed["dependencies"]["@repo/shared"], "^2.0.0");
