@@ -166,21 +166,24 @@ fn calculate_version(root: &std::path::Path, channel_override: Option<String>) -
     Ok(full_version)
 }
 
-fn execute_task(command: &TaskCommand, cwd: &std::path::Path) -> Result<()> {
+fn execute_task(
+    command: &TaskCommand,
+    cwd: &std::path::Path,
+    variables: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let status = match command {
-        TaskCommand::Shell(command) => std::process::Command::new("sh")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(cwd)
-            .status()?,
+        TaskCommand::Shell(command) => {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-lc").arg(command).current_dir(cwd).envs(variables);
+            cmd.status()?
+        }
         TaskCommand::Argv(command) => {
             let (program, args) = command
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("resolved task command was empty"))?;
-            std::process::Command::new(program)
-                .args(args)
-                .current_dir(cwd)
-                .status()?
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(args).current_dir(cwd).envs(variables);
+            cmd.status()?
         }
     };
     anyhow::ensure!(
@@ -193,7 +196,9 @@ fn execute_task(command: &TaskCommand, cwd: &std::path::Path) -> Result<()> {
 
 fn execute_unit(unit: &ExecutionUnit, _root: &std::path::Path) -> Result<()> {
     match unit {
-        ExecutionUnit::Single(resolved) => execute_task(&resolved.command, &resolved.package_dir),
+        ExecutionUnit::Single(resolved) => {
+            execute_task(&resolved.command, &resolved.package_dir, &resolved.variables)
+        }
         ExecutionUnit::Batch(batch) => {
             let status = match &batch.command {
                 TaskCommand::Shell(command) => std::process::Command::new("sh")
