@@ -196,9 +196,11 @@ fn execute_task(
 
 fn execute_unit(unit: &ExecutionUnit, _root: &std::path::Path) -> Result<()> {
     match unit {
-        ExecutionUnit::Single(resolved) => {
-            execute_task(&resolved.command, &resolved.package_dir, &resolved.variables)
-        }
+        ExecutionUnit::Single(resolved) => execute_task(
+            &resolved.command,
+            &resolved.package_dir,
+            &resolved.variables,
+        ),
         ExecutionUnit::Batch(batch) => {
             let status = match &batch.command {
                 TaskCommand::Shell(command) => std::process::Command::new("sh")
