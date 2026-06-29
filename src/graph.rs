@@ -1137,7 +1137,7 @@ impl MaterializedTaskPlan {
                 .then_with(|| left_node.cmp(right_node))
         });
 
-        for (slot, (node, _)) in nodes.iter_mut().zip(keyed.into_iter()) {
+        for (slot, (node, _)) in nodes.iter_mut().zip(keyed) {
             *slot = node;
         }
     }
