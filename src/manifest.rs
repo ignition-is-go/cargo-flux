@@ -456,6 +456,52 @@ shared = { path = "../shared" }
     }
 
     #[test]
+    fn links_internal_dependencies_declared_under_target_cfg() {
+        let root = temp_dir("workspace-target-cfg-links");
+        fs::create_dir_all(root.join("shared")).expect("create shared dir");
+        fs::create_dir_all(root.join("service")).expect("create service dir");
+
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["shared", "service"]
+"#,
+        )
+        .expect("write root workspace");
+
+        fs::write(
+            root.join("shared/Cargo.toml"),
+            r#"[package]
+name = "shared"
+version = "0.1.0"
+"#,
+        )
+        .expect("write shared");
+
+        // `shared` is only declared under a platform-specific dependency table.
+        fs::write(
+            root.join("service/Cargo.toml"),
+            r#"[package]
+name = "service"
+version = "0.1.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+shared = { path = "../shared" }
+"#,
+        )
+        .expect("write service");
+
+        let packages = discover_packages(&root).expect("discover packages");
+        let service = packages
+            .into_iter()
+            .find(|pkg| pkg.name == "service")
+            .expect("service package");
+
+        assert_eq!(service.internal_dependencies.len(), 1);
+        assert_eq!(service.internal_dependencies[0].to_string(), "cargo:shared");
+    }
+
+    #[test]
     fn warns_for_workspace_packages_in_cargo_special_dependency_sections() {
         let root = temp_dir("warn-cargo-special-deps");
         fs::create_dir_all(root.join("shared")).expect("create shared dir");

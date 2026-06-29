@@ -63,21 +63,38 @@ impl ManifestPlugin for CargoPlugin {
             }
         };
 
-        let build_dependencies = manifest.build_dependencies.clone().unwrap_or_default();
-        let mut deps = local_cargo_dependencies(manifest.dependencies.unwrap_or_default());
-        deps.extend(local_cargo_dependencies(build_dependencies.clone()));
+        // Collect workspace-local dependencies from the top-level tables and every
+        // `[target.<cfg>.*]` table, so platform-specific deps still form graph edges.
+        let mut normal_dependencies = Vec::new();
+        let mut build_dependencies = Vec::new();
+        let mut dev_dependencies = Vec::new();
+        let dependency_tables = std::iter::once(&manifest.dependencies)
+            .chain(manifest.target.iter().flatten().map(|(_, tables)| tables));
+        for tables in dependency_tables {
+            normal_dependencies.extend(local_cargo_dependencies(
+                tables.dependencies.clone().unwrap_or_default(),
+            ));
+            build_dependencies.extend(local_cargo_dependencies(
+                tables.build_dependencies.clone().unwrap_or_default(),
+            ));
+            dev_dependencies.extend(local_cargo_dependencies(
+                tables.dev_dependencies.clone().unwrap_or_default(),
+            ));
+        }
+
+        let mut deps = normal_dependencies;
+        deps.extend(build_dependencies.iter().cloned());
         deps.sort();
         deps.dedup();
-        let mut warned_deps =
-            local_cargo_dependencies(manifest.dev_dependencies.unwrap_or_default())
-                .into_iter()
-                .map(|name| WarnedDependencyRef {
-                    name,
-                    section: "dev-dependencies".to_string(),
-                })
-                .collect::<Vec<_>>();
+        let mut warned_deps = dev_dependencies
+            .into_iter()
+            .map(|name| WarnedDependencyRef {
+                name,
+                section: "dev-dependencies".to_string(),
+            })
+            .collect::<Vec<_>>();
         warned_deps.extend(
-            local_cargo_dependencies(build_dependencies)
+            build_dependencies
                 .into_iter()
                 .map(|name| WarnedDependencyRef {
                     name,
@@ -135,6 +152,14 @@ fn is_local_cargo_dependency(value: &toml::Value) -> bool {
 struct CargoManifest {
     package: Option<CargoPackage>,
     workspace: Option<CargoWorkspace>,
+    #[serde(flatten)]
+    dependencies: CargoDependencyTables,
+    /// Platform-specific dependency tables: `[target.'cfg(...)'.dependencies]` and friends.
+    target: Option<BTreeMap<String, CargoDependencyTables>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CargoDependencyTables {
     dependencies: Option<BTreeMap<String, toml::Value>>,
     #[serde(rename = "dev-dependencies")]
     dev_dependencies: Option<BTreeMap<String, toml::Value>>,
