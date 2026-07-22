@@ -100,12 +100,29 @@ Flux determines the version by:
 
 1. Finding the latest production git tag (`vX.Y.Z`, no prerelease suffix)
 2. Collecting all commit subjects since that tag
-3. Parsing conventional commits to determine the bump level:
+3. Parsing conventional commits to determine the bump level, following
+   [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
    - `fix:` commits produce a patch bump
    - `feat:` commits produce a minor bump
-   - `feat!:`, `fix!:`, or `BREAKING CHANGE` produce a major bump
+   - a `!` after the type/scope (`feat!:`, `refactor!:`, …) or a `BREAKING CHANGE`
+     footer on **any** type produces a major bump
+   - **all other types** (`docs`, `chore`, `style`, `refactor`, `perf`, `test`,
+     `build`, `ci`, and non-conventional subjects) have no implicit SemVer effect
+     and produce **no release**
 4. Resolving the current branch to a release channel via `[channels]` in `flux.toml`
 5. For prerelease channels, appending `-channel.N` where N is one more than the highest existing tag
+
+When step 3 finds no release-worthy commit, `cargo flux version` prints nothing
+to stdout (and exits 0), and `cargo flux stamp` refuses without an explicit
+version. A release workflow should treat empty output as "nothing to release":
+
+```bash
+VERSION=$(cargo flux version)
+[ -z "$VERSION" ] && { echo "nothing to release"; exit 0; }
+```
+
+A genuine failure still exits non-zero, so empty-and-successful means exactly
+"no release-worthy commits" and never a swallowed error.
 
 ```bash
 cargo flux version              # auto-detect channel from current branch

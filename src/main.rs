@@ -36,15 +36,31 @@ fn main() -> Result<()> {
     }
     match cli.command {
         Command::Version { channel } => {
-            let version_str = calculate_version(&root, channel)?;
-            println!("{}", version_str);
+            match calculate_version(&root, channel)? {
+                // A release-worthy version goes to stdout, alone, so `$(cargo
+                // flux version)` captures exactly it.
+                Some(version_str) => println!("{}", version_str),
+                // No release-worthy commits: empty stdout, reason on stderr, exit
+                // 0. Callers guard on empty stdout; a genuine error still exits
+                // non-zero, so empty-and-successful unambiguously means "nothing
+                // to release" rather than a swallowed failure.
+                None => eprintln!(
+                    "no release-worthy commits since the last production tag \
+                     (only non-releasing types like docs/chore); nothing to release"
+                ),
+            }
         }
         Command::Stamp {
             version: explicit_version,
         } => {
             let version_str = match explicit_version {
                 Some(v) => v,
-                None => calculate_version(&root, None)?,
+                None => calculate_version(&root, None)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no release-worthy commits since the last production tag; \
+                         nothing to stamp. Pass an explicit version to override."
+                    )
+                })?,
             };
             let modified = stamp::stamp_all(&root, &discovery.packages, &version_str)?;
             for path in &modified {
@@ -117,7 +133,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn calculate_version(root: &std::path::Path, channel_override: Option<String>) -> Result<String> {
+/// Compute the next release version for the current branch, or `None` when the
+/// commits since the last production tag warrant no release (only non-releasing
+/// Conventional Commit types — `docs`, `chore`, etc.).
+fn calculate_version(
+    root: &std::path::Path,
+    channel_override: Option<String>,
+) -> Result<Option<String>> {
     let tasks = TaskRegistry::load(root)?;
     let channels_table = tasks.channels();
 
@@ -153,7 +175,9 @@ fn calculate_version(root: &std::path::Path, channel_override: Option<String>) -
             patch: 0,
         });
 
-    let next = version::calculate_next_version(current, &commits);
+    let Some(next) = version::calculate_next_version(current, &commits) else {
+        return Ok(None);
+    };
     let base = next.format();
 
     let full_version = if channel_config.prerelease {
@@ -163,7 +187,7 @@ fn calculate_version(root: &std::path::Path, channel_override: Option<String>) -
         base
     };
 
-    Ok(full_version)
+    Ok(Some(full_version))
 }
 
 fn execute_task(
