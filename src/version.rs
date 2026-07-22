@@ -39,23 +39,39 @@ impl Version {
     }
 }
 
-pub fn calculate_next_version(current: Version, commits: &[String]) -> Version {
-    let mut bump = Bump::Patch;
-
-    let feat_re = Regex::new(r"^feat(\([^)]*\))?!?:").unwrap();
+/// Compute the next version from a batch of commit subjects, or `None` when no
+/// commit warrants a release.
+///
+/// Follows Conventional Commits v1.0.0 strictly: only `fix` (PATCH) and `feat`
+/// (MINOR) correlate to a SemVer bump, and a `!` after the type/scope or a
+/// `BREAKING CHANGE` footer on ANY type is a MAJOR bump. Every other type —
+/// `docs`, `chore`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, and
+/// non-conventional subjects — "has no implicit effect in Semantic Versioning
+/// (unless they include a BREAKING CHANGE)", so a batch containing only those
+/// releases nothing. That is what `None` means to the caller.
+pub fn calculate_next_version(current: Version, commits: &[String]) -> Option<Version> {
+    // `!` after the type/scope marks a breaking change on any type.
     let breaking_re = Regex::new(r"^[a-z]+(\([^)]*\))?!:").unwrap();
+    let feat_re = Regex::new(r"^feat(\([^)]*\))?:").unwrap();
+    let fix_re = Regex::new(r"^fix(\([^)]*\))?:").unwrap();
 
+    let mut bump: Option<Bump> = None;
     for msg in commits {
-        if msg.contains("BREAKING CHANGE") || breaking_re.is_match(msg) {
-            bump = Bump::Major;
-            break;
-        }
-        if feat_re.is_match(msg) && bump < Bump::Minor {
-            bump = Bump::Minor;
-        }
+        let this = if msg.contains("BREAKING CHANGE") || breaking_re.is_match(msg) {
+            Some(Bump::Major)
+        } else if feat_re.is_match(msg) {
+            Some(Bump::Minor)
+        } else if fix_re.is_match(msg) {
+            Some(Bump::Patch)
+        } else {
+            None
+        };
+        // Option<Bump> orders None < Some, Patch < Minor < Major — the highest
+        // bump across the batch wins, and stays `None` if nothing qualifies.
+        bump = bump.max(this);
     }
 
-    match bump {
+    bump.map(|bump| match bump {
         Bump::Major => Version {
             major: current.major + 1,
             minor: 0,
@@ -71,7 +87,7 @@ pub fn calculate_next_version(current: Version, commits: &[String]) -> Version {
             minor: current.minor,
             patch: current.patch + 1,
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -133,11 +149,11 @@ mod tests {
         let commits = vec!["fix: something".to_string()];
         assert_eq!(
             calculate_next_version(current, &commits),
-            Version {
+            Some(Version {
                 major: 3,
                 minor: 0,
                 patch: 1
-            }
+            })
         );
     }
 
@@ -147,11 +163,11 @@ mod tests {
         let commits = vec!["feat: new feature".to_string()];
         assert_eq!(
             calculate_next_version(current, &commits),
-            Version {
+            Some(Version {
                 major: 3,
                 minor: 1,
                 patch: 0
-            }
+            })
         );
     }
 
@@ -161,11 +177,11 @@ mod tests {
         let commits = vec!["feat!: breaking change".to_string()];
         assert_eq!(
             calculate_next_version(current, &commits),
-            Version {
+            Some(Version {
                 major: 4,
                 minor: 0,
                 patch: 0
-            }
+            })
         );
     }
 
@@ -175,11 +191,27 @@ mod tests {
         let commits = vec!["fix: something\n\nBREAKING CHANGE: removed old API".to_string()];
         assert_eq!(
             calculate_next_version(current, &commits),
-            Version {
+            Some(Version {
                 major: 4,
                 minor: 0,
                 patch: 0
-            }
+            })
+        );
+    }
+
+    /// A breaking `!` on a non-releasing type (e.g. `refactor!`) is still MAJOR —
+    /// the spec ties the major bump to the breaking marker, not to the type.
+    #[test]
+    fn breaking_bang_on_non_releasing_type_is_major() {
+        let current = Version::parse("v3.4.5");
+        let commits = vec!["refactor!: drop the old trait".to_string()];
+        assert_eq!(
+            calculate_next_version(current, &commits),
+            Some(Version {
+                major: 4,
+                minor: 0,
+                patch: 0
+            })
         );
     }
 
@@ -193,25 +225,52 @@ mod tests {
         ];
         assert_eq!(
             calculate_next_version(current, &commits),
-            Version {
+            Some(Version {
                 major: 1,
                 minor: 1,
                 patch: 0
-            }
+            })
+        );
+    }
+
+    /// The reason this whole change exists: a batch of only non-releasing types
+    /// must release nothing. `docs`, `chore`, `style`, `refactor`, `perf`,
+    /// `test`, `build`, `ci` have no implicit SemVer effect per the spec.
+    #[test]
+    fn non_releasing_types_produce_no_release() {
+        let current = Version::parse("v1.2.3");
+        for ty in [
+            "docs", "chore", "style", "refactor", "perf", "test", "build", "ci",
+        ] {
+            let commits = vec![format!("{ty}: some change"), format!("{ty}(scope): more")];
+            assert_eq!(
+                calculate_next_version(current, &commits),
+                None,
+                "`{ty}:` commits must not trigger a release"
+            );
+        }
+    }
+
+    /// A docs commit alongside a fix still releases — as a PATCH, driven by the
+    /// fix, not by the docs.
+    #[test]
+    fn releasing_commit_alongside_docs_uses_the_releasing_type() {
+        let current = Version::parse("v1.2.3");
+        let commits = vec!["docs: tidy readme".to_string(), "fix: real bug".to_string()];
+        assert_eq!(
+            calculate_next_version(current, &commits),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 4
+            })
         );
     }
 
     #[test]
-    fn defaults_to_patch_for_non_conventional_commits() {
+    fn non_conventional_commits_do_not_release() {
         let current = Version::parse("v1.0.0");
         let commits = vec!["update readme".to_string()];
-        assert_eq!(
-            calculate_next_version(current, &commits),
-            Version {
-                major: 1,
-                minor: 0,
-                patch: 1
-            }
-        );
+        assert_eq!(calculate_next_version(current, &commits), None);
     }
 }
