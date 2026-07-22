@@ -37,6 +37,17 @@ impl Version {
     pub fn format(&self) -> String {
         format!("{}.{}.{}", self.major, self.minor, self.patch)
     }
+
+    /// Whether `s` is a well-formed version to stamp: `MAJOR.MINOR.PATCH`,
+    /// optionally with a leading `v` and a `-prerelease` suffix. Unlike
+    /// [`parse`](Self::parse), which is lenient and falls back to `0.0.0`, this
+    /// is strict — it exists to reject empty or garbage input before it is
+    /// written into manifests and a git tag.
+    pub fn is_valid(s: &str) -> bool {
+        Regex::new(r"^v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
+            .unwrap()
+            .is_match(s)
+    }
 }
 
 /// Compute the next version from a batch of commit subjects, or `None` when no
@@ -272,5 +283,15 @@ mod tests {
         let current = Version::parse("v1.0.0");
         let commits = vec!["update readme".to_string()];
         assert_eq!(calculate_next_version(current, &commits), None);
+    }
+
+    #[test]
+    fn is_valid_accepts_real_versions_and_rejects_garbage() {
+        for ok in ["2.0.1", "v2.0.1", "1.4.0-beta.3", "0.0.0", "10.20.30-rc.1"] {
+            assert!(Version::is_valid(ok), "{ok} should be valid");
+        }
+        for bad in ["", " ", "v", "2.0", "2", "abc", "2.0.x", "-1.0.0", "2.0.1 "] {
+            assert!(!Version::is_valid(bad), "{bad:?} should be rejected");
+        }
     }
 }

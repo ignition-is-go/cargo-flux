@@ -62,6 +62,16 @@ fn main() -> Result<()> {
                     )
                 })?,
             };
+            // Reject an empty or malformed version before writing anything. A
+            // release workflow that forwards `cargo flux version`'s (now
+            // possibly empty) output as `stamp "$VERSION"` without guarding it
+            // would otherwise stamp `""` into every manifest and tag `v` — a
+            // corrupt release. Fail loudly instead.
+            anyhow::ensure!(
+                version::Version::is_valid(&version_str),
+                "refusing to stamp invalid version {version_str:?}: expected `MAJOR.MINOR.PATCH` \
+                 optionally followed by a `-prerelease` suffix"
+            );
             let modified = stamp::stamp_all(&root, &discovery.packages, &version_str)?;
             for path in &modified {
                 eprintln!("{}", path);
