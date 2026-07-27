@@ -53,13 +53,6 @@ impl ManifestPlugin for UvPlugin {
             .as_ref()
             .and_then(|project| project.name.clone())
             .or_else(|| {
-                manifest
-                    .tool
-                    .as_ref()
-                    .and_then(|tool| tool.uv.as_ref())
-                    .and_then(|uv| uv.package.clone())
-            })
-            .or_else(|| {
                 path.parent()
                     .and_then(|p| p.file_name())
                     .and_then(|name| name.to_str())
@@ -200,7 +193,10 @@ struct PythonTool {
 
 #[derive(Debug, Deserialize)]
 struct UvTool {
-    package: Option<String>,
+    // NOTE: `[tool.uv] package` is a uv BOOLEAN (`false` = virtual workspace root,
+    // not itself an installable package) — NOT a package name. flux takes the name
+    // from `[project].name`, so this key is intentionally not modeled; serde ignores
+    // unknown keys. (Modeling it as `Option<String>` crashed on `package = false`.)
     workspace: Option<UvWorkspace>,
     sources: Option<BTreeMap<String, UvSourceSpec>>,
     #[serde(rename = "dev-dependencies")]
@@ -292,4 +288,44 @@ fn parse_bridges(bridges: Vec<String>) -> Result<Vec<BridgeTarget>> {
         .into_iter()
         .map(|bridge| BridgeTarget::parse(&bridge))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: uv's `[tool.uv] package` is a BOOLEAN (`false` marks a virtual
+    /// workspace root that is not itself an installable package). flux modeled it
+    /// as `Option<String>`, so this manifest failed to parse ("invalid type:
+    /// boolean `false`, expected a string") — crashing `flux graph`/`version` on
+    /// every real uv workspace root. It must now deserialize cleanly, with the
+    /// package name still taken from `[project].name`.
+    #[test]
+    fn parses_virtual_workspace_root_with_package_false() {
+        let manifest = r#"
+[project]
+name = "pulse-pipe"
+version = "0.1.0"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["apps/*", "libs/*"]
+"#;
+        let parsed = toml::from_str::<PyProjectManifest>(manifest)
+            .expect("virtual root with `package = false` must parse");
+        assert_eq!(
+            parsed.project.and_then(|p| p.name).as_deref(),
+            Some("pulse-pipe"),
+        );
+        assert_eq!(
+            parsed
+                .tool
+                .and_then(|t| t.uv)
+                .and_then(|uv| uv.workspace)
+                .and_then(|ws| ws.members),
+            Some(vec!["apps/*".to_string(), "libs/*".to_string()]),
+        );
+    }
 }
