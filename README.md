@@ -29,11 +29,19 @@ Use `cargo flux plan <task>` to inspect the plan without executing anything.
 
 ## Install
 
-Install the binary locally:
+Download a prebuilt binary with [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
 
 ```bash
-cargo install --path . --force
+cargo binstall cargo-flux
 ```
+
+Or compile and install it from crates.io:
+
+```bash
+cargo install cargo-flux
+```
+
+To install a local checkout instead, run `cargo install --path . --force`.
 
 Because the binary is named `cargo-flux`, Cargo exposes it as a subcommand:
 
