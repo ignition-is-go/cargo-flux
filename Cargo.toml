@@ -12,6 +12,11 @@ categories = ["development-tools::cargo-plugins", "development-tools::build-util
 [package.metadata.flux]
 tasks = ["build", "test", "lint", "release"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
