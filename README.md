@@ -23,7 +23,7 @@ The current implementation:
 - follows cross-ecosystem bridge dependencies
 - prints task plans as Unicode trees
 - executes tasks in dependency order with `run`
-- can batch compatible ready Cargo tasks into a single workspace invocation when a task is marked `workspace_batchable`
+- can batch compatible Cargo tasks across native dependency layers into a single workspace invocation when a task is marked `workspace_batchable`
 
 Use `cargo flux plan <task>` to inspect the plan without executing anything.
 
@@ -414,11 +414,11 @@ cargo = ["cargo", "check"]
 
 This does not change planning semantics. Flux still plans package-task nodes first and respects dependency ordering.
 
-Batching only happens at execution time, and only across tasks that are already unblocked in the same ready group.
+Batching only happens at execution time. Compatible Cargo tasks may be combined across native dependency layers because Cargo itself understands the workspace dependency graph. Flux does not batch across task dependencies, ecosystem bridges, non-Cargo tasks, different commands or arguments, or different variable environments.
 
-Today this is implemented for Cargo commands. When multiple ready Cargo packages have the same logical task and that task is marked `workspace_batchable`, Flux can collapse them into a single workspace Cargo invocation such as `cargo check -p a -p b -p c`.
+Today this is implemented for Cargo commands. When multiple Cargo packages have the same logical task and that task is marked `workspace_batchable`, Flux can collapse them into a single workspace Cargo invocation such as `cargo check -p a -p b -p c`.
 
-This is an execution optimization only. The dependency graph, task availability rules, and plan output still operate on package-task nodes.
+This is an execution optimization only. The dependency graph, task availability rules, failure policy, and plan output still operate on package-task nodes. Batched Cargo commands run from the workspace root; unbatched commands retain their package working directory.
 
 ### `ecosystem_depends_on`
 

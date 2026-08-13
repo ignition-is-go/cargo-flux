@@ -13,7 +13,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use graph::WorkspaceGraph;
 use manifest::discover_workspace;
-use plugins::{ExecutionUnit, batch_execution_units};
+use plugins::{ExecutionUnit, batch_execution_plan};
 use std::io::IsTerminal;
 use tasks::{TaskCommand, TaskRegistry};
 
@@ -112,26 +112,24 @@ fn main() -> Result<()> {
                 }
                 Command::Run { task } => {
                     let tasks = TaskRegistry::load(&root)?;
-                    let groups = graph.task_ready_groups(&tasks, &task)?;
-                    let total_tasks = groups.iter().map(Vec::len).sum::<usize>();
+                    let plan = graph.task_execution_plan(&tasks, &task)?;
+                    let total_tasks = plan.tasks.len();
                     let mut started = 0usize;
-                    for group in groups {
-                        for unit in batch_execution_units(group, &tasks, &root)? {
-                            let count = unit.task_count();
-                            started += count;
-                            println!(
-                                "{}",
-                                render_run_start(
-                                    &unit.display_label(stdout_is_terminal),
-                                    started + 1 - count,
-                                    started,
-                                    total_tasks,
-                                    stdout_is_terminal
-                                )
-                            );
-                            if let Err(error) = execute_unit(&unit, &root) {
-                                handle_unit_failure(&unit, error, use_color)?;
-                            }
+                    for unit in batch_execution_plan(plan, &tasks, &root)? {
+                        let count = unit.task_count();
+                        started += count;
+                        println!(
+                            "{}",
+                            render_run_start(
+                                &unit.display_label(stdout_is_terminal),
+                                started + 1 - count,
+                                started,
+                                total_tasks,
+                                stdout_is_terminal
+                            )
+                        );
+                        if let Err(error) = execute_unit(&unit, &root) {
+                            handle_unit_failure(&unit, error, use_color)?;
                         }
                     }
                 }
@@ -241,6 +239,7 @@ fn execute_unit(unit: &ExecutionUnit, _root: &std::path::Path) -> Result<()> {
                     .arg("-lc")
                     .arg(command)
                     .current_dir(&batch.working_dir)
+                    .envs(&batch.variables)
                     .status()?,
                 TaskCommand::Argv(command) => {
                     let (program, args) = command
@@ -249,6 +248,7 @@ fn execute_unit(unit: &ExecutionUnit, _root: &std::path::Path) -> Result<()> {
                     std::process::Command::new(program)
                         .args(args)
                         .current_dir(&batch.working_dir)
+                        .envs(&batch.variables)
                         .status()?
                 }
             };
@@ -338,8 +338,9 @@ fn normalize_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std
 mod tests {
     use super::{handle_task_failure, normalize_args};
     use crate::cli::{Cli, Command};
-    use crate::manifest::{Ecosystem, Package, PackageId};
-    use crate::plugins::{ExecutionUnit, batch_execution_units};
+    use crate::graph::{TaskExecutionPlan, WorkspaceGraph};
+    use crate::manifest::{Ecosystem, Package, PackageId, TaskOptIn};
+    use crate::plugins::{ExecutionUnit, batch_execution_plan, batch_execution_units};
     use crate::tasks::{ResolvedTask, TaskCommand, TaskRegistry};
     use clap::Parser;
     use std::collections::BTreeMap;
@@ -458,8 +459,176 @@ cargo = ["cargo", "check"]
         }
     }
 
-    fn cargo_resolved_task(package_name: &str, explicitly_opted_in: bool) -> ResolvedTask {
-        let package = Package {
+    #[test]
+    fn batches_compatible_cargo_tasks_across_dependency_layers() {
+        let root = temp_dir("cross-layer-cargo-batch");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+autoapply = "inherit"
+cascade = "all"
+workspace_batchable = true
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let base = cargo_package("base");
+        let mut middle = cargo_package("middle");
+        middle.internal_dependencies.push(base.id.clone());
+        let mut app = cargo_package("app");
+        app.internal_dependencies.push(middle.id.clone());
+        app.task_opt_ins
+            .insert("check".to_string(), TaskOptIn::default());
+        let graph = WorkspaceGraph::new(vec![base, middle, app]);
+        let plan = graph
+            .task_execution_plan(&registry, "check")
+            .expect("materialize plan");
+
+        let units = batch_execution_plan(plan, &registry, &root).expect("schedule plan");
+        assert_eq!(units.len(), 1);
+        let ExecutionUnit::Batch(batch) = &units[0] else {
+            panic!("expected one cross-layer Cargo batch");
+        };
+        assert_eq!(batch.package_names, vec!["app", "base", "middle"]);
+    }
+
+    #[test]
+    fn non_cargo_task_remains_a_cross_layer_batching_barrier() {
+        let root = temp_dir("cross-layer-cargo-barrier");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+workspace_batchable = true
+cargo = ["cargo", "check"]
+bun = ["bun", "test"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let mut bun = cargo_resolved_task("sdk", true);
+        bun.ecosystem = Ecosystem::Js;
+        bun.command = TaskCommand::Argv(vec!["bun".to_string(), "test".to_string()]);
+        let plan = TaskExecutionPlan {
+            tasks: vec![
+                cargo_resolved_task("core", true),
+                bun,
+                cargo_resolved_task("app", true),
+            ],
+            prerequisites: vec![vec![], vec![0], vec![1]],
+            absorbable_prerequisites: vec![Default::default(); 3],
+        };
+
+        let units = batch_execution_plan(plan, &registry, &root).expect("schedule plan");
+        assert_eq!(units.len(), 3);
+        assert!(matches!(&units[0], ExecutionUnit::Single(task) if task.package_name == "core"));
+        assert!(matches!(&units[1], ExecutionUnit::Single(task) if task.package_name == "sdk"));
+        assert!(matches!(&units[2], ExecutionUnit::Single(task) if task.package_name == "app"));
+    }
+
+    #[test]
+    fn cargo_package_selectors_precede_test_harness_arguments() {
+        let root = temp_dir("cargo-batch-harness-args");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+workspace_batchable = true
+cargo = ["cargo", "test", "--", "--nocapture"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let mut a = cargo_resolved_task("a", true);
+        let mut b = cargo_resolved_task("b", true);
+        for task in [&mut a, &mut b] {
+            task.command = TaskCommand::Argv(vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ]);
+        }
+
+        let units = batch_execution_units(vec![a, b], &registry, &root).expect("batch units");
+        let ExecutionUnit::Batch(batch) = &units[0] else {
+            panic!("expected Cargo batch");
+        };
+        assert_eq!(
+            batch.command,
+            TaskCommand::Argv(vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "-p".to_string(),
+                "a".to_string(),
+                "-p".to_string(),
+                "b".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn cargo_batches_require_matching_variable_environments() {
+        let root = temp_dir("cargo-batch-variables");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+workspace_batchable = true
+variables = ["PROFILE"]
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let mut a = cargo_resolved_task("a", true);
+        let mut b = cargo_resolved_task("b", true);
+        a.variables
+            .insert("PROFILE".to_string(), "fast".to_string());
+        b.variables
+            .insert("PROFILE".to_string(), "slow".to_string());
+
+        let units = batch_execution_units(vec![a, b], &registry, &root).expect("batch units");
+        assert_eq!(units.len(), 2);
+        assert!(
+            units
+                .iter()
+                .all(|unit| matches!(unit, ExecutionUnit::Single(_)))
+        );
+    }
+
+    #[test]
+    fn cargo_batch_retains_matching_variable_environment() {
+        let root = temp_dir("cargo-batch-matching-variables");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+workspace_batchable = true
+variables = ["PROFILE"]
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let mut a = cargo_resolved_task("a", true);
+        let mut b = cargo_resolved_task("b", true);
+        for task in [&mut a, &mut b] {
+            task.variables
+                .insert("PROFILE".to_string(), "fast".to_string());
+        }
+
+        let units = batch_execution_units(vec![a, b], &registry, &root).expect("batch units");
+        let ExecutionUnit::Batch(batch) = &units[0] else {
+            panic!("expected Cargo batch");
+        };
+        assert_eq!(
+            batch.variables.get("PROFILE").map(String::as_str),
+            Some("fast")
+        );
+    }
+
+    fn cargo_package(package_name: &str) -> Package {
+        Package {
             id: PackageId::new(Ecosystem::Cargo, package_name),
             name: package_name.to_string(),
             ecosystem: Ecosystem::Cargo,
@@ -468,7 +637,11 @@ cargo = ["cargo", "check"]
             task_opt_ins: Default::default(),
             bridged_dependencies: Default::default(),
             internal_dependencies: vec![],
-        };
+        }
+    }
+
+    fn cargo_resolved_task(package_name: &str, explicitly_opted_in: bool) -> ResolvedTask {
+        let package = cargo_package(package_name);
 
         ResolvedTask {
             task_name: "check".to_string(),
