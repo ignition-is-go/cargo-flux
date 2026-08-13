@@ -299,6 +299,10 @@ fn infer_js_package_manager(label: &str) -> Option<JsPackageManager> {
 struct FluxConfig {
     tasks: Option<BTreeMap<String, TaskDefinition>>,
     channels: Option<toml::Value>,
+    // Stamp policy is loaded by the stamp command; accepting it here keeps the
+    // shared flux.toml schema compatible with task and version commands.
+    #[serde(rename = "stamp")]
+    _stamp: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]

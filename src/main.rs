@@ -52,6 +52,9 @@ fn main() -> Result<()> {
         }
         Command::Stamp {
             version: explicit_version,
+            packages,
+            exclude,
+            exclude_versions,
         } => {
             let version_str = match explicit_version {
                 Some(v) => v,
@@ -72,7 +75,21 @@ fn main() -> Result<()> {
                 "refusing to stamp invalid version {version_str:?}: expected `MAJOR.MINOR.PATCH` \
                  optionally followed by a `-prerelease` suffix"
             );
-            let modified = stamp::stamp_all(&root, &discovery.packages, &version_str)?;
+            let config = stamp::StampConfig::load(&root)?;
+            let modified = stamp::stamp_selected(
+                &root,
+                &discovery.packages,
+                &version_str,
+                &stamp::StampOptions {
+                    packages,
+                    exclude,
+                    exclude_versions: config
+                        .exclude_versions
+                        .into_iter()
+                        .chain(exclude_versions)
+                        .collect(),
+                },
+            )?;
             for path in &modified {
                 eprintln!("{}", path);
             }
@@ -94,9 +111,23 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-                Command::Plan { task, ordered } => {
+                Command::Plan {
+                    task,
+                    ordered,
+                    stamp_args,
+                } => {
                     let tasks = TaskRegistry::load(&root)?;
-                    if ordered {
+                    if stamp_args {
+                        let package_names = graph
+                            .task_plan(&tasks, &task)?
+                            .into_iter()
+                            .filter(|resolved| resolved.ecosystem != manifest::Ecosystem::Uv)
+                            .map(|resolved| resolved.package_name)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        for package_name in package_names {
+                            println!("--package={package_name}");
+                        }
+                    } else if ordered {
                         for (index, resolved) in
                             graph.task_plan(&tasks, &task)?.into_iter().enumerate()
                         {
@@ -410,9 +441,31 @@ mod tests {
         let cli = Cli::parse_from(["cargo-flux", "plan", "build", "--ordered"]);
 
         match cli.command {
-            Command::Plan { task, ordered } => {
+            Command::Plan {
+                task,
+                ordered,
+                stamp_args,
+            } => {
                 assert_eq!(task, "build");
                 assert!(ordered);
+                assert!(!stamp_args);
+            }
+            other => panic!("expected plan command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_stamp_args_plan_flag() {
+        let cli = Cli::parse_from(["cargo-flux", "plan", "publish", "--stamp-args"]);
+        match cli.command {
+            Command::Plan {
+                task,
+                ordered,
+                stamp_args,
+            } => {
+                assert_eq!(task, "publish");
+                assert!(!ordered);
+                assert!(stamp_args);
             }
             other => panic!("expected plan command, got {other:?}"),
         }
@@ -681,8 +734,48 @@ cargo = ["cargo", "check"]
     fn parses_stamp_command_with_explicit_version() {
         let cli = Cli::parse_from(["cargo-flux", "stamp", "1.2.3"]);
         match cli.command {
-            Command::Stamp { version } => {
+            Command::Stamp {
+                version,
+                packages,
+                exclude,
+                exclude_versions,
+            } => {
                 assert_eq!(version.as_deref(), Some("1.2.3"));
+                assert!(packages.is_empty());
+                assert!(exclude.is_empty());
+                assert!(exclude_versions.is_empty());
+            }
+            other => panic!("expected stamp command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_repeated_stamp_selectors() {
+        let cli = Cli::parse_from([
+            "cargo-flux",
+            "stamp",
+            "1.2.3",
+            "-p",
+            "sdk",
+            "--package",
+            "app",
+            "--exclude",
+            "private",
+            "--exclude-version",
+            "0.0.0",
+            "--exclude-version",
+            "0.0.1",
+        ]);
+        match cli.command {
+            Command::Stamp {
+                packages,
+                exclude,
+                exclude_versions,
+                ..
+            } => {
+                assert_eq!(packages, ["sdk", "app"]);
+                assert_eq!(exclude, ["private"]);
+                assert_eq!(exclude_versions, ["0.0.0", "0.0.1"]);
             }
             other => panic!("expected stamp command, got {other:?}"),
         }
@@ -692,7 +785,7 @@ cargo = ["cargo", "check"]
     fn parses_stamp_command_without_version() {
         let cli = Cli::parse_from(["cargo-flux", "stamp"]);
         match cli.command {
-            Command::Stamp { version } => {
+            Command::Stamp { version, .. } => {
                 assert!(version.is_none());
             }
             other => panic!("expected stamp command, got {other:?}"),
