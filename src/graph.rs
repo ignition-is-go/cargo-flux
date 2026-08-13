@@ -141,28 +141,56 @@ impl WorkspaceGraph {
             .collect()
     }
 
-    pub fn task_ready_groups(
+    pub(crate) fn task_execution_plan(
         &self,
         tasks: &TaskRegistry,
         task: &str,
-    ) -> Result<Vec<Vec<ResolvedTask>>> {
+    ) -> Result<TaskExecutionPlan> {
         let plan = self.materialize_task_plan(tasks, task)?;
-        let groups = plan.ready_groups()?;
-        groups
-            .into_iter()
-            .map(|group| {
-                group
+        let nodes = plan.priority_order()?;
+        let indices = nodes
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, node)| (node, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolved = Vec::with_capacity(nodes.len());
+        let mut prerequisites = Vec::with_capacity(nodes.len());
+        let mut absorbable_prerequisites = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let package = self
+                .packages
+                .get(&node.package_id)
+                .expect("task node package must exist");
+            resolved.push(tasks.resolve(package, &node.task_name)?);
+            let node_prerequisites = plan
+                .prerequisites
+                .get(node)
+                .into_iter()
+                .flatten()
+                .map(|prerequisite| indices[prerequisite])
+                .collect::<Vec<_>>();
+            absorbable_prerequisites.push(
+                plan.prerequisites
+                    .get(node)
                     .into_iter()
-                    .map(|node| {
-                        let package = self
-                            .packages
-                            .get(&node.package_id)
-                            .expect("task node package must exist");
-                        tasks.resolve(package, &node.task_name)
+                    .flatten()
+                    .filter(|prerequisite| {
+                        prerequisite.task_name == node.task_name
+                            && package
+                                .internal_dependencies
+                                .contains(&prerequisite.package_id)
                     })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect()
+                    .map(|prerequisite| indices[prerequisite])
+                    .collect(),
+            );
+            prerequisites.push(node_prerequisites);
+        }
+        Ok(TaskExecutionPlan {
+            tasks: resolved,
+            prerequisites,
+            absorbable_prerequisites,
+        })
     }
 
     fn materialize_task_plan(
@@ -953,6 +981,12 @@ fn output_uses_color() -> bool {
 }
 
 #[derive(Debug)]
+pub(crate) struct TaskExecutionPlan {
+    pub(crate) tasks: Vec<ResolvedTask>,
+    pub(crate) prerequisites: Vec<Vec<usize>>,
+    pub(crate) absorbable_prerequisites: Vec<BTreeSet<usize>>,
+}
+
 struct MaterializedTaskPlan {
     included: BTreeSet<TaskNode>,
     prerequisites: BTreeMap<TaskNode, Vec<TaskNode>>,
@@ -985,10 +1019,6 @@ impl MaterializedTaskPlan {
 
     fn priority_order(&self) -> Result<Vec<TaskNode>> {
         self.topological_order()
-    }
-
-    fn ready_groups(&self) -> Result<Vec<Vec<TaskNode>>> {
-        Ok(self.priority_schedule()?.1)
     }
 
     fn priority_schedule(&self) -> Result<(Vec<TaskNode>, Vec<Vec<TaskNode>>)> {

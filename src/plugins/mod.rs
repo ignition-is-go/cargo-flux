@@ -46,6 +46,71 @@ pub(crate) fn batch_execution_units(
     Ok(units)
 }
 
+/// Schedule a task DAG into execution units. A batchable Cargo task absorbs
+/// compatible pending Cargo tasks whose prerequisites are already complete or
+/// are themselves inside the same batch. Other ecosystems, commands, task
+/// names, and variable environments remain ordering barriers.
+pub(crate) fn batch_execution_plan(
+    plan: crate::graph::TaskExecutionPlan,
+    tasks: &TaskRegistry,
+    root: &Path,
+) -> Result<Vec<ExecutionUnit>> {
+    let mut pending = (0..plan.tasks.len()).collect::<BTreeSet<_>>();
+    let mut completed = BTreeSet::new();
+    let mut units = Vec::new();
+
+    while !pending.is_empty() {
+        let seed = pending
+            .iter()
+            .copied()
+            .find(|index| {
+                plan.prerequisites[*index]
+                    .iter()
+                    .all(|prerequisite| completed.contains(prerequisite))
+            })
+            .ok_or_else(|| anyhow::anyhow!("cycle detected while scheduling task execution"))?;
+        let seed_key = cargo::task_batch_compatibility_key(&plan.tasks[seed], tasks)?;
+        let mut cohort = BTreeSet::from([seed]);
+
+        if let Some(seed_key) = seed_key {
+            loop {
+                let mut changed = false;
+                for index in pending.iter().copied() {
+                    if cohort.contains(&index)
+                        || cargo::task_batch_compatibility_key(&plan.tasks[index], tasks)?
+                            != Some(seed_key.clone())
+                    {
+                        continue;
+                    }
+                    if plan.prerequisites[index].iter().all(|prerequisite| {
+                        completed.contains(prerequisite)
+                            || (cohort.contains(prerequisite)
+                                && plan.absorbable_prerequisites[index].contains(prerequisite))
+                    }) {
+                        cohort.insert(index);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        let group = cohort
+            .iter()
+            .map(|index| plan.tasks[*index].clone())
+            .collect();
+        units.extend(batch_execution_units(group, tasks, root)?);
+        for index in cohort {
+            pending.remove(&index);
+            completed.insert(index);
+        }
+    }
+
+    Ok(units)
+}
+
 pub(crate) enum ExecutionUnit {
     Single(ResolvedTask),
     Batch(BatchedExecution),
@@ -58,6 +123,7 @@ pub(crate) struct BatchedExecution {
     pub(crate) explicitly_opted_in: bool,
     pub(crate) display_label: String,
     pub(crate) working_dir: PathBuf,
+    pub(crate) variables: std::collections::BTreeMap<String, String>,
 }
 
 impl ExecutionUnit {

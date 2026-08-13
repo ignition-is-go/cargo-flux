@@ -237,20 +237,43 @@ fn parse_bridges(bridges: Vec<String>) -> Result<Vec<BridgeTarget>> {
         .collect()
 }
 
+pub(crate) type BatchCompatibilityKey = (String, Vec<String>, BTreeMap<String, String>);
+
+pub(crate) fn task_batch_compatibility_key(
+    resolved: &ResolvedTask,
+    tasks: &TaskRegistry,
+) -> Result<Option<BatchCompatibilityKey>> {
+    if resolved.ecosystem != Ecosystem::Cargo || !tasks.workspace_batchable(&resolved.task_name)? {
+        return Ok(None);
+    }
+    Ok(cargo_batch_command(&resolved.command).map(|command| {
+        (
+            resolved.task_name.clone(),
+            command,
+            resolved.variables.clone(),
+        )
+    }))
+}
+
 pub(crate) fn batch_execution_units(
     group: Vec<ResolvedTask>,
     tasks: &TaskRegistry,
     root: &Path,
 ) -> Result<Vec<ExecutionUnit>> {
     let mut units = Vec::new();
-    let mut pending_batches = BTreeMap::<(String, Vec<String>), Vec<ResolvedTask>>::new();
+    let mut pending_batches =
+        BTreeMap::<(String, Vec<String>, BTreeMap<String, String>), Vec<ResolvedTask>>::new();
 
     for resolved in group {
         if tasks.workspace_batchable(&resolved.task_name)?
             && let Some(command) = cargo_batch_command(&resolved.command)
         {
             pending_batches
-                .entry((resolved.task_name.clone(), command))
+                .entry((
+                    resolved.task_name.clone(),
+                    command,
+                    resolved.variables.clone(),
+                ))
                 .or_default()
                 .push(resolved);
         } else {
@@ -258,7 +281,7 @@ pub(crate) fn batch_execution_units(
         }
     }
 
-    for ((task_name, command), mut resolved_group) in pending_batches {
+    for ((task_name, command, variables), mut resolved_group) in pending_batches {
         resolved_group.sort_by(|left, right| left.package_name.cmp(&right.package_name));
         if resolved_group.len() == 1 {
             units.push(ExecutionUnit::Single(
@@ -285,6 +308,7 @@ pub(crate) fn batch_execution_units(
             explicitly_opted_in,
             display_label: render_batch_label(&task_name, &package_names, true),
             working_dir: root.to_path_buf(),
+            variables,
         }));
     }
 
@@ -304,10 +328,14 @@ fn cargo_batch_command(command: &TaskCommand) -> Option<Vec<String>> {
 }
 
 fn batch_command_for_packages(mut command: Vec<String>, package_names: &[String]) -> Vec<String> {
-    for package_name in package_names {
-        command.push("-p".to_string());
-        command.push(package_name.clone());
-    }
+    let insertion_index = command
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(command.len());
+    let package_arguments = package_names
+        .iter()
+        .flat_map(|package_name| ["-p".to_string(), package_name.clone()]);
+    command.splice(insertion_index..insertion_index, package_arguments);
     command
 }
 
