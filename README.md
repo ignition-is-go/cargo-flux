@@ -61,6 +61,7 @@ cargo-flux --help
 cargo flux graph --root /path/to/repo
 cargo flux topo --root /path/to/repo
 cargo flux plan build --root /path/to/repo
+cargo flux plan publish --stamp-args
 cargo flux run build --root /path/to/repo
 cargo flux version
 cargo flux stamp
@@ -91,6 +92,17 @@ Use `--ordered` to print the actual execution order instead of the tree view:
 ```bash
 cargo flux plan build --ordered --root /path/to/repo
 ```
+
+Use `--stamp-args` to turn the unique Cargo and JavaScript packages in a task
+plan into repeatable `--package=NAME` arguments:
+
+```bash
+cargo flux plan publish --stamp-args
+cargo flux stamp "$VERSION" $(cargo flux plan publish --stamp-args)
+```
+
+This uses the plan's existing native and cross-ecosystem closure, so a publish
+task can define exactly which manifests are release-stamped.
 
 ### `run <task>`
 
@@ -139,21 +151,34 @@ cargo flux version --channel beta  # override channel
 
 ### `stamp [version]`
 
-Writes a version string into every discovered workspace manifest.
+Writes a version string into selected Cargo and JavaScript workspace manifests.
 
 - If a version argument is provided, stamps that literal string.
 - If omitted, calculates the next version the same way as `version`.
+- `--exclude-version VERSION` skips packages currently at that version.
+- Repeated `--package/-p NAME` arguments select an explicit subset.
+- Repeated `--exclude NAME` arguments remove packages from the selection.
 
-Flux updates:
-
-- `Cargo.toml`: the `[package] version` field and any intra-workspace path dependency versions
-- `package.json`: the top-level `"version"` field
+Flux updates dependency requirements only when the dependency target is also
+selected. In particular, an app may be stamped while a path/workspace dependency
+on an intentionally unversioned `0.0.0` package remains unchanged.
 
 Prints each modified file path to stderr and the stamped version to stdout.
 
 ```bash
-cargo flux stamp            # calculate and stamp
-cargo flux stamp 2.0.0      # stamp an explicit version
+cargo flux stamp                         # calculate and stamp
+cargo flux stamp 2.0.0                   # stamp an explicit version
+cargo flux stamp 2.0.0 --exclude-version 0.0.0
+cargo flux stamp 2.0.0 -p public-sdk -p release-app
+cargo flux stamp 2.0.0 --exclude some-private-crate
+```
+
+A repository can make version exclusions the default in `flux.toml`; command-line
+exclusions are additive:
+
+```toml
+[stamp]
+exclude_versions = ["0.0.0"]
 ```
 
 ## Release Channels

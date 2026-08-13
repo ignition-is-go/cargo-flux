@@ -23,8 +23,11 @@ pub enum Command {
         /// Logical task name to plan.
         task: String,
         /// Print the planned execution order instead of the dependency tree.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "stamp_args")]
         ordered: bool,
+        /// Print repeatable stamp package arguments for every package in the plan.
+        #[arg(long, conflicts_with = "ordered")]
+        stamp_args: bool,
     },
     /// Execute a logical task in planned order.
     Run {
@@ -37,9 +40,18 @@ pub enum Command {
         #[arg(long)]
         channel: Option<String>,
     },
-    /// Stamp a version into all workspace manifests.
+    /// Stamp a version into selected workspace manifests.
     Stamp {
         /// Version to stamp. If omitted, calculates the next version automatically.
         version: Option<String>,
+        /// Stamp only packages with this name. May be repeated.
+        #[arg(long = "package", short = 'p')]
+        packages: Vec<String>,
+        /// Do not stamp packages with this name. May be repeated.
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Do not stamp packages whose current version equals this value. May be repeated.
+        #[arg(long = "exclude-version")]
+        exclude_versions: Vec<String>,
     },
 }
