@@ -74,6 +74,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard};
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_git_repo(prefix: &str) -> PathBuf {
         let millis = std::time::SystemTime::now()
@@ -168,13 +171,18 @@ mod tests {
 
     struct SetCurrentDir {
         previous: PathBuf,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl SetCurrentDir {
         fn new(path: &std::path::Path) -> Self {
+            let lock = CWD_LOCK.lock().expect("lock current directory");
             let previous = std::env::current_dir().expect("get cwd");
             std::env::set_current_dir(path).expect("set cwd");
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
