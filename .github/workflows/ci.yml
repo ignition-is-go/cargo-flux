@@ -11,10 +11,13 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: public-ci
     steps:
       - uses: actions/checkout@v4
+      - run: sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && sudo apt-get update && sudo apt-get install -y build-essential pkg-config
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - run: cargo test
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
