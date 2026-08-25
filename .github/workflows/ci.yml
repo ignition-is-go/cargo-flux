@@ -21,6 +21,16 @@ jobs:
       - run: cargo test
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  windows-check:
+    runs-on: public-ci-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build the Windows release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
   release:
     needs: check
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
