@@ -19,6 +19,7 @@ The current implementation:
 - discovers workspace packages
 - resolves native in-workspace dependencies
 - loads repo-defined logical tasks from `flux.toml`
+- runs explicit `root` task variants once from the workspace root
 - determines which packages participate in a task
 - follows cross-ecosystem bridge dependencies
 - prints task plans as Unicode trees
@@ -141,6 +142,32 @@ The base ref must exist locally. CI should fetch the target branch with enough
 history for Git to find a merge base. A missing or shallow base is an error, not
 an empty affected set. An empty diff succeeds, and `run` reports that there is
 nothing to run.
+
+### Workspace-root tasks
+
+A task can define a `root` command that runs once from the workspace root rather
+than once per package:
+
+```toml
+[tasks.prepare]
+root = ["bun", "install"]
+
+[tasks.check]
+root = ["./tools/check-workspace.sh"]
+depends_on = ["prepare"]
+autoapply = "all"
+cargo = ["cargo", "check"]
+```
+
+`cargo flux run check` runs `prepare` once, the root `check` once, and then the
+participating package checks. Root variants appear as `workspace:check [root]`
+in plans and progress output. A package task may depend on a root-only task; the
+root dependency runs once before package work. A root variant can depend only on
+tasks that also define a root command, which keeps dependency scope explicit.
+
+With `--affected`, reachable root variants run once when the committed diff is
+nonempty. An empty diff skips both root and package work. Root tasks are omitted
+from `plan --stamp-args` because they are not packages.
 
 ### `run <task>`
 
@@ -278,7 +305,9 @@ Each ecosystem plugin discovers the packages that belong to that ecosystem's wor
 
 Logical tasks are repo-level names like `build`, `test`, `lint`, or `generate`.
 
-They are defined once in `flux.toml`, with different command variants per ecosystem.
+They are defined once in `flux.toml`, with different command variants per
+ecosystem. A `root` variant runs once at the workspace root and can coexist with
+package variants for the same logical task.
 
 ### Bridges
 
@@ -300,7 +329,9 @@ Example:
 - `build` may depend on `test`
 - `publish` may depend on `build`
 
-These dependencies apply per package. Flux runs the dependency task on the same package before the dependent task.
+Package dependencies apply per package: Flux runs the dependency task on the
+same package before the dependent task. Root variants follow root variants with
+the same names and run once before package execution.
 
 ## How Workspace Discovery Works
 
@@ -429,6 +460,7 @@ default = ["docker", "build", "."]
 
 Each task can define commands for:
 
+- `root` (runs once from the workspace root)
 - `default`
 - `cargo`
 - `npm`
@@ -461,7 +493,10 @@ cargo = ["cargo", "build"]
 cargo = ["cargo", "test"]
 ```
 
-When a task depends on another task, Flux schedules the dependency task on the same package before the dependent task.
+For package variants, Flux schedules the dependency task on the same package
+before the dependent task. A package task can also depend on a root-only task;
+that root command runs once before package execution. Root variants resolve
+`depends_on` only through other root variants.
 
 This composes with cascades and bridges. If `build` appears on a package because it was an entrypoint, a cascaded dependency, or a bridged package, `build`'s task dependencies are applied there too, subject to the dependency task's own `autoapply` and `cascade` settings.
 

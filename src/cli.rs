@@ -22,7 +22,7 @@ pub enum Command {
     Plan {
         /// Logical task name to plan.
         task: String,
-        /// Limit execution to packages affected since this base ref.
+        /// Limit execution to affected packages and root tasks.
         #[arg(long, visible_alias = "affected-from", value_name = "BASE")]
         affected: Option<String>,
         /// Print the planned execution order instead of the dependency tree.
@@ -36,7 +36,7 @@ pub enum Command {
     Run {
         /// Logical task name to execute.
         task: String,
-        /// Limit execution to packages affected since this base ref.
+        /// Limit execution to affected packages and root tasks.
         #[arg(long, visible_alias = "affected-from", value_name = "BASE")]
         affected: Option<String>,
     },
