@@ -57,16 +57,29 @@ steps:
     with:
       fetch-depth: 0
 
-  - uses: ignition-is-go/cargo-flux@v0.7.0
+  - id: flux
+    uses: ignition-is-go/cargo-flux@v0.7.0
     with:
       task: test
       affected: origin/${{ github.base_ref }}
+
+  - if: steps.flux.outputs.outcome == 'completed'
+    env:
+      TASK_OUTPUTS: ${{ steps.flux.outputs['task-outputs'] }}
+    run: echo "$TASK_OUTPUTS"
 ```
 
 Omit `task` to install Cargo Flux and add it to `PATH` for later steps. `version`
 defaults to the CLI version carried by the selected action release; it can be
 overridden explicitly. `root` defaults to `.`. A full checkout is required when
 using `affected` so Git can find the merge base.
+
+When a task is supplied, the action exposes `outcome` (`completed` or `skipped`)
+and `task-outputs`, a compact JSON object keyed by root task and output name.
+GitHub expressions can read arbitrary values with
+`fromJSON(steps.flux.outputs['task-outputs'])`. Setup-only use leaves both execution
+outputs empty. Failed tasks remain failed action steps and do not promise a
+report.
 
 The action contains no JavaScript wrapper. Its composite steps download the
 platform-native release archive, verify the published SHA-256 file, cache the
@@ -196,6 +209,43 @@ in plans and progress output. A package task may depend on a root-only task; the
 root dependency runs once before package work. A root variant can depend only on
 tasks that also define a root command, which keeps dependency scope explicit.
 
+Root-only workflows can capture the final command's stdout, gate dependent
+tasks, and execute structured argv steps without a shell script:
+
+```toml
+[tasks.calculate-version]
+root = ["cargo", "flux", "version"]
+outputs = { version = "stdout" }
+
+[tasks.publish-production]
+depends_on = ["calculate-version"]
+when = { output = "calculate-version.version", nonempty = true }
+root_steps = [
+  ["cargo", "flux", "stamp", "${calculate-version.version}"],
+  ["cargo", "update", "--workspace"],
+  ["cargo", "fmt", "--all"],
+  ["git", "add", "-A"],
+  ["git", "commit", "-m", "chore(release): v${calculate-version.version}"],
+]
+```
+
+`root` and `root_steps` are mutually exclusive. Steps run sequentially and stop
+on the first real failure. Output substitution is supported only in argv
+commands, where the full substituted value remains one argument and cannot be
+reinterpreted as shell source. Empty stdout is a produced empty value, so the
+`nonempty` condition skips `publish-production` and its dependent chain
+successfully. A missing or failed producer is not treated as an empty output.
+Dynamic outputs and conditions are currently restricted to root-only tasks so a
+single value cannot be ambiguously assigned to many package executions.
+
+`cargo flux run TASK --report report.json` writes a stable JSON report containing
+the requested outcome (`completed` or `skipped`) and nested task outputs. Reports
+can be adapted without loading a workspace:
+
+```bash
+cargo flux report github-output --input report.json --output-file "$GITHUB_OUTPUT"
+```
+
 With `--affected`, reachable root variants run once when the committed diff is
 nonempty. An empty diff skips both root and package work. Root tasks are omitted
 from `plan --stamp-args` because they are not packages.
@@ -229,16 +279,9 @@ Flux determines the version by:
 5. For prerelease channels, appending `-channel.N` where N is one more than the highest existing tag
 
 When step 3 finds no release-worthy commit, `cargo flux version` prints nothing
-to stdout (and exits 0), and `cargo flux stamp` refuses without an explicit
-version. A release workflow should treat empty output as "nothing to release":
-
-```bash
-VERSION=$(cargo flux version)
-[ -z "$VERSION" ] && { echo "nothing to release"; exit 0; }
-```
-
-A genuine failure still exits non-zero, so empty-and-successful means exactly
-"no release-worthy commits" and never a swallowed error.
+to stdout and exits 0. Capturing it as a root task output and using a `nonempty`
+condition, as shown above, turns that result into a successful skipped release
+chain without hiding genuine calculation or publishing failures.
 
 ```bash
 cargo flux version              # auto-detect channel from current branch

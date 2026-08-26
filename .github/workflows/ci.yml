@@ -22,7 +22,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   windows-check:
-    runs-on: public-ci-windows
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
@@ -84,7 +84,7 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             binary_ext: ''
-          - os: public-ci-windows
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_ext: .exe
     runs-on: ${{ matrix.os }}
@@ -129,15 +129,39 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15-intel, macos-15, public-ci-windows]
+        os: [ubuntu-22.04, macos-15-intel, macos-15, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.release.outputs.tag }}
-      - name: Install the published binary through the action
+      - name: Create an output-composition fixture
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-flux-action-smoke"
+          cat > "$RUNNER_TEMP/cargo-flux-action-smoke/flux.toml" <<'EOF'
+          [tasks.probe]
+          root = ["git", "--version"]
+          outputs = { version = "stdout" }
+
+          [tasks.gated]
+          depends_on = ["probe"]
+          when = { output = "probe.version", nonempty = true }
+          root = ["git", "--version"]
+          EOF
+      - name: Install and run the published binary through the action
+        id: flux
         uses: ./
         with:
           version: ${{ needs.release.outputs.version }}
-      - name: Verify Cargo Flux is on PATH
-        run: cargo flux --help
+          root: ${{ runner.temp }}/cargo-flux-action-smoke
+          task: gated
+      - name: Verify Cargo Flux outputs and PATH
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.flux.outputs.outcome }}
+          TASK_OUTPUTS: ${{ steps.flux.outputs['task-outputs'] }}
+        run: |
+          test "$OUTCOME" = completed
+          grep -q '"probe":{"version":"git version ' <<< "$TASK_OUTPUTS"
+          cargo-flux --help

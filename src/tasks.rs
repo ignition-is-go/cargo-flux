@@ -56,11 +56,12 @@ impl TaskRegistry {
             .tasks
             .get(task_name)
             .ok_or_else(|| anyhow!("task `{task_name}` is not defined in flux.toml"))?;
+        let has_root = task.has_root_command()?;
         for dependency in &task.depends_on {
             let dependency_task = self.tasks.get(dependency).ok_or_else(|| {
                 anyhow!("task `{task_name}` depends on undefined task `{dependency}` in flux.toml")
             })?;
-            if task.root.is_some() && dependency_task.root.is_none() {
+            if has_root && !dependency_task.has_root_command()? {
                 bail!(
                     "root task `{task_name}` depends on `{dependency}`, but `{dependency}` has no root command"
                 );
@@ -68,18 +69,141 @@ impl TaskRegistry {
             self.collect_root_tasks(dependency, visiting, completed, plan)?;
         }
 
+        let condition = task
+            .when
+            .as_ref()
+            .map(|condition| self.resolve_output_condition(task_name, condition))
+            .transpose()?;
+        if task.outputs.len() > 1 {
+            bail!(
+                "task `{task_name}` declares multiple outputs, but the `stdout` source currently supports one"
+            );
+        }
+        if !task.outputs.is_empty() && !is_output_task_name(task_name) {
+            bail!(
+                "output-producing task name `{task_name}` must start with a letter or `_` and contain only letters, digits, `_`, `-`, or `.`"
+            );
+        }
+        for output_name in task.outputs.keys() {
+            if !is_output_identifier(output_name) {
+                bail!(
+                    "task `{task_name}` output name `{output_name}` must start with a letter or `_` and contain only letters, digits, `_`, or `-`"
+                );
+            }
+        }
+        if (!task.outputs.is_empty() || condition.is_some()) && !has_root {
+            bail!("task `{task_name}` uses root outputs or conditions but has no root command");
+        }
+        if (!task.outputs.is_empty() || condition.is_some()) && task.has_package_command() {
+            bail!(
+                "task `{task_name}` uses dynamic root outputs or conditions and cannot also define package commands"
+            );
+        }
+
         visiting.remove(task_name);
         completed.insert(task_name.to_string());
-        if let Some(command) = task.root.as_ref().map(CommandSpec::to_command) {
-            if command.is_empty() {
+        let commands = task.root_commands()?;
+        if !commands.is_empty() {
+            if commands.iter().any(TaskCommand::is_empty) {
                 bail!("root task `{task_name}` resolved to an empty command");
+            }
+            for command in &commands {
+                self.validate_root_output_references(task_name, command)?;
             }
             plan.push(ResolvedRootTask {
                 task_name: task_name.to_string(),
-                command,
+                commands,
+                depends_on: task.depends_on.clone(),
+                output_names: task.outputs.keys().cloned().collect(),
+                condition,
             });
         }
         Ok(())
+    }
+
+    fn validate_root_output_references(
+        &self,
+        task_name: &str,
+        command: &TaskCommand,
+    ) -> Result<()> {
+        match command {
+            TaskCommand::Shell(command) => {
+                if !qualified_output_references(command, false)?.is_empty() {
+                    bail!("task output substitution is supported only in argv commands");
+                }
+            }
+            TaskCommand::Argv(command) => {
+                for part in command {
+                    for reference in qualified_output_references(part, true)? {
+                        self.validate_output_reference(task_name, reference)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_output_reference(&self, task_name: &str, reference: &str) -> Result<()> {
+        let (producer, output) = reference.rsplit_once('.').ok_or_else(|| {
+            anyhow!("task output reference must be `task.output`, got `{reference}`")
+        })?;
+        if !self.has_transitive_dependency(task_name, producer, &mut BTreeSet::new())? {
+            bail!(
+                "task `{task_name}` references `{reference}`, but `{producer}` is not a dependency"
+            );
+        }
+        let producer_task = self
+            .tasks
+            .get(producer)
+            .ok_or_else(|| anyhow!("task `{task_name}` references undefined task `{producer}`"))?;
+        if !producer_task.outputs.contains_key(output) {
+            bail!("task `{task_name}` references undefined output `{reference}`");
+        }
+        Ok(())
+    }
+
+    fn resolve_output_condition(
+        &self,
+        task_name: &str,
+        condition: &TaskCondition,
+    ) -> Result<OutputCondition> {
+        if !condition.nonempty {
+            bail!("task `{task_name}` has a `when` condition without `nonempty = true`");
+        }
+        let (producer, output) = condition.output.rsplit_once('.').ok_or_else(|| {
+            anyhow!(
+                "task `{task_name}` condition must reference an output as `task.output`, got `{}`",
+                condition.output
+            )
+        })?;
+        self.validate_output_reference(task_name, &condition.output)?;
+        Ok(OutputCondition {
+            task_name: producer.to_string(),
+            output_name: output.to_string(),
+        })
+    }
+
+    fn has_transitive_dependency(
+        &self,
+        task_name: &str,
+        target: &str,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<bool> {
+        if !visited.insert(task_name.to_string()) {
+            return Ok(false);
+        }
+        let task = self
+            .tasks
+            .get(task_name)
+            .ok_or_else(|| anyhow!("task `{task_name}` is not defined in flux.toml"))?;
+        for dependency in &task.depends_on {
+            if dependency == target
+                || self.has_transitive_dependency(dependency, target, visited)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn resolve(&self, package: &Package, task_name: &str) -> Result<ResolvedTask> {
@@ -341,13 +465,30 @@ impl ResolvedTask {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRootTask {
     pub task_name: String,
-    pub command: TaskCommand,
+    pub commands: Vec<TaskCommand>,
+    pub depends_on: Vec<String>,
+    pub output_names: Vec<String>,
+    pub condition: Option<OutputCondition>,
 }
 
 impl ResolvedRootTask {
     pub fn render(&self) -> String {
-        format!("workspace:{} [root]", self.task_name)
+        format!(
+            "workspace:{} [root]{}",
+            self.task_name,
+            if self.condition.is_some() {
+                " (conditional)"
+            } else {
+                ""
+            }
+        )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputCondition {
+    pub task_name: String,
+    pub output_name: String,
 }
 
 fn infer_js_package_manager(label: &str) -> Option<JsPackageManager> {
@@ -388,6 +529,13 @@ struct TaskDefinition {
     variables: Vec<String>,
     /// Command executed once from the workspace root.
     root: Option<CommandSpec>,
+    /// Structured commands executed sequentially from the workspace root.
+    root_steps: Option<Vec<Vec<String>>>,
+    /// Named values captured from the final root command's stdout.
+    #[serde(default)]
+    outputs: BTreeMap<String, TaskOutputSource>,
+    /// Runtime condition evaluated from a dependency's output.
+    when: Option<TaskCondition>,
     #[serde(rename = "default")]
     default_command: Option<CommandSpec>,
     cargo: Option<CommandSpec>,
@@ -396,6 +544,20 @@ struct TaskDefinition {
     yarn: Option<CommandSpec>,
     bun: Option<CommandSpec>,
     uv: Option<CommandSpec>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum TaskOutputSource {
+    Stdout,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskCondition {
+    output: String,
+    #[serde(default)]
+    nonempty: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
@@ -490,6 +652,41 @@ impl<'de> Deserialize<'de> for AutoApply {
 }
 
 impl TaskDefinition {
+    fn has_root_command(&self) -> Result<bool> {
+        if self.root.is_some() && self.root_steps.is_some() {
+            bail!("a task cannot define both `root` and `root_steps`");
+        }
+        if self.root_steps.as_ref().is_some_and(Vec::is_empty) {
+            bail!("a task's `root_steps` cannot be empty");
+        }
+        Ok(self.root.is_some() || self.root_steps.is_some())
+    }
+
+    fn root_commands(&self) -> Result<Vec<TaskCommand>> {
+        self.has_root_command()?;
+        Ok(match &self.root {
+            Some(command) => vec![command.to_command()],
+            None => self
+                .root_steps
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .cloned()
+                .map(TaskCommand::Argv)
+                .collect(),
+        })
+    }
+
+    fn has_package_command(&self) -> bool {
+        self.default_command.is_some()
+            || self.cargo.is_some()
+            || self.npm.is_some()
+            || self.pnpm.is_some()
+            || self.yarn.is_some()
+            || self.bun.is_some()
+            || self.uv.is_some()
+    }
+
     fn command_for(&self, package: &Package) -> Option<TaskCommand> {
         let spec = match package.ecosystem {
             Ecosystem::Cargo => self.cargo.as_ref().or(self.default_command.as_ref()),
@@ -543,14 +740,120 @@ impl TaskCommand {
     fn is_empty(&self) -> bool {
         match self {
             TaskCommand::Shell(command) => command.trim().is_empty(),
-            TaskCommand::Argv(command) => command.is_empty(),
+            TaskCommand::Argv(command) => command.first().is_none_or(|program| program.is_empty()),
+        }
+    }
+
+    pub fn interpolate_outputs(
+        &self,
+        outputs: &BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Result<Self> {
+        match self {
+            // Shell commands remain an explicit escape hatch. Flux never rewrites
+            // their source because doing so would change shell expansion semantics.
+            TaskCommand::Shell(command) => {
+                if !qualified_output_references(command, false)?.is_empty() {
+                    bail!("task output substitution is supported only in argv commands");
+                }
+                Ok(TaskCommand::Shell(command.clone()))
+            }
+            TaskCommand::Argv(command) => Ok(TaskCommand::Argv(
+                command
+                    .iter()
+                    .map(|part| interpolate_output_part(part, outputs))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
         }
     }
 }
 
+fn is_output_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+}
+
+fn is_output_task_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '_'
+                || character == '-'
+                || character == '.'
+        })
+}
+
+fn is_output_reference_syntax(reference: &str) -> bool {
+    reference
+        .rsplit_once('.')
+        .is_some_and(|(task_name, output_name)| {
+            is_output_task_name(task_name) && is_output_identifier(output_name)
+        })
+}
+
+fn qualified_output_references(part: &str, reject_unclosed: bool) -> Result<Vec<&str>> {
+    let mut references = Vec::new();
+    let mut rest = part;
+    while let Some(start) = rest.find("${") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            if reject_unclosed {
+                bail!("unclosed task output reference in `{part}`");
+            }
+            break;
+        };
+        let reference = &after_start[..end];
+        if is_output_reference_syntax(reference) {
+            references.push(reference);
+        }
+        rest = &after_start[end + 1..];
+    }
+    Ok(references)
+}
+
+fn interpolate_output_part(
+    part: &str,
+    outputs: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<String> {
+    let mut result = String::new();
+    let mut rest = part;
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            bail!("unclosed task output reference in `{part}`");
+        };
+        let reference = &after_start[..end];
+        if is_output_reference_syntax(reference) {
+            let (task_name, output_name) = reference
+                .rsplit_once('.')
+                .expect("validated output reference must contain a dot");
+            let value = outputs
+                .get(task_name)
+                .and_then(|task| task.get(output_name))
+                .ok_or_else(|| anyhow!("task output `{reference}` is not available"))?;
+            result.push_str(value);
+        } else {
+            result.push_str("${");
+            result.push_str(reference);
+            result.push('}');
+        }
+        rest = &after_start[end + 1..];
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AutoApply, TaskRegistry};
+    use super::{AutoApply, TaskCommand, TaskRegistry};
     use crate::manifest::{Ecosystem, JsPackageManager, Package, PackageId};
     use std::collections::BTreeMap;
     use std::fs;
@@ -1127,6 +1430,179 @@ depends_on = ["check"]
             .expect_err("cross-scope root dependency must fail");
 
         assert!(error.to_string().contains("has no root command"));
+    }
+
+    #[test]
+    fn resolves_root_steps_outputs_and_condition() {
+        let root = temp_dir("root-output-condition");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.probe]
+root = ["printf", "1.2.3"]
+outputs = { version = "stdout" }
+
+[tasks.ship]
+depends_on = ["probe"]
+when = { output = "probe.version", nonempty = true }
+root_steps = [["echo", "prepare"], ["echo", "${probe.version}"]]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let plan = registry.root_task_plan("ship").expect("root plan");
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].output_names, ["version"]);
+        assert_eq!(plan[1].commands.len(), 2);
+        assert_eq!(plan[1].depends_on, ["probe"]);
+        let condition = plan[1].condition.as_ref().expect("condition");
+        assert_eq!(condition.task_name, "probe");
+        assert_eq!(condition.output_name, "version");
+    }
+
+    #[test]
+    fn rejects_condition_on_non_dependency_output() {
+        let root = temp_dir("non-dependency-output");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.probe]
+root = ["printf", "1.2.3"]
+outputs = { version = "stdout" }
+
+[tasks.ship]
+when = { output = "probe.version", nonempty = true }
+root = ["echo", "ship"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let error = registry
+            .root_task_plan("ship")
+            .expect_err("invalid condition");
+        assert!(error.to_string().contains("is not a dependency"));
+    }
+
+    #[test]
+    fn rejects_root_and_root_steps_together() {
+        let root = temp_dir("root-command-conflict");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.ship]
+root = ["echo", "one"]
+root_steps = [["echo", "two"]]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let error = registry
+            .root_task_plan("ship")
+            .expect_err("conflicting root commands");
+        assert!(error.to_string().contains("both `root` and `root_steps`"));
+    }
+
+    #[test]
+    fn output_interpolation_preserves_one_argv_element() {
+        let command = TaskCommand::Argv(vec!["touch".into(), "v${probe.version}".into()]);
+        let outputs = BTreeMap::from([(
+            "probe".to_string(),
+            BTreeMap::from([("version".to_string(), " 1; echo bad".to_string())]),
+        )]);
+        let resolved = command
+            .interpolate_outputs(&outputs)
+            .expect("interpolate output");
+        assert_eq!(
+            resolved,
+            TaskCommand::Argv(vec!["touch".into(), "v 1; echo bad".into()])
+        );
+    }
+
+    #[test]
+    fn rejects_argv_output_reference_without_dependency() {
+        let root = temp_dir("argv-output-nondependency");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.probe]
+root = ["printf", "value"]
+outputs = { value = "stdout" }
+
+[tasks.consumer]
+root = ["echo", "${probe.value}"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let error = registry
+            .root_task_plan("consumer")
+            .expect_err("implicit dependency should fail");
+        assert!(error.to_string().contains("is not a dependency"));
+    }
+
+    #[test]
+    fn rejects_output_reference_in_shell_command_before_execution() {
+        let root = temp_dir("shell-output-reference");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.probe]
+root = ["printf", "value"]
+outputs = { value = "stdout" }
+
+[tasks.consumer]
+depends_on = ["probe"]
+root = "echo ${probe.value}"
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let error = registry
+            .root_task_plan("consumer")
+            .expect_err("shell substitution should fail");
+        assert!(error.to_string().contains("only in argv commands"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_output_names() {
+        let root = temp_dir("ambiguous-output-name");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.probe]
+root = ["printf", "value"]
+outputs = { "release.version" = "stdout" }
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let error = registry
+            .root_task_plan("probe")
+            .expect_err("ambiguous output should fail");
+        assert!(error.to_string().contains("must start with a letter"));
+    }
+
+    #[test]
+    fn preserves_non_flux_braced_values_in_argv() {
+        let command = TaskCommand::Argv(vec![
+            "echo".into(),
+            "${VERSION:-1.0}".into(),
+            "${FILE:-foo.bar}".into(),
+        ]);
+        let resolved = command
+            .interpolate_outputs(&BTreeMap::new())
+            .expect("preserve ordinary values");
+        assert_eq!(command, resolved);
+    }
+
+    #[test]
+    fn preserves_normal_shell_parameter_defaults_with_dots() {
+        let root = temp_dir("shell-parameter-default");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.render]
+root = 'printf "%s" "${VERSION:-1.0}" "${FILE:-foo.bar}"'
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let plan = registry.root_task_plan("render").expect("root plan");
+        assert_eq!(plan.len(), 1);
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
