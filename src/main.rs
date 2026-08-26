@@ -113,23 +113,33 @@ fn main() -> Result<()> {
                 }
                 Command::Plan {
                     task,
+                    affected,
                     ordered,
                     stamp_args,
                 } => {
                     let tasks = TaskRegistry::load(&root)?;
+                    let affected = affected
+                        .as_deref()
+                        .map(|base| {
+                            let changed = git::get_changed_files(&root, base)?;
+                            graph.affected_packages(&root, &changed)
+                        })
+                        .transpose()?;
                     if stamp_args {
-                        let package_names = graph
-                            .task_plan(&tasks, &task)?
-                            .into_iter()
-                            .filter(|resolved| resolved.ecosystem != manifest::Ecosystem::Uv)
-                            .map(|resolved| resolved.package_name)
-                            .collect::<std::collections::BTreeSet<_>>();
+                        let package_names =
+                            task_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?
+                                .into_iter()
+                                .filter(|resolved| resolved.ecosystem != manifest::Ecosystem::Uv)
+                                .map(|resolved| resolved.package_name)
+                                .collect::<std::collections::BTreeSet<_>>();
                         for package_name in package_names {
                             println!("--package={package_name}");
                         }
                     } else if ordered {
                         for (index, resolved) in
-                            graph.task_plan(&tasks, &task)?.into_iter().enumerate()
+                            task_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?
+                                .into_iter()
+                                .enumerate()
                         {
                             println!(
                                 "{}. {}",
@@ -138,13 +148,43 @@ fn main() -> Result<()> {
                             );
                         }
                     } else {
-                        println!("{}", graph.render_task_plan_tree(&tasks, &task)?);
+                        let rendered =
+                            render_task_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?;
+                        if !rendered.is_empty() {
+                            println!("{rendered}");
+                        }
                     }
                 }
-                Command::Run { task } => {
+                Command::Affected { base } => {
+                    let changed = git::get_changed_files(&root, &base)?;
+                    let affected = graph.affected_packages(&root, &changed)?;
+                    for package in graph.affected_in_native_order(&affected)? {
+                        println!("{}", package.id);
+                    }
+                }
+                Command::Run { task, affected } => {
                     let tasks = TaskRegistry::load(&root)?;
-                    let plan = graph.task_execution_plan(&tasks, &task)?;
+                    let affected_base = affected.clone();
+                    let affected = affected
+                        .as_deref()
+                        .map(|base| {
+                            let changed = git::get_changed_files(&root, base)?;
+                            graph.affected_packages(&root, &changed)
+                        })
+                        .transpose()?;
+                    let plan =
+                        task_execution_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?;
                     let total_tasks = plan.tasks.len();
+                    if total_tasks == 0 {
+                        match affected_base {
+                            Some(base) => println!(
+                                "nothing to run: task `{task}` has no work affected by changes since `{base}`"
+                            ),
+                            None => {
+                                println!("nothing to run: task `{task}` produced an empty plan")
+                            }
+                        }
+                    }
                     let mut started = 0usize;
                     for unit in batch_execution_plan(plan, &tasks, &root)? {
                         let count = unit.task_count();
@@ -170,6 +210,42 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn task_plan_with_scope(
+    graph: &WorkspaceGraph,
+    tasks: &TaskRegistry,
+    task: &str,
+    affected: Option<&std::collections::BTreeSet<manifest::PackageId>>,
+) -> Result<Vec<tasks::ResolvedTask>> {
+    match affected {
+        Some(affected) => graph.task_plan_affected(tasks, task, Some(affected)),
+        None => graph.task_plan(tasks, task),
+    }
+}
+
+fn render_task_plan_with_scope(
+    graph: &WorkspaceGraph,
+    tasks: &TaskRegistry,
+    task: &str,
+    affected: Option<&std::collections::BTreeSet<manifest::PackageId>>,
+) -> Result<String> {
+    match affected {
+        Some(affected) => graph.render_task_plan_tree_affected(tasks, task, Some(affected)),
+        None => graph.render_task_plan_tree(tasks, task),
+    }
+}
+
+fn task_execution_plan_with_scope(
+    graph: &WorkspaceGraph,
+    tasks: &TaskRegistry,
+    task: &str,
+    affected: Option<&std::collections::BTreeSet<manifest::PackageId>>,
+) -> Result<graph::TaskExecutionPlan> {
+    match affected {
+        Some(affected) => graph.task_execution_plan_affected(tasks, task, Some(affected)),
+        None => graph.task_execution_plan(tasks, task),
+    }
 }
 
 /// Compute the next release version for the current branch, or `None` when the
@@ -443,10 +519,12 @@ mod tests {
         match cli.command {
             Command::Plan {
                 task,
+                affected,
                 ordered,
                 stamp_args,
             } => {
                 assert_eq!(task, "build");
+                assert_eq!(affected, None);
                 assert!(ordered);
                 assert!(!stamp_args);
             }
@@ -460,14 +538,39 @@ mod tests {
         match cli.command {
             Command::Plan {
                 task,
+                affected,
                 ordered,
                 stamp_args,
             } => {
                 assert_eq!(task, "publish");
+                assert_eq!(affected, None);
                 assert!(!ordered);
                 assert!(stamp_args);
             }
             other => panic!("expected plan command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_affected_filter_for_plan_and_run() {
+        let plan = Cli::parse_from(["cargo-flux", "plan", "check", "--affected", "origin/main"]);
+        match plan.command {
+            Command::Plan { affected, .. } => {
+                assert_eq!(affected.as_deref(), Some("origin/main"));
+            }
+            other => panic!("expected plan command, got {other:?}"),
+        }
+
+        let run = Cli::parse_from(["cargo-flux", "run", "check", "--affected-from", "main"]);
+        match run.command {
+            Command::Run { affected, .. } => assert_eq!(affected.as_deref(), Some("main")),
+            other => panic!("expected run command, got {other:?}"),
+        }
+
+        let affected = Cli::parse_from(["cargo-flux", "affected", "--base", "origin/dev"]);
+        match affected.command {
+            Command::Affected { base } => assert_eq!(base, "origin/dev"),
+            other => panic!("expected affected command, got {other:?}"),
         }
     }
 

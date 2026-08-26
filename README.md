@@ -60,9 +60,10 @@ cargo-flux --help
 ```bash
 cargo flux graph --root /path/to/repo
 cargo flux topo --root /path/to/repo
-cargo flux plan build --root /path/to/repo
+cargo flux affected --base origin/main --root /path/to/repo
+cargo flux plan build --affected origin/main --root /path/to/repo
 cargo flux plan publish --stamp-args
-cargo flux run build --root /path/to/repo
+cargo flux run build --affected origin/main --root /path/to/repo
 cargo flux version
 cargo flux stamp
 cargo flux stamp 1.2.3
@@ -103,6 +104,43 @@ cargo flux stamp "$VERSION" $(cargo flux plan publish --stamp-args)
 
 This uses the plan's existing native and cross-ecosystem closure, so a publish
 task can define exactly which manifests are release-stamped.
+
+### Affected package and task filtering
+
+Compare the current committed branch with the merge base of a target branch or
+commit:
+
+```bash
+cargo flux affected --base origin/main
+cargo flux plan test --affected origin/main
+cargo flux run test --affected origin/main
+```
+
+`affected` prints package IDs such as `cargo:core` in native dependency order.
+The `--affected BASE` option on `plan` and `run` limits execution to affected
+packages. `--affected-from` is an alias for the same option.
+
+Flux uses Git's three-dot merge-base semantics. New commits made only on the
+base branch do not count as pull-request changes. The comparison uses committed
+`HEAD` only; staged, unstaged, and untracked files are not included.
+
+A changed file first affects its owning package. Flux then walks reverse native
+and cross-ecosystem bridge dependencies, so changing a low-level package also
+affects every transitive consumer. The normal task plan is materialized from
+those affected entrypoints and then scoped to affected packages. Same-package
+task dependencies, ordering, and batching are preserved; an unchanged upstream
+package is not reintroduced merely because a task normally cascades to it.
+
+Workspace-wide inputs such as `flux.toml`, root workspace manifests, lockfiles,
+`.cargo/config.toml`, and Rust toolchain files affect every package. Files that
+cannot be assigned to a current package are also treated conservatively as
+workspace-wide changes. This handles shared inputs and deleted packages without
+silently skipping required CI work.
+
+The base ref must exist locally. CI should fetch the target branch with enough
+history for Git to find a merge base. A missing or shallow base is an error, not
+an empty affected set. An empty diff succeeds, and `run` reports that there is
+nothing to run.
 
 ### `run <task>`
 

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Execute a git command and capture trimmed stdout
@@ -17,6 +18,71 @@ fn exec(cmd: &str) -> Result<String> {
         bail!("command failed: {}\n{}", cmd, stderr);
     }
 
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Return files changed on `HEAD` since its merge base with `base`.
+///
+/// Rename detection is disabled deliberately so both sides of a rename are
+/// reported. That lets package moves and deletions invalidate the old owner as
+/// well as the new one.
+pub fn get_changed_files(root: &Path, base: &str) -> Result<Vec<PathBuf>> {
+    let base_commit = git_output(
+        root,
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .with_context(|| {
+        format!(
+            "could not resolve base ref `{base}` as a commit; fetch the base branch and ensure checkout history is deep enough"
+        )
+    })?;
+    let range = format!("{base_commit}...HEAD");
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--relative",
+            &range,
+            "--",
+        ])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to compare HEAD with base ref `{base}`"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("failed to compare HEAD with base ref `{base}`: {stderr}");
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(PathBuf::from)
+                .context("git diff returned a path that is not valid UTF-8")
+        })
+        .collect()
+}
+
+fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .context("failed to execute git")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git command failed: {stderr}");
+    }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -167,6 +233,50 @@ mod tests {
         let _guard = SetCurrentDir::new(&repo);
         let count = get_existing_prerelease_count("1.0.0", "beta");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn changed_files_use_merge_base_and_exclude_base_only_commits() {
+        let repo = temp_git_repo("changed-merge-base");
+        git(&repo, "git branch base");
+        git(&repo, "git checkout -b feature");
+        fs::write(repo.join("feature.txt"), "feature").expect("write feature file");
+        git(
+            &repo,
+            "git add feature.txt && git commit -m 'feature change'",
+        );
+        git(&repo, "git checkout base");
+        fs::write(repo.join("base.txt"), "base").expect("write base file");
+        git(&repo, "git add base.txt && git commit -m 'base change'");
+        git(&repo, "git checkout feature");
+
+        let changed = get_changed_files(&repo, "base").expect("diff feature from base");
+
+        assert_eq!(changed, vec![PathBuf::from("feature.txt")]);
+    }
+
+    #[test]
+    fn changed_files_preserve_spaces_and_newlines() {
+        let repo = temp_git_repo("changed-special-paths");
+        git(&repo, "git branch base");
+        git(&repo, "git checkout -b feature");
+        fs::write(repo.join("file with spaces.txt"), "spaces").expect("write spaced file");
+        fs::write(repo.join("file\nwith-newline.txt"), "newline").expect("write newline file");
+        git(&repo, "git add . && git commit -m 'special paths'");
+
+        let changed = get_changed_files(&repo, "base").expect("diff special paths");
+
+        assert!(changed.contains(&PathBuf::from("file with spaces.txt")));
+        assert!(changed.contains(&PathBuf::from("file\nwith-newline.txt")));
+    }
+
+    #[test]
+    fn changed_files_fail_for_missing_base() {
+        let repo = temp_git_repo("changed-missing-base");
+        let error =
+            get_changed_files(&repo, "definitely-missing").expect_err("missing base must fail");
+
+        assert!(error.to_string().contains("could not resolve base ref"));
     }
 
     struct SetCurrentDir {
