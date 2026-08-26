@@ -118,16 +118,17 @@ fn main() -> Result<()> {
                     stamp_args,
                 } => {
                     let tasks = TaskRegistry::load(&root)?;
-                    let affected = affected
-                        .as_deref()
-                        .map(|base| {
-                            let changed = git::get_changed_files(&root, base)?;
-                            graph.affected_packages(&root, &changed)
-                        })
-                        .transpose()?;
+                    let affected = calculate_affected_scope(&root, &graph, affected.as_deref())?;
+                    let affected_packages = affected.as_ref().map(|scope| &scope.packages);
+                    let root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
+                        tasks.root_task_plan(&task)?
+                    } else {
+                        Vec::new()
+                    };
+
                     if stamp_args {
                         let package_names =
-                            task_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?
+                            task_plan_with_scope(&graph, &tasks, &task, affected_packages)?
                                 .into_iter()
                                 .filter(|resolved| resolved.ecosystem != manifest::Ecosystem::Uv)
                                 .map(|resolved| resolved.package_name)
@@ -136,20 +137,30 @@ fn main() -> Result<()> {
                             println!("--package={package_name}");
                         }
                     } else if ordered {
+                        for (index, resolved) in root_plan.iter().enumerate() {
+                            println!("{}. {}", index + 1, resolved.render());
+                        }
+                        let offset = root_plan.len();
                         for (index, resolved) in
-                            task_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?
+                            task_plan_with_scope(&graph, &tasks, &task, affected_packages)?
                                 .into_iter()
                                 .enumerate()
                         {
                             println!(
                                 "{}. {}",
-                                index + 1,
+                                offset + index + 1,
                                 resolved.render_colored(stdout_is_terminal)
                             );
                         }
                     } else {
+                        for resolved in &root_plan {
+                            println!("{}", resolved.render());
+                        }
                         let rendered =
-                            render_task_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?;
+                            render_task_plan_with_scope(&graph, &tasks, &task, affected_packages)?;
+                        if !root_plan.is_empty() && !rendered.is_empty() {
+                            println!();
+                        }
                         if !rendered.is_empty() {
                             println!("{rendered}");
                         }
@@ -165,16 +176,16 @@ fn main() -> Result<()> {
                 Command::Run { task, affected } => {
                     let tasks = TaskRegistry::load(&root)?;
                     let affected_base = affected.clone();
-                    let affected = affected
-                        .as_deref()
-                        .map(|base| {
-                            let changed = git::get_changed_files(&root, base)?;
-                            graph.affected_packages(&root, &changed)
-                        })
-                        .transpose()?;
+                    let affected = calculate_affected_scope(&root, &graph, affected.as_deref())?;
+                    let affected_packages = affected.as_ref().map(|scope| &scope.packages);
+                    let root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
+                        tasks.root_task_plan(&task)?
+                    } else {
+                        Vec::new()
+                    };
                     let plan =
-                        task_execution_plan_with_scope(&graph, &tasks, &task, affected.as_ref())?;
-                    let total_tasks = plan.tasks.len();
+                        task_execution_plan_with_scope(&graph, &tasks, &task, affected_packages)?;
+                    let total_tasks = root_plan.len() + plan.tasks.len();
                     if total_tasks == 0 {
                         match affected_base {
                             Some(base) => println!(
@@ -185,7 +196,22 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+
                     let mut started = 0usize;
+                    for resolved in root_plan {
+                        started += 1;
+                        println!(
+                            "{}",
+                            render_run_start(
+                                &resolved.render(),
+                                started,
+                                started,
+                                total_tasks,
+                                stdout_is_terminal,
+                            )
+                        );
+                        execute_task(&resolved.command, &root, &std::collections::BTreeMap::new())?;
+                    }
                     for unit in batch_execution_plan(plan, &tasks, &root)? {
                         let count = unit.task_count();
                         started += count;
@@ -210,6 +236,28 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct AffectedScope {
+    packages: std::collections::BTreeSet<manifest::PackageId>,
+    has_changes: bool,
+}
+
+fn calculate_affected_scope(
+    root: &std::path::Path,
+    graph: &WorkspaceGraph,
+    base: Option<&str>,
+) -> Result<Option<AffectedScope>> {
+    base.map(|base| {
+        let changed = git::get_changed_files(root, base)?;
+        let has_changes = !changed.is_empty();
+        let packages = graph.affected_packages(root, &changed)?;
+        Ok(AffectedScope {
+            packages,
+            has_changes,
+        })
+    })
+    .transpose()
 }
 
 fn task_plan_with_scope(
@@ -443,7 +491,7 @@ fn normalize_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_task_failure, normalize_args};
+    use super::{execute_task, handle_task_failure, normalize_args};
     use crate::cli::{Cli, Command};
     use crate::graph::{TaskExecutionPlan, WorkspaceGraph};
     use crate::manifest::{Ecosystem, Package, PackageId, TaskOptIn};
@@ -572,6 +620,26 @@ mod tests {
             Command::Affected { base } => assert_eq!(base, "origin/dev"),
             other => panic!("expected affected command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn executes_root_task_once_from_workspace_root() {
+        let root = temp_dir("execute-root-task");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.prepare]
+root = ["sh", "-c", "pwd > root-task-pwd"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let plan = registry.root_task_plan("prepare").expect("root plan");
+
+        assert_eq!(plan.len(), 1);
+        execute_task(&plan[0].command, &root, &BTreeMap::new()).expect("execute root task");
+
+        let actual = fs::read_to_string(root.join("root-task-pwd")).expect("read task output");
+        assert_eq!(PathBuf::from(actual.trim()), root);
     }
 
     #[test]

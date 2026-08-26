@@ -1,7 +1,7 @@
 use crate::manifest::{Ecosystem, JsPackageManager, Package, colorize_display_label};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Deserializer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -26,6 +26,60 @@ impl TaskRegistry {
 
     pub fn channels(&self) -> Option<&toml::Value> {
         self.channels.as_ref()
+    }
+
+    /// Resolve workspace-root task variants reachable from a logical task.
+    /// Each root variant appears once, after its root dependencies.
+    pub fn root_task_plan(&self, task_name: &str) -> Result<Vec<ResolvedRootTask>> {
+        let mut visiting = BTreeSet::new();
+        let mut completed = BTreeSet::new();
+        let mut plan = Vec::new();
+        self.collect_root_tasks(task_name, &mut visiting, &mut completed, &mut plan)?;
+        Ok(plan)
+    }
+
+    fn collect_root_tasks(
+        &self,
+        task_name: &str,
+        visiting: &mut BTreeSet<String>,
+        completed: &mut BTreeSet<String>,
+        plan: &mut Vec<ResolvedRootTask>,
+    ) -> Result<()> {
+        if completed.contains(task_name) {
+            return Ok(());
+        }
+        if !visiting.insert(task_name.to_string()) {
+            bail!("cycle detected in root task dependencies involving `{task_name}`");
+        }
+
+        let task = self
+            .tasks
+            .get(task_name)
+            .ok_or_else(|| anyhow!("task `{task_name}` is not defined in flux.toml"))?;
+        for dependency in &task.depends_on {
+            let dependency_task = self.tasks.get(dependency).ok_or_else(|| {
+                anyhow!("task `{task_name}` depends on undefined task `{dependency}` in flux.toml")
+            })?;
+            if task.root.is_some() && dependency_task.root.is_none() {
+                bail!(
+                    "root task `{task_name}` depends on `{dependency}`, but `{dependency}` has no root command"
+                );
+            }
+            self.collect_root_tasks(dependency, visiting, completed, plan)?;
+        }
+
+        visiting.remove(task_name);
+        completed.insert(task_name.to_string());
+        if let Some(command) = task.root.as_ref().map(CommandSpec::to_command) {
+            if command.is_empty() {
+                bail!("root task `{task_name}` resolved to an empty command");
+            }
+            plan.push(ResolvedRootTask {
+                task_name: task_name.to_string(),
+                command,
+            });
+        }
+        Ok(())
     }
 
     pub fn resolve(&self, package: &Package, task_name: &str) -> Result<ResolvedTask> {
@@ -284,6 +338,18 @@ impl ResolvedTask {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRootTask {
+    pub task_name: String,
+    pub command: TaskCommand,
+}
+
+impl ResolvedRootTask {
+    pub fn render(&self) -> String {
+        format!("workspace:{} [root]", self.task_name)
+    }
+}
+
 fn infer_js_package_manager(label: &str) -> Option<JsPackageManager> {
     match label {
         "npm" => Some(JsPackageManager::Npm),
@@ -320,6 +386,8 @@ struct TaskDefinition {
     workspace_batchable: bool,
     #[serde(default)]
     variables: Vec<String>,
+    /// Command executed once from the workspace root.
+    root: Option<CommandSpec>,
     #[serde(rename = "default")]
     default_command: Option<CommandSpec>,
     cargo: Option<CommandSpec>,
@@ -957,6 +1025,108 @@ npm = ["npm", "run", "build"]
         };
 
         assert_eq!(resolved.render(), "web:build [npm] {mode=production}");
+    }
+
+    #[test]
+    fn resolves_root_tasks_once_in_dependency_order() {
+        let root = temp_dir("root-task-plan");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.prepare]
+root = ["echo", "prepare"]
+
+[tasks.release]
+root = ["echo", "release"]
+depends_on = ["prepare"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+
+        let plan = registry.root_task_plan("release").expect("root task plan");
+        let rendered = plan.iter().map(|task| task.render()).collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec!["workspace:prepare [root]", "workspace:release [root]"]
+        );
+    }
+
+    #[test]
+    fn package_tasks_can_depend_on_a_single_root_task() {
+        let root = temp_dir("package-depends-root");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.prepare]
+root = ["echo", "prepare"]
+
+[tasks.check]
+depends_on = ["prepare"]
+autoapply = "all"
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+
+        let plan = registry
+            .root_task_plan("check")
+            .expect("root prerequisite plan");
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].task_name, "prepare");
+    }
+
+    #[test]
+    fn root_task_dependency_cycles_fail() {
+        let root = temp_dir("root-task-cycle");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.first]
+root = ["echo", "first"]
+depends_on = ["second"]
+
+[tasks.second]
+root = ["echo", "second"]
+depends_on = ["first"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+
+        let error = registry
+            .root_task_plan("first")
+            .expect_err("root cycle must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cycle detected in root task dependencies")
+        );
+    }
+
+    #[test]
+    fn root_tasks_reject_non_root_dependencies() {
+        let root = temp_dir("root-depends-package");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+autoapply = "all"
+cargo = ["cargo", "check"]
+
+[tasks.release]
+root = ["echo", "release"]
+depends_on = ["check"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+
+        let error = registry
+            .root_task_plan("release")
+            .expect_err("cross-scope root dependency must fail");
+
+        assert!(error.to_string().contains("has no root command"));
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
