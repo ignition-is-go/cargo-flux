@@ -27,6 +27,12 @@ outputs:
   path:
     description: Absolute path to the installed cargo-flux executable
     value: ${{ steps.install-unix.outputs.path || steps.install-windows.outputs.path }}
+  outcome:
+    description: Requested task outcome (`completed` or `skipped`); empty in setup-only mode
+    value: ${{ steps.run-unix.outputs.outcome || steps.run-windows.outputs.outcome }}
+  task-outputs:
+    description: Compact JSON object containing outputs from executed root tasks
+    value: ${{ steps.run-unix.outputs['task-outputs'] || steps.run-windows.outputs['task-outputs'] }}
 
 runs:
   using: composite
@@ -189,6 +195,7 @@ runs:
         "path=$binary" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
     - name: Run Cargo Flux task
+      id: run-unix
       if: inputs.task != '' && runner.os != 'Windows'
       shell: bash
       env:
@@ -198,13 +205,17 @@ runs:
         WORKSPACE_ROOT: ${{ inputs.root }}
       run: |
         set -euo pipefail
-        args=(run "$TASK" --root "$WORKSPACE_ROOT")
+        report="$(mktemp "${RUNNER_TEMP}/cargo-flux-report.XXXXXX")"
+        args=(run "$TASK" --root "$WORKSPACE_ROOT" --report "$report")
         if [[ -n "$AFFECTED" ]]; then
           args+=(--affected "$AFFECTED")
         fi
         "$CARGO_FLUX" "${args[@]}"
+        "$CARGO_FLUX" report github-output --input "$report" --output-file "$GITHUB_OUTPUT"
+        rm -f "$report"
 
     - name: Run Cargo Flux task
+      id: run-windows
       if: inputs.task != '' && runner.os == 'Windows'
       shell: pwsh
       env:
@@ -214,12 +225,16 @@ runs:
         WORKSPACE_ROOT: ${{ inputs.root }}
       run: |
         $ErrorActionPreference = 'Stop'
-        $arguments = @('run', $env:TASK, '--root', $env:WORKSPACE_ROOT)
+        $report = Join-Path $env:RUNNER_TEMP "cargo-flux-report-$([guid]::NewGuid()).json"
+        $arguments = @('run', $env:TASK, '--root', $env:WORKSPACE_ROOT, '--report', $report)
         if (-not [string]::IsNullOrWhiteSpace($env:AFFECTED)) {
           $arguments += @('--affected', $env:AFFECTED)
         }
         & $env:CARGO_FLUX @arguments
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & $env:CARGO_FLUX report github-output --input $report --output-file $env:GITHUB_OUTPUT
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Remove-Item -Force $report
 
 branding:
   icon: git-branch

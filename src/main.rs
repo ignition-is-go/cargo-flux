@@ -10,15 +10,24 @@ mod version;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, ReportCommand};
 use graph::WorkspaceGraph;
 use manifest::discover_workspace;
 use plugins::{ExecutionUnit, batch_execution_plan};
-use std::io::IsTerminal;
-use tasks::{TaskCommand, TaskRegistry};
+use serde::{Deserialize, Serialize};
+use std::io::{IsTerminal, Write};
+use tasks::{ResolvedRootTask, TaskCommand, TaskRegistry};
 
 fn main() -> Result<()> {
     let cli = Cli::parse_from(normalize_args(std::env::args_os()));
+    if let Command::Report { command } = &cli.command {
+        match command {
+            ReportCommand::GithubOutput { input, output_file } => {
+                append_github_outputs(input, output_file)?;
+            }
+        }
+        return Ok(());
+    }
     let root = cli.root.canonicalize()?;
     let discovery = discover_workspace(&root)?;
     let stdout_is_terminal = std::io::stdout().is_terminal();
@@ -173,7 +182,11 @@ fn main() -> Result<()> {
                         println!("{}", package.id);
                     }
                 }
-                Command::Run { task, affected } => {
+                Command::Run {
+                    task,
+                    affected,
+                    report,
+                } => {
                     let tasks = TaskRegistry::load(&root)?;
                     let affected_base = affected.clone();
                     let affected = calculate_affected_scope(&root, &graph, affected.as_deref())?;
@@ -198,39 +211,66 @@ fn main() -> Result<()> {
                     }
 
                     let mut started = 0usize;
-                    for resolved in root_plan {
-                        started += 1;
+                    let root_execution = execute_root_plan(
+                        &root_plan,
+                        &root,
+                        total_tasks,
+                        stdout_is_terminal,
+                        &mut started,
+                    )?;
+                    let root_outcomes = root_execution.outcomes;
+                    let task_outputs = root_execution.task_outputs;
+
+                    let target_skipped = has_skipped_root_dependency(&root_outcomes);
+                    if !target_skipped {
+                        for unit in batch_execution_plan(plan, &tasks, &root)? {
+                            let count = unit.task_count();
+                            started += count;
+                            println!(
+                                "{}",
+                                render_run_start(
+                                    &unit.display_label(stdout_is_terminal),
+                                    started + 1 - count,
+                                    started,
+                                    total_tasks,
+                                    stdout_is_terminal
+                                )
+                            );
+                            if let Err(error) = execute_unit(&unit, &root) {
+                                handle_unit_failure(&unit, error, use_color)?;
+                            }
+                        }
+                    } else if !plan.tasks.is_empty() {
+                        let count = plan.tasks.len();
+                        started += count;
                         println!(
-                            "{}",
+                            "{} — skipped by root condition",
                             render_run_start(
-                                &resolved.render(),
-                                started,
+                                "package tasks",
+                                started + 1 - count,
                                 started,
                                 total_tasks,
                                 stdout_is_terminal,
                             )
                         );
-                        execute_task(&resolved.command, &root, &std::collections::BTreeMap::new())?;
                     }
-                    for unit in batch_execution_plan(plan, &tasks, &root)? {
-                        let count = unit.task_count();
-                        started += count;
-                        println!(
-                            "{}",
-                            render_run_start(
-                                &unit.display_label(stdout_is_terminal),
-                                started + 1 - count,
-                                started,
-                                total_tasks,
-                                stdout_is_terminal
-                            )
-                        );
-                        if let Err(error) = execute_unit(&unit, &root) {
-                            handle_unit_failure(&unit, error, use_color)?;
-                        }
+
+                    let execution_report = ExecutionReport {
+                        schema_version: execution_report_schema_version(),
+                        outcome: if total_tasks == 0 || target_skipped {
+                            TaskExecutionOutcome::Skipped
+                        } else {
+                            TaskExecutionOutcome::Completed
+                        },
+                        task_outputs,
+                    };
+                    if let Some(path) = report {
+                        write_execution_report(&path, &execution_report)?;
                     }
                 }
-                Command::Version { .. } | Command::Stamp { .. } => unreachable!(),
+                Command::Version { .. } | Command::Stamp { .. } | Command::Report { .. } => {
+                    unreachable!()
+                }
             }
         }
     }
@@ -353,31 +393,240 @@ fn calculate_version(
     Ok(Some(full_version))
 }
 
+fn has_skipped_root_dependency(
+    outcomes: &std::collections::BTreeMap<String, TaskExecutionOutcome>,
+) -> bool {
+    outcomes
+        .values()
+        .any(|outcome| matches!(outcome, TaskExecutionOutcome::Skipped))
+}
+
+struct RootExecution {
+    outcomes: std::collections::BTreeMap<String, TaskExecutionOutcome>,
+    task_outputs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+fn execute_root_plan(
+    plan: &[ResolvedRootTask],
+    root: &std::path::Path,
+    total_tasks: usize,
+    use_color: bool,
+    started: &mut usize,
+) -> Result<RootExecution> {
+    let mut task_outputs = std::collections::BTreeMap::new();
+    let mut outcomes = std::collections::BTreeMap::new();
+    for resolved in plan {
+        *started += 1;
+        let dependency_skipped = resolved.depends_on.iter().any(|dependency| {
+            matches!(
+                outcomes.get(dependency),
+                Some(TaskExecutionOutcome::Skipped)
+            )
+        });
+        let condition_met = resolved.condition.as_ref().is_none_or(|condition| {
+            task_outputs
+                .get(&condition.task_name)
+                .and_then(|outputs: &std::collections::BTreeMap<String, String>| {
+                    outputs.get(&condition.output_name)
+                })
+                .is_some_and(|value| !value.is_empty())
+        });
+        if dependency_skipped || !condition_met {
+            println!(
+                "{} — skipped",
+                render_run_start(
+                    &resolved.render(),
+                    *started,
+                    *started,
+                    total_tasks,
+                    use_color,
+                )
+            );
+            outcomes.insert(resolved.task_name.clone(), TaskExecutionOutcome::Skipped);
+            continue;
+        }
+
+        println!(
+            "{}",
+            render_run_start(
+                &resolved.render(),
+                *started,
+                *started,
+                total_tasks,
+                use_color,
+            )
+        );
+        let mut captured_stdout = None;
+        for (index, command) in resolved.commands.iter().enumerate() {
+            let command = command.interpolate_outputs(&task_outputs)?;
+            let capture = !resolved.output_names.is_empty() && index + 1 == resolved.commands.len();
+            let output = execute_task_with_output(
+                &command,
+                root,
+                &std::collections::BTreeMap::new(),
+                capture,
+            )?;
+            if output.is_some() {
+                captured_stdout = output;
+            }
+        }
+        if !resolved.output_names.is_empty() {
+            let value = captured_stdout
+                .unwrap_or_default()
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            task_outputs.insert(
+                resolved.task_name.clone(),
+                resolved
+                    .output_names
+                    .iter()
+                    .map(|name| (name.clone(), value.clone()))
+                    .collect(),
+            );
+        }
+        outcomes.insert(resolved.task_name.clone(), TaskExecutionOutcome::Completed);
+    }
+    Ok(RootExecution {
+        outcomes,
+        task_outputs,
+    })
+}
+
 fn execute_task(
     command: &TaskCommand,
     cwd: &std::path::Path,
     variables: &std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
-    let status = match command {
+    execute_task_with_output(command, cwd, variables, false).map(|_| ())
+}
+
+fn execute_task_with_output(
+    command: &TaskCommand,
+    cwd: &std::path::Path,
+    variables: &std::collections::BTreeMap<String, String>,
+    capture_stdout: bool,
+) -> Result<Option<String>> {
+    let mut cmd = match command {
         TaskCommand::Shell(command) => {
             let mut cmd = std::process::Command::new("sh");
-            cmd.arg("-lc").arg(command).current_dir(cwd).envs(variables);
-            cmd.status()?
+            cmd.arg("-lc").arg(command);
+            cmd
         }
         TaskCommand::Argv(command) => {
             let (program, args) = command
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("resolved task command was empty"))?;
             let mut cmd = std::process::Command::new(program);
-            cmd.args(args).current_dir(cwd).envs(variables);
-            cmd.status()?
+            cmd.args(args);
+            cmd
         }
     };
+    cmd.current_dir(cwd).envs(variables);
+    if capture_stdout {
+        cmd.stderr(std::process::Stdio::inherit());
+        let output = cmd.output()?;
+        std::io::stdout().write_all(&output.stdout)?;
+        if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
+            writeln!(std::io::stdout())?;
+        }
+        anyhow::ensure!(
+            output.status.success(),
+            "task execution failed in {}",
+            cwd.display()
+        );
+        return String::from_utf8(output.stdout)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("task stdout was not UTF-8: {error}"));
+    }
+
+    let status = cmd.status()?;
     anyhow::ensure!(
         status.success(),
         "task execution failed in {}",
         cwd.display()
     );
+    Ok(None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TaskExecutionOutcome {
+    Completed,
+    Skipped,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionReport {
+    schema_version: u32,
+    outcome: TaskExecutionOutcome,
+    task_outputs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+const fn execution_report_schema_version() -> u32 {
+    1
+}
+
+fn write_execution_report(path: &std::path::Path, report: &ExecutionReport) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let serialized = serde_json::to_vec(report)?;
+    let mut temp_path = None;
+    for attempt in 0..100u32 {
+        let candidate = parent.join(format!(
+            ".cargo-flux-report-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(&serialized)?;
+                file.sync_all()?;
+                temp_path = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let temp = temp_path.ok_or_else(|| anyhow::anyhow!("could not create report temp file"))?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn append_github_outputs(input: &std::path::Path, output_file: &std::path::Path) -> Result<()> {
+    let report: ExecutionReport = serde_json::from_slice(&std::fs::read(input)?)?;
+    anyhow::ensure!(
+        report.schema_version == execution_report_schema_version(),
+        "unsupported execution report schema version {}",
+        report.schema_version
+    );
+    let outcome = match report.outcome {
+        TaskExecutionOutcome::Completed => "completed",
+        TaskExecutionOutcome::Skipped => "skipped",
+    };
+    let task_outputs = serde_json::to_string(&report.task_outputs)?;
+    let payload = format!("outcome={outcome}\ntask-outputs={task_outputs}\n");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_file)?;
+    file.write_all(payload.as_bytes())?;
     Ok(())
 }
 
@@ -491,7 +740,11 @@ fn normalize_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_task, handle_task_failure, normalize_args};
+    use super::{
+        ExecutionReport, TaskExecutionOutcome, append_github_outputs, execute_root_plan,
+        execute_task, execution_report_schema_version, handle_task_failure,
+        has_skipped_root_dependency, normalize_args, write_execution_report,
+    };
     use crate::cli::{Cli, Command};
     use crate::graph::{TaskExecutionPlan, WorkspaceGraph};
     use crate::manifest::{Ecosystem, Package, PackageId, TaskOptIn};
@@ -636,7 +889,7 @@ root = ["sh", "-c", "pwd > root-task-pwd"]
         let plan = registry.root_task_plan("prepare").expect("root plan");
 
         assert_eq!(plan.len(), 1);
-        execute_task(&plan[0].command, &root, &BTreeMap::new()).expect("execute root task");
+        execute_task(&plan[0].commands[0], &root, &BTreeMap::new()).expect("execute root task");
 
         let actual = fs::read_to_string(root.join("root-task-pwd")).expect("read task output");
         assert_eq!(PathBuf::from(actual.trim()), root);
@@ -953,6 +1206,55 @@ cargo = ["cargo", "check"]
     }
 
     #[test]
+    fn github_adapter_rejects_unversioned_report_without_writing() {
+        let root = temp_dir("unversioned-report");
+        let report = root.join("report.json");
+        let output = root.join("github-output");
+        fs::write(&report, r#"{"outcome":"completed","task_outputs":{}}"#).expect("write report");
+        fs::write(&output, "existing=value\n").expect("write output");
+
+        assert!(append_github_outputs(&report, &output).is_err());
+        assert_eq!(
+            fs::read_to_string(output).expect("read output"),
+            "existing=value\n"
+        );
+    }
+
+    #[test]
+    fn parses_run_report_path() {
+        let cli = Cli::parse_from(["cargo-flux", "run", "ship", "--report", "report.json"]);
+        match cli.command {
+            Command::Run { task, report, .. } => {
+                assert_eq!(task, "ship");
+                assert_eq!(report, Some(PathBuf::from("report.json")));
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_report_github_output_adapter() {
+        let cli = Cli::parse_from([
+            "cargo-flux",
+            "report",
+            "github-output",
+            "--input",
+            "report.json",
+            "--output-file",
+            "github-output",
+        ]);
+        match cli.command {
+            Command::Report {
+                command: crate::cli::ReportCommand::GithubOutput { input, output_file },
+            } => {
+                assert_eq!(input, PathBuf::from("report.json"));
+                assert_eq!(output_file, PathBuf::from("github-output"));
+            }
+            other => panic!("expected report adapter, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_stamp_command_without_version() {
         let cli = Cli::parse_from(["cargo-flux", "stamp"]);
         match cli.command {
@@ -961,6 +1263,136 @@ cargo = ["cargo", "check"]
             }
             other => panic!("expected stamp command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_root_output_skips_dependent_chain() {
+        let root = temp_dir("empty-output-skip");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.calculate-version]
+root = ["printf", ""]
+outputs = { version = "stdout" }
+
+[tasks.publish]
+depends_on = ["calculate-version"]
+when = { output = "calculate-version.version", nonempty = true }
+root = ["touch", "published"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let plan = registry.root_task_plan("publish").expect("root plan");
+        let mut started = 0;
+        let execution = execute_root_plan(&plan, &root, plan.len(), false, &mut started)
+            .expect("execute root plan");
+
+        assert_eq!(
+            execution.outcomes.get("publish"),
+            Some(&TaskExecutionOutcome::Skipped)
+        );
+        assert_eq!(execution.task_outputs["calculate-version"]["version"], "");
+        assert!(!root.join("published").exists());
+    }
+
+    #[test]
+    fn skipped_root_dependency_blocks_package_only_target() {
+        let root = temp_dir("skipped-root-blocks-packages");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.probe]
+root = ["printf", ""]
+outputs = { value = "stdout" }
+
+[tasks.gate]
+depends_on = ["probe"]
+when = { output = "probe.value", nonempty = true }
+root = ["touch", "gate-ran"]
+
+[tasks.package-check]
+depends_on = ["gate"]
+autoapply = "all"
+cargo = ["touch", "package-ran"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let plan = registry.root_task_plan("package-check").expect("root plan");
+        let mut started = 0;
+        let execution =
+            execute_root_plan(&plan, &root, 3, false, &mut started).expect("execute roots");
+
+        assert!(has_skipped_root_dependency(&execution.outcomes));
+        assert!(!root.join("gate-ran").exists());
+        assert!(!root.join("package-ran").exists());
+    }
+
+    #[test]
+    fn root_output_substitution_stays_one_argv_value() {
+        let root = temp_dir("output-argv-substitution");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.calculate-version]
+root = ["printf", "v 1;not-shell\n"]
+outputs = { version = "stdout" }
+
+[tasks.publish]
+depends_on = ["calculate-version"]
+when = { output = "calculate-version.version", nonempty = true }
+root_steps = [
+  ["touch", "${calculate-version.version}"],
+  ["printf", "published\n"],
+]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let plan = registry.root_task_plan("publish").expect("root plan");
+        let mut started = 0;
+        let execution = execute_root_plan(&plan, &root, plan.len(), false, &mut started)
+            .expect("execute root plan");
+
+        assert_eq!(
+            execution.outcomes.get("publish"),
+            Some(&TaskExecutionOutcome::Completed)
+        );
+        assert!(root.join("v 1;not-shell").exists());
+        assert!(!root.join("not-shell").exists());
+    }
+
+    #[test]
+    fn execution_report_adapts_to_safe_github_outputs() {
+        let root = temp_dir("github-report-output");
+        let report_path = root.join("report.json");
+        let github_path = root.join("github-output");
+        let mut outputs = BTreeMap::new();
+        outputs.insert(
+            "probe".to_string(),
+            BTreeMap::from([
+                ("empty".to_string(), String::new()),
+                ("hostile".to_string(), "line1\nline2=%<<\\\"☃".to_string()),
+            ]),
+        );
+        let report = ExecutionReport {
+            schema_version: execution_report_schema_version(),
+            outcome: TaskExecutionOutcome::Completed,
+            task_outputs: outputs.clone(),
+        };
+        write_execution_report(&report_path, &report).expect("write report");
+        fs::write(&github_path, "existing=value\n").expect("seed output");
+        append_github_outputs(&report_path, &github_path).expect("adapt report");
+
+        let actual = fs::read_to_string(github_path).expect("read output");
+        let lines = actual.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "existing=value");
+        assert_eq!(lines[1], "outcome=completed");
+        let json = lines[2]
+            .strip_prefix("task-outputs=")
+            .expect("JSON output prefix");
+        let decoded: BTreeMap<String, BTreeMap<String, String>> =
+            serde_json::from_str(json).expect("decode JSON");
+        assert_eq!(decoded, outputs);
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

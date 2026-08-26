@@ -39,6 +39,14 @@ pub enum Command {
         /// Limit execution to affected packages and root tasks.
         #[arg(long, visible_alias = "affected-from", value_name = "BASE")]
         affected: Option<String>,
+        /// Write a machine-readable execution report to this path.
+        #[arg(long, value_name = "PATH")]
+        report: Option<std::path::PathBuf>,
+    },
+    /// Adapt a machine-readable execution report for another system.
+    Report {
+        #[command(subcommand)]
+        command: ReportCommand,
     },
     /// Print packages affected since the merge base with a base ref.
     Affected {
@@ -65,5 +73,18 @@ pub enum Command {
         /// Do not stamp packages whose current version equals this value. May be repeated.
         #[arg(long = "exclude-version")]
         exclude_versions: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReportCommand {
+    /// Append report fields to a GitHub Actions output file.
+    GithubOutput {
+        /// Cargo Flux execution report JSON.
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        /// GitHub Actions output file, normally `$GITHUB_OUTPUT`.
+        #[arg(long, value_name = "PATH")]
+        output_file: PathBuf,
     },
 }
