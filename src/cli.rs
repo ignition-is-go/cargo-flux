@@ -22,6 +22,9 @@ pub enum Command {
     Plan {
         /// Logical task name to plan.
         task: String,
+        /// Limit execution to packages affected since this base ref.
+        #[arg(long, visible_alias = "affected-from", value_name = "BASE")]
+        affected: Option<String>,
         /// Print the planned execution order instead of the dependency tree.
         #[arg(long, conflicts_with = "stamp_args")]
         ordered: bool,
@@ -33,6 +36,15 @@ pub enum Command {
     Run {
         /// Logical task name to execute.
         task: String,
+        /// Limit execution to packages affected since this base ref.
+        #[arg(long, visible_alias = "affected-from", value_name = "BASE")]
+        affected: Option<String>,
+    },
+    /// Print packages affected since the merge base with a base ref.
+    Affected {
+        /// Branch, tag, or commit the current branch will merge into.
+        #[arg(long, value_name = "BASE")]
+        base: String,
     },
     /// Print the next calculated semantic version.
     Version {

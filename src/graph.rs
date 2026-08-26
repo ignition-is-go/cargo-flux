@@ -6,6 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 #[cfg(not(test))]
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct WorkspaceGraph {
@@ -19,6 +20,128 @@ impl WorkspaceGraph {
             .map(|pkg| (pkg.id.clone(), pkg))
             .collect::<BTreeMap<_, _>>();
         Self { packages }
+    }
+
+    /// Resolve changed paths to their owning packages, then include every
+    /// package that depends on them through a native or bridge dependency.
+    pub fn affected_packages(
+        &self,
+        root: &Path,
+        changed_paths: &[PathBuf],
+    ) -> Result<BTreeSet<PackageId>> {
+        if changed_paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        if changed_paths.iter().any(|path| workspace_wide_change(path)) {
+            return Ok(self.packages.keys().cloned().collect());
+        }
+
+        let package_dirs = self
+            .packages
+            .iter()
+            .map(|(id, package)| {
+                let directory = package
+                    .manifest_path
+                    .parent()
+                    .expect("package manifest must have a parent")
+                    .strip_prefix(root)
+                    .unwrap_or_else(|_| {
+                        package
+                            .manifest_path
+                            .parent()
+                            .expect("package manifest must have a parent")
+                    })
+                    .to_path_buf();
+                (id.clone(), directory)
+            })
+            .collect::<Vec<_>>();
+
+        let manifest_paths = self
+            .packages
+            .values()
+            .map(|package| {
+                package
+                    .manifest_path
+                    .strip_prefix(root)
+                    .unwrap_or(&package.manifest_path)
+                    .to_path_buf()
+            })
+            .collect::<BTreeSet<_>>();
+
+        let mut affected = BTreeSet::new();
+        for path in changed_paths {
+            if is_package_manifest(path) && !manifest_paths.contains(path) {
+                return Ok(self.packages.keys().cloned().collect());
+            }
+            let deepest = package_dirs
+                .iter()
+                .filter(|(_, directory)| path.starts_with(directory))
+                .map(|(_, directory)| directory.components().count())
+                .max();
+            let Some(deepest) = deepest else {
+                // Shared scripts and deleted/moved packages cannot be assigned
+                // safely from the current tree. Prefer extra work over skipping
+                // a package whose inputs may have changed.
+                return Ok(self.packages.keys().cloned().collect());
+            };
+            if deepest == 0 && !root_package_owned_change(path) {
+                // A package at the workspace root would otherwise claim every
+                // repository file, including shared scripts and CI/tooling
+                // inputs. Only conventional package source roots are owned by
+                // that package; other root paths conservatively affect all.
+                return Ok(self.packages.keys().cloned().collect());
+            }
+            affected.extend(
+                package_dirs
+                    .iter()
+                    .filter(|(_, directory)| {
+                        directory.components().count() == deepest && path.starts_with(directory)
+                    })
+                    .map(|(id, _)| id.clone()),
+            );
+        }
+
+        let mut dependents = self
+            .packages
+            .keys()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect::<BTreeMap<_, Vec<PackageId>>>();
+        for package in self.packages.values() {
+            for dependency in &package.internal_dependencies {
+                dependents
+                    .get_mut(dependency)
+                    .expect("native dependency must be a workspace package")
+                    .push(package.id.clone());
+            }
+            for bridge in &package.bridged_dependencies {
+                let dependency = self.package_id_by_bridge(bridge)?;
+                dependents
+                    .get_mut(&dependency)
+                    .expect("bridge dependency must be a workspace package")
+                    .push(package.id.clone());
+            }
+        }
+
+        let mut pending = affected.iter().cloned().collect::<VecDeque<_>>();
+        while let Some(package) = pending.pop_front() {
+            for dependent in dependents.get(&package).into_iter().flatten() {
+                if affected.insert(dependent.clone()) {
+                    pending.push_back(dependent.clone());
+                }
+            }
+        }
+        Ok(affected)
+    }
+
+    pub fn affected_in_native_order(
+        &self,
+        affected: &BTreeSet<PackageId>,
+    ) -> Result<Vec<&Package>> {
+        Ok(self
+            .topological_order()?
+            .into_iter()
+            .filter(|package| affected.contains(&package.id))
+            .collect())
     }
 
     pub fn render_tree(&self) -> Result<String> {
@@ -107,7 +230,16 @@ impl WorkspaceGraph {
     }
 
     pub fn render_task_plan_tree(&self, tasks: &TaskRegistry, task: &str) -> Result<String> {
-        let plan = self.materialize_task_plan(tasks, task)?;
+        self.render_task_plan_tree_affected(tasks, task, None)
+    }
+
+    pub fn render_task_plan_tree_affected(
+        &self,
+        tasks: &TaskRegistry,
+        task: &str,
+        affected: Option<&BTreeSet<PackageId>>,
+    ) -> Result<String> {
+        let plan = self.materialize_task_plan(tasks, task, affected)?;
         let mut roots = plan.roots();
         let mut depths = BTreeMap::new();
         plan.sort_nodes_by_depth(&mut roots, &mut depths);
@@ -127,7 +259,16 @@ impl WorkspaceGraph {
     }
 
     pub fn task_plan(&self, tasks: &TaskRegistry, task: &str) -> Result<Vec<ResolvedTask>> {
-        let plan = self.materialize_task_plan(tasks, task)?;
+        self.task_plan_affected(tasks, task, None)
+    }
+
+    pub fn task_plan_affected(
+        &self,
+        tasks: &TaskRegistry,
+        task: &str,
+        affected: Option<&BTreeSet<PackageId>>,
+    ) -> Result<Vec<ResolvedTask>> {
+        let plan = self.materialize_task_plan(tasks, task, affected)?;
         let order = plan.priority_order()?;
         order
             .into_iter()
@@ -146,7 +287,16 @@ impl WorkspaceGraph {
         tasks: &TaskRegistry,
         task: &str,
     ) -> Result<TaskExecutionPlan> {
-        let plan = self.materialize_task_plan(tasks, task)?;
+        self.task_execution_plan_affected(tasks, task, None)
+    }
+
+    pub(crate) fn task_execution_plan_affected(
+        &self,
+        tasks: &TaskRegistry,
+        task: &str,
+        affected: Option<&BTreeSet<PackageId>>,
+    ) -> Result<TaskExecutionPlan> {
+        let plan = self.materialize_task_plan(tasks, task, affected)?;
         let nodes = plan.priority_order()?;
         let indices = nodes
             .iter()
@@ -197,8 +347,18 @@ impl WorkspaceGraph {
         &self,
         tasks: &TaskRegistry,
         task: &str,
+        affected: Option<&BTreeSet<PackageId>>,
     ) -> Result<MaterializedTaskPlan> {
-        let (included, restricted) = self.task_nodes_for(tasks, task)?;
+        let (mut included, mut restricted) = self.task_nodes_for(tasks, task, affected)?;
+        if let Some(affected) = affected {
+            // Expansion discovers the task's normal prerequisites, but affected
+            // mode is a package execution scope: unchanged upstream packages
+            // must not be reintroduced by `cascade = "all"` or a bridge walk.
+            // Same-package task dependencies remain because their package is in
+            // the affected set.
+            included.retain(|node| affected.contains(&node.package_id));
+            restricted.retain(|node| included.contains(node));
+        }
         let mut prerequisites = BTreeMap::new();
 
         for node in &included {
@@ -239,25 +399,41 @@ impl WorkspaceGraph {
         &self,
         tasks: &TaskRegistry,
         task: &str,
+        affected: Option<&BTreeSet<PackageId>>,
     ) -> Result<(BTreeSet<TaskNode>, BTreeSet<TaskNode>)> {
         let mut included = BTreeSet::new();
         let mut restricted = BTreeSet::new();
         let mut expanded = BTreeMap::new();
-        let entrypoints = self
-            .packages
-            .values()
-            .filter(|pkg| pkg.opts_into_task(task))
-            .map(|pkg| pkg.id.clone())
-            .collect::<Vec<_>>();
-
-        let seed_ids = if entrypoints.is_empty() {
+        let seed_ids = if let Some(affected) = affected {
+            // Affected packages are explicit entrypoints for this invocation as
+            // long as the task can run for them. In particular, `autoapply =
+            // "inherit"` packages must not disappear merely because they are
+            // normally reached through another package's task plan.
             self.packages
                 .values()
-                .filter(|pkg| tasks.seeds_all_packages_without_explicit_opt_in(pkg, task))
-                .map(|pkg| pkg.id.clone())
+                .filter(|package| {
+                    affected.contains(&package.id) && tasks.participates_in_task(package, task)
+                })
+                .map(|package| package.id.clone())
                 .collect::<Vec<_>>()
         } else {
-            entrypoints
+            let entrypoints = self
+                .packages
+                .values()
+                .filter(|package| package.opts_into_task(task))
+                .map(|package| package.id.clone())
+                .collect::<Vec<_>>();
+            if entrypoints.is_empty() {
+                self.packages
+                    .values()
+                    .filter(|package| {
+                        tasks.seeds_all_packages_without_explicit_opt_in(package, task)
+                    })
+                    .map(|package| package.id.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                entrypoints
+            }
         };
 
         for package_id in seed_ids {
@@ -966,6 +1142,50 @@ impl WorkspaceGraph {
             self.render_package(dep, &child_prefix, child_is_last, false, use_color, lines);
         }
     }
+}
+
+fn root_package_owned_change(path: &Path) -> bool {
+    path == Path::new("build.rs")
+        || ["src", "tests", "benches", "examples"]
+            .iter()
+            .any(|directory| path.starts_with(Path::new(directory)))
+}
+
+fn is_package_manifest(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == "Cargo.toml" || name == "package.json" || name == "pyproject.toml"
+    })
+}
+
+fn workspace_wide_change(path: &Path) -> bool {
+    const ROOT_FILES: &[&str] = &[
+        "flux.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "yarn.lock",
+        "bun.lock",
+        "bun.lockb",
+        "pyproject.toml",
+        "uv.lock",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+    ];
+
+    if ROOT_FILES
+        .iter()
+        .any(|candidate| path == Path::new(candidate))
+        || path == Path::new(".cargo/config")
+        || path == Path::new(".cargo/config.toml")
+    {
+        return true;
+    }
+
+    false
 }
 
 fn output_uses_color() -> bool {
@@ -2367,6 +2587,212 @@ npm = ["npm", "run", "build"]
             tree,
             "a:build [cargo]\n└── b [cargo]\n    └── c [cargo] (bridge d)\n        └── d:build [npm]"
         );
+    }
+
+    #[test]
+    fn affected_packages_include_transitive_native_dependents() {
+        let core = pkg("core", vec![], vec![], vec![]);
+        let facade = pkg("facade", vec!["core"], vec![], vec![]);
+        let app = pkg("app", vec!["facade"], vec![], vec![]);
+        let graph = WorkspaceGraph::new(vec![core, facade, app]);
+
+        let affected = graph
+            .affected_packages(
+                PathBuf::from(".").as_path(),
+                &[PathBuf::from("core/src/lib.rs")],
+            )
+            .expect("affected closure");
+        let names = affected
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["cargo:app", "cargo:core", "cargo:facade"]);
+    }
+
+    #[test]
+    fn affected_packages_cross_bridge_dependencies() {
+        let core = pkg("core", vec![], vec![], vec![]);
+        let bindings = pkg_with_ecosystem(
+            Ecosystem::Js,
+            "bindings",
+            vec![],
+            vec![],
+            vec!["cargo:core"],
+        );
+        let app = pkg_with_ecosystem(Ecosystem::Js, "app", vec!["bindings"], vec![], vec![]);
+        let graph = WorkspaceGraph::new(vec![core, bindings, app]);
+
+        let affected = graph
+            .affected_packages(
+                PathBuf::from(".").as_path(),
+                &[PathBuf::from("core/src/lib.rs")],
+            )
+            .expect("affected closure");
+
+        assert!(affected.contains(&PackageId::new(Ecosystem::Cargo, "core")));
+        assert!(affected.contains(&PackageId::new(Ecosystem::Js, "bindings")));
+        assert!(affected.contains(&PackageId::new(Ecosystem::Js, "app")));
+    }
+
+    #[test]
+    fn affected_mapping_uses_deepest_package_and_global_files_select_all() {
+        let root = Package {
+            manifest_path: PathBuf::from("Cargo.toml"),
+            ..pkg("root", vec![], vec![], vec![])
+        };
+        let nested = Package {
+            manifest_path: PathBuf::from("crates/nested/Cargo.toml"),
+            ..pkg("nested", vec![], vec![], vec![])
+        };
+        let graph = WorkspaceGraph::new(vec![root, nested]);
+
+        let local = graph
+            .affected_packages(
+                PathBuf::from(".").as_path(),
+                &[PathBuf::from("crates/nested/src/lib.rs")],
+            )
+            .expect("local affected set");
+        assert_eq!(local, [PackageId::new(Ecosystem::Cargo, "nested")].into());
+
+        let root_source = graph
+            .affected_packages(PathBuf::from(".").as_path(), &[PathBuf::from("src/lib.rs")])
+            .expect("root package source set");
+        assert_eq!(
+            root_source,
+            [PackageId::new(Ecosystem::Cargo, "root")].into()
+        );
+
+        let global = graph
+            .affected_packages(PathBuf::from(".").as_path(), &[PathBuf::from("Cargo.lock")])
+            .expect("global affected set");
+        assert_eq!(global.len(), 2);
+
+        let shared_script = graph
+            .affected_packages(
+                PathBuf::from(".").as_path(),
+                &[PathBuf::from("scripts/build.sh")],
+            )
+            .expect("shared script affected set");
+        assert_eq!(shared_script.len(), 2);
+    }
+
+    #[test]
+    fn empty_affected_set_produces_no_tasks() {
+        let root = temp_dir("empty-affected-task-plan");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+autoapply = "all"
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let graph = WorkspaceGraph::new(vec![pkg("app", vec![], vec![], vec![])]);
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let affected = std::collections::BTreeSet::new();
+
+        let plan = graph
+            .task_plan_affected(&registry, "check", Some(&affected))
+            .expect("empty affected plan");
+        let rendered = graph
+            .render_task_plan_tree_affected(&registry, "check", Some(&affected))
+            .expect("empty affected tree");
+
+        assert!(plan.is_empty());
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn affected_inherit_packages_become_task_entrypoints() {
+        let root = temp_dir("affected-inherit-entrypoints");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.test]
+autoapply = "inherit"
+cascade = "none"
+cargo = ["cargo", "test"]
+"#,
+        )
+        .expect("write config");
+        let graph = WorkspaceGraph::new(vec![pkg("changed", vec![], vec![], vec![])]);
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let affected = [PackageId::new(Ecosystem::Cargo, "changed")].into();
+
+        let planned = graph
+            .task_plan_affected(&registry, "test", Some(&affected))
+            .expect("affected plan")
+            .into_iter()
+            .map(|task| task.package_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(planned, vec!["changed"]);
+    }
+
+    #[test]
+    fn affected_scope_excludes_unchanged_upstream_prerequisites() {
+        let root = temp_dir("affected-task-entrypoints");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.check]
+cascade = "all"
+autoapply = "inherit"
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let core = pkg("core", vec![], vec![], vec![]);
+        let facade = pkg("facade", vec!["core"], vec![], vec![]);
+        let app = pkg("app", vec!["facade"], vec!["check"], vec![]);
+        let graph = WorkspaceGraph::new(vec![core, facade, app]);
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let affected = graph
+            .affected_packages(
+                PathBuf::from(".").as_path(),
+                &[PathBuf::from("facade/src/lib.rs")],
+            )
+            .expect("affected closure");
+
+        let planned = graph
+            .task_plan_affected(&registry, "check", Some(&affected))
+            .expect("affected plan")
+            .into_iter()
+            .map(|task| task.package_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(planned, vec!["facade", "app"]);
+    }
+
+    #[test]
+    fn affected_scope_preserves_same_package_task_dependencies() {
+        let root = temp_dir("affected-task-dependencies");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.lint]
+autoapply = "inherit"
+cascade = "none"
+cargo = ["cargo", "clippy"]
+
+[tasks.check]
+depends_on = ["lint"]
+autoapply = "inherit"
+cascade = "none"
+cargo = ["cargo", "check"]
+"#,
+        )
+        .expect("write config");
+        let graph = WorkspaceGraph::new(vec![pkg("app", vec![], vec!["check", "lint"], vec![])]);
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let affected = [PackageId::new(Ecosystem::Cargo, "app")].into();
+
+        let planned = graph
+            .task_plan_affected(&registry, "check", Some(&affected))
+            .expect("affected plan")
+            .into_iter()
+            .map(|task| task.task_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(planned, vec!["lint", "check"]);
     }
 
     #[test]
