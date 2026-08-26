@@ -346,21 +346,41 @@ Branch names support trailing `*` for glob matching. Exact matches take priority
 
 ### Self-publishing example
 
-Combine `version`, `stamp`, and a release task to create a self-publishing workflow:
+A single-package workspace can compose versioning, stamping, Git, and publishing
+as structured commands. No task name is special and no shell guard is required:
 
 ```toml
 [channels]
 main = "production"
 
-[tasks.release]
-cargo = "VERSION=$(cargo flux version) && cargo flux stamp \"$VERSION\" && cargo update --workspace && cargo fmt --all && git add -A && git commit -m \"chore(release): $VERSION\" && git tag \"v$VERSION\" -m \"Release $VERSION\" && git push origin HEAD \"v$VERSION\" && cargo publish"
+[tasks.calculate-version]
+root = ["cargo", "flux", "version"]
+outputs = { version = "stdout" }
+
+[tasks.publish-production]
+depends_on = ["calculate-version"]
+when = { output = "calculate-version.version", nonempty = true }
+root_steps = [
+  ["cargo", "flux", "stamp", "${calculate-version.version}"],
+  ["cargo", "update", "--workspace"],
+  ["cargo", "fmt", "--all"],
+  ["git", "add", "-A"],
+  ["git", "commit", "-m", "chore(release): v${calculate-version.version}"],
+  ["git", "tag", "v${calculate-version.version}", "-m", "Release ${calculate-version.version}"],
+  ["git", "push", "origin", "HEAD", "v${calculate-version.version}"],
+  ["cargo", "publish"],
+]
 ```
 
 Then run:
 
 ```bash
-cargo flux run release
+cargo flux run publish-production --report release-report.json
 ```
+
+A docs-only or chore-only commit makes `calculate-version.version` empty, so the
+publish task is reported as `skipped` and the command exits successfully. A real
+versioning, stamping, Git, or publishing error still fails the run.
 
 ## Core Model
 
