@@ -1,0 +1,226 @@
+name: Cargo Flux
+description: Install a verified Cargo Flux binary and optionally run an affected task
+author: Lucid
+
+inputs:
+  version:
+    description: Cargo Flux version to install, or "action" for the version in this action release
+    required: false
+    default: action
+  task:
+    description: Logical task to run after installation; omit for setup-only use
+    required: false
+    default: ""
+  affected:
+    description: Optional Git base ref passed to cargo flux run --affected
+    required: false
+    default: ""
+  root:
+    description: Workspace root passed to cargo flux run --root
+    required: false
+    default: .
+
+outputs:
+  version:
+    description: Installed Cargo Flux version
+    value: ${{ steps.install-unix.outputs.version || steps.install-windows.outputs.version }}
+  path:
+    description: Absolute path to the installed cargo-flux executable
+    value: ${{ steps.install-unix.outputs.path || steps.install-windows.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Cargo Flux
+      id: install-unix
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        REQUESTED_VERSION: ${{ inputs.version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        version="$REQUESTED_VERSION"
+        if [[ -z "$version" || "$version" == "action" ]]; then
+          version="$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ && in_package { exit }
+            in_package && /^version[[:space:]]*=/ {
+              value=$0
+              sub(/^[^=]*=[[:space:]]*"/, "", value)
+              sub(/".*/, "", value)
+              print value
+              exit
+            }
+          ' "$ACTION_PATH/Cargo.toml")"
+        fi
+        version="${version#v}"
+        if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "Invalid Cargo Flux version: $version" >&2
+          exit 1
+        fi
+
+        case "${RUNNER_OS}:${RUNNER_ARCH}" in
+          Linux:X64) target=x86_64-unknown-linux-gnu ;;
+          macOS:X64) target=x86_64-apple-darwin ;;
+          macOS:ARM64) target=aarch64-apple-darwin ;;
+          *)
+            echo "Cargo Flux does not publish a binary for ${RUNNER_OS}/${RUNNER_ARCH}" >&2
+            exit 1
+            ;;
+        esac
+
+        archive="cargo-flux-${version}-${target}.tgz"
+        cache_dir="${RUNNER_TOOL_CACHE}/cargo-flux/${version}/${target}"
+        cached_archive="${cache_dir}/${archive}"
+        base="https://github.com/ignition-is-go/cargo-flux/releases/download/v${version}"
+        mkdir -p "$cache_dir"
+
+        checksum_file="$(mktemp "${RUNNER_TEMP}/cargo-flux-checksum.XXXXXX")"
+        curl -fsSL "$base/$archive.sha256" -o "$checksum_file"
+        expected="$(awk '{ print tolower($1) }' "$checksum_file")"
+        if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "Invalid SHA-256 file for $archive" >&2
+          exit 1
+        fi
+
+        hash_archive() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$1" | awk '{ print tolower($1) }'
+          else
+            shasum -a 256 "$1" | awk '{ print tolower($1) }'
+          fi
+        }
+
+        if [[ ! -f "$cached_archive" ]] || [[ "$(hash_archive "$cached_archive")" != "$expected" ]]; then
+          pending="$(mktemp "${RUNNER_TEMP}/cargo-flux-archive.XXXXXX")"
+          curl -fsSL "$base/$archive" -o "$pending"
+          actual="$(hash_archive "$pending")"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Checksum mismatch for $archive" >&2
+            exit 1
+          fi
+          mv -f "$pending" "$cached_archive"
+        fi
+
+        install_dir="$(mktemp -d "${RUNNER_TEMP}/cargo-flux-${version}-${target}.XXXXXX")"
+        tar -xzf "$cached_archive" -C "$install_dir"
+        binary="${install_dir}/cargo-flux"
+        if [[ ! -f "$binary" ]]; then
+          echo "Release archive did not contain cargo-flux" >&2
+          exit 1
+        fi
+        chmod +x "$binary"
+
+        echo "$install_dir" >> "$GITHUB_PATH"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "path=$binary" >> "$GITHUB_OUTPUT"
+
+    - name: Install Cargo Flux
+      id: install-windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        REQUESTED_VERSION: ${{ inputs.version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $version = $env:REQUESTED_VERSION
+        if ([string]::IsNullOrWhiteSpace($version) -or $version -eq 'action') {
+          $inPackage = $false
+          foreach ($line in Get-Content (Join-Path $env:ACTION_PATH 'Cargo.toml')) {
+            if ($line -match '^\[package\]$') {
+              $inPackage = $true
+              continue
+            }
+            if ($inPackage -and $line -match '^\[') { break }
+            if ($inPackage -and $line -match '^version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+              break
+            }
+          }
+        }
+        $version = $version -replace '^v', ''
+        if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
+          throw "Invalid Cargo Flux version: $version"
+        }
+        if ($env:RUNNER_ARCH -ne 'X64') {
+          throw "Cargo Flux does not publish a binary for Windows/$env:RUNNER_ARCH"
+        }
+
+        $target = 'x86_64-pc-windows-msvc'
+        $archive = "cargo-flux-$version-$target.tgz"
+        $cacheDir = Join-Path $env:RUNNER_TOOL_CACHE "cargo-flux/$version/$target"
+        $cachedArchive = Join-Path $cacheDir $archive
+        $base = "https://github.com/ignition-is-go/cargo-flux/releases/download/v$version"
+        New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+
+        $checksumPath = Join-Path $env:RUNNER_TEMP "cargo-flux-checksum-$([guid]::NewGuid()).txt"
+        Invoke-WebRequest -Uri "$base/$archive.sha256" -OutFile $checksumPath
+        $expected = ((Get-Content $checksumPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+        if ($expected -notmatch '^[0-9a-f]{64}$') {
+          throw "Invalid SHA-256 file for $archive"
+        }
+
+        $cacheValid = (Test-Path $cachedArchive -PathType Leaf) -and ((Get-FileHash -Algorithm SHA256 $cachedArchive).Hash.ToLowerInvariant() -eq $expected)
+        if (-not $cacheValid) {
+          $pending = Join-Path $env:RUNNER_TEMP "cargo-flux-archive-$([guid]::NewGuid()).tgz"
+          Invoke-WebRequest -Uri "$base/$archive" -OutFile $pending
+          $actual = (Get-FileHash -Algorithm SHA256 $pending).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Checksum mismatch for $archive"
+          }
+          Move-Item -Force $pending $cachedArchive
+        }
+
+        $installDir = Join-Path $env:RUNNER_TEMP "cargo-flux-$version-$target-$([guid]::NewGuid())"
+        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+        tar -xzf $cachedArchive -C $installDir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $binary = Join-Path $installDir 'cargo-flux.exe'
+        if (-not (Test-Path $binary -PathType Leaf)) {
+          throw 'Release archive did not contain cargo-flux.exe'
+        }
+
+        $installDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        "path=$binary" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    - name: Run Cargo Flux task
+      if: inputs.task != '' && runner.os != 'Windows'
+      shell: bash
+      env:
+        CARGO_FLUX: ${{ steps.install-unix.outputs.path }}
+        TASK: ${{ inputs.task }}
+        AFFECTED: ${{ inputs.affected }}
+        WORKSPACE_ROOT: ${{ inputs.root }}
+      run: |
+        set -euo pipefail
+        args=(run "$TASK" --root "$WORKSPACE_ROOT")
+        if [[ -n "$AFFECTED" ]]; then
+          args+=(--affected "$AFFECTED")
+        fi
+        "$CARGO_FLUX" "${args[@]}"
+
+    - name: Run Cargo Flux task
+      if: inputs.task != '' && runner.os == 'Windows'
+      shell: pwsh
+      env:
+        CARGO_FLUX: ${{ steps.install-windows.outputs.path }}
+        TASK: ${{ inputs.task }}
+        AFFECTED: ${{ inputs.affected }}
+        WORKSPACE_ROOT: ${{ inputs.root }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $arguments = @('run', $env:TASK, '--root', $env:WORKSPACE_ROOT)
+        if (-not [string]::IsNullOrWhiteSpace($env:AFFECTED)) {
+          $arguments += @('--affected', $env:AFFECTED)
+        }
+        & $env:CARGO_FLUX @arguments
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+branding:
+  icon: git-branch
+  color: purple

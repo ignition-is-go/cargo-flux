@@ -42,6 +42,37 @@ Or compile and install it from crates.io:
 cargo install cargo-flux
 ```
 
+### GitHub Action
+
+The repository also publishes a colocated composite action backed by verified
+native release binaries. It supports Linux x86-64, Windows x86-64, and macOS
+x86-64 or ARM64 runners, and can run a task directly:
+
+```yaml
+permissions:
+  contents: read
+
+steps:
+  - uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+
+  - uses: ignition-is-go/cargo-flux@v0.7.0
+    with:
+      task: test
+      affected: origin/${{ github.base_ref }}
+```
+
+Omit `task` to install Cargo Flux and add it to `PATH` for later steps. `version`
+defaults to the CLI version carried by the selected action release; it can be
+overridden explicitly. `root` defaults to `.`. A full checkout is required when
+using `affected` so Git can find the merge base.
+
+The action contains no JavaScript wrapper. Its composite steps download the
+platform-native release archive, verify the published SHA-256 file, cache the
+verified archive, extract it fresh, and invoke Cargo Flux with arguments passed
+without shell expansion.
+
 To install a local checkout instead, run `cargo install --path . --force`.
 
 Because the binary is named `cargo-flux`, Cargo exposes it as a subcommand:
