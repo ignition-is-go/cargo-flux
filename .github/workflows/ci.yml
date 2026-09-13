@@ -67,6 +67,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt
+      - name: Install GitHub CLI
+        run: command -v gh >/dev/null || (sudo apt-get update && sudo apt-get install -y gh)
       - run: cargo install --path . --force
       - name: Configure git
         run: |
