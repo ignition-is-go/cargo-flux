@@ -31,7 +31,7 @@ jobs:
         if: always()
 
   windows-check:
-    runs-on: ci-windows-ephemeral
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -102,9 +102,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_ext: ''
           - os: ci-macos-ephemeral
-            target: x86_64-apple-darwin
-            binary_ext: ''
-          - os: ci-macos-ephemeral
             target: aarch64-apple-darwin
             binary_ext: ''
           - os: ci-windows-ephemeral
@@ -155,8 +152,6 @@ jobs:
         include:
           - os: linux
             runner: ci-public-linux-ephemeral
-          - os: macos-intel
-            runner: ci-macos-ephemeral
           - os: macos-arm
             runner: ci-macos-ephemeral
           - os: windows

@@ -45,8 +45,8 @@ cargo install cargo-flux
 ### GitHub Action
 
 The repository also publishes a colocated composite action backed by verified
-native release binaries. It supports Linux x86-64, Windows x86-64, and macOS
-x86-64 or ARM64 runners, and can run a task directly:
+native release binaries. It supports Linux x86-64, Windows x86-64, and Apple
+Silicon macOS runners, and can run a task directly:
 
 ```yaml
 permissions:
