@@ -106,7 +106,7 @@ jobs:
           - os: ci-macos-ephemeral
             target: aarch64-apple-darwin
             binary_ext: ''
-          - os: ci-windows-ephemeral
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
             binary_ext: .exe
     runs-on: ${{ matrix.os }}
@@ -157,7 +157,7 @@ jobs:
           - os: macos-arm
             runner: ci-macos-ephemeral
           - os: windows
-            runner: ci-windows-ephemeral
+            runner: windows-2025
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
