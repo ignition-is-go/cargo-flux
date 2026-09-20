@@ -1,14 +1,16 @@
 use crate::manifest::{Ecosystem, JsPackageManager, Package, colorize_display_label};
 use anyhow::{Context, Result, anyhow, bail};
+use glob::Pattern;
 use serde::{Deserialize, Deserializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct TaskRegistry {
     tasks: BTreeMap<String, TaskDefinition>,
     channels: Option<toml::Value>,
+    affected: AffectedConfig,
 }
 
 impl TaskRegistry {
@@ -21,7 +23,26 @@ impl TaskRegistry {
         Ok(Self {
             tasks: config.tasks.unwrap_or_default(),
             channels: config.channels,
+            affected: config.affected,
         })
+    }
+
+    pub fn affected_paths(&self, paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let ignore = self
+            .affected
+            .ignore
+            .iter()
+            .map(|pattern| {
+                Pattern::new(pattern)
+                    .with_context(|| format!("invalid affected ignore pattern `{pattern}`"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(paths
+            .iter()
+            .filter(|path| !ignore.iter().any(|pattern| pattern.matches_path(path)))
+            .cloned()
+            .collect())
     }
 
     pub fn channels(&self) -> Option<&toml::Value> {
@@ -506,10 +527,18 @@ fn infer_js_package_manager(label: &str) -> Option<JsPackageManager> {
 struct FluxConfig {
     tasks: Option<BTreeMap<String, TaskDefinition>>,
     channels: Option<toml::Value>,
+    #[serde(default)]
+    affected: AffectedConfig,
     // Stamp policy is loaded by the stamp command; accepting it here keeps the
     // shared flux.toml schema compatible with task and version commands.
     #[serde(rename = "stamp")]
     _stamp: Option<toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AffectedConfig {
+    ignore: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1603,6 +1632,21 @@ root = 'printf "%s" "${VERSION:-1.0}" "${FILE:-foo.bar}"'
         let registry = TaskRegistry::load(&root).expect("load registry");
         let plan = registry.root_task_plan("render").expect("root plan");
         assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn rejects_invalid_affected_ignore_patterns() {
+        let root = temp_dir("invalid-affected-ignore");
+        fs::write(root.join("flux.toml"), "[affected]\nignore = [\"[\"]\n").expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let error = registry
+            .affected_paths(&[PathBuf::from("AGENTS.md")])
+            .expect_err("reject invalid glob");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid affected ignore pattern")
+        );
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
