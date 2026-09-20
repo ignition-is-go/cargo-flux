@@ -127,7 +127,8 @@ fn main() -> Result<()> {
                     stamp_args,
                 } => {
                     let tasks = TaskRegistry::load(&root)?;
-                    let affected = calculate_affected_scope(&root, &graph, affected.as_deref())?;
+                    let affected =
+                        calculate_affected_scope(&root, &graph, &tasks, affected.as_deref())?;
                     let affected_packages = affected.as_ref().map(|scope| &scope.packages);
                     let root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
                         tasks.root_task_plan(&task)?
@@ -176,7 +177,8 @@ fn main() -> Result<()> {
                     }
                 }
                 Command::Affected { base } => {
-                    let changed = git::get_changed_files(&root, &base)?;
+                    let tasks = TaskRegistry::load(&root)?;
+                    let changed = tasks.affected_paths(&git::get_changed_files(&root, &base)?)?;
                     let affected = graph.affected_packages(&root, &changed)?;
                     for package in graph.affected_in_native_order(&affected)? {
                         println!("{}", package.id);
@@ -189,7 +191,8 @@ fn main() -> Result<()> {
                 } => {
                     let tasks = TaskRegistry::load(&root)?;
                     let affected_base = affected.clone();
-                    let affected = calculate_affected_scope(&root, &graph, affected.as_deref())?;
+                    let affected =
+                        calculate_affected_scope(&root, &graph, &tasks, affected.as_deref())?;
                     let affected_packages = affected.as_ref().map(|scope| &scope.packages);
                     let root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
                         tasks.root_task_plan(&task)?
@@ -286,10 +289,11 @@ struct AffectedScope {
 fn calculate_affected_scope(
     root: &std::path::Path,
     graph: &WorkspaceGraph,
+    tasks: &TaskRegistry,
     base: Option<&str>,
 ) -> Result<Option<AffectedScope>> {
     base.map(|base| {
-        let changed = git::get_changed_files(root, base)?;
+        let changed = tasks.affected_paths(&git::get_changed_files(root, base)?)?;
         let has_changes = !changed.is_empty();
         let packages = graph.affected_packages(root, &changed)?;
         Ok(AffectedScope {

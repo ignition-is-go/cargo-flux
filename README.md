@@ -182,6 +182,19 @@ cannot be assigned to a current package are also treated conservatively as
 workspace-wide changes. This handles shared inputs and deleted packages without
 silently skipping required CI work.
 
+Repositories can exclude committed paths that do not affect build or test
+behavior. Patterns are relative to the workspace root and use glob syntax:
+
+```toml
+[affected]
+ignore = ["AGENTS.md", "docs/**"]
+```
+
+Ignored paths are removed before Flux decides whether the diff is empty. If all
+changed paths are ignored, `affected` prints no packages and affected `plan` or
+`run` commands schedule no root or package tasks. Only list files whose changes
+cannot alter task behavior or package outputs.
+
 The base ref must exist locally. CI should fetch the target branch with enough
 history for Git to find a merge base. A missing or shallow base is an error, not
 an empty affected set. An empty diff succeeds, and `run` reports that there is
