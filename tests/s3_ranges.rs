@@ -31,7 +31,7 @@ fn large_archives_download_concurrently_with_pinned_etags() {
         "{}",
         String::from_utf8_lossy(&saved.stderr)
     );
-    let archive = std::fs::read_dir(source.path().join(".flux/cache/objects"))
+    let archive = std::fs::read_dir(source.path().join(".flux/cache/objects/v2"))
         .unwrap()
         .next()
         .unwrap()

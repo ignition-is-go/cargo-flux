@@ -417,13 +417,26 @@ and source identities. Storage operations never skip build/check/test commands.
 Archives preserve executable modes, sparse holes and exact file timestamps;
 contents are verified in staging before existing outputs are replaced.
 
-Storage hashes and verifies files with up to eight workers and compresses with
-up to four zstd workers, bounded by available CPU parallelism. Native S3 transfers
-use up to four concurrent 8 MiB upload parts or download ranges; large downloads
-pin ranges to one ETag and buffer disk writes. Archives and keys remain compatible
-with existing snapshots. Storage reports hash, compression, verification, transfer
-and extraction times to stderr, including compressed byte counts and download
-throughput, so CPU and disk work can be distinguished from transfer costs.
+Storage hashes and verifies files with up to eight workers. Snapshot creation
+and extraction use up to eight independent zstd-compressed tar shards, bounded
+by available CPU parallelism. Files are balanced by allocated size on Unix to
+account for sparse linker outputs. Workers write buffered compressed extents
+directly into one temporary snapshot; an index supports parallel extraction
+without temporary shard copies. Restored files are verified before promotion.
+All temporary archives and staging are removed on success or failure.
+
+New snapshots use the versioned `objects/v2/` object path. Restore tries that
+format first, then reads legacy `objects/` snapshots, so existing caches can
+seed the new format without overwriting objects used by older Flux versions.
+This format versioning is internal; explicit compatibility and artifact keys
+remain unchanged. The first run using legacy data still extracts that legacy
+archive serially; subsequent runs can restore the new parallel format.
+
+Native S3 transfers use up to four concurrent 8 MiB upload parts or download
+ranges; large downloads pin ranges to one ETag and buffer disk writes. Storage
+reports hash, compression, verification, transfer and extraction times to stderr,
+including compressed byte counts and download throughput, so CPU and disk work
+can be distinguished from transfer costs.
 
 Named artifact contracts keep shared file lists in `flux.toml`:
 
