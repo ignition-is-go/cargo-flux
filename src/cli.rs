@@ -38,8 +38,14 @@ pub enum Command {
     /// Execute a logical task in planned order.
     Run {
         /// Execute tasks without reading or writing task-output caches.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["cache_required", "cache_hit_required"])]
         no_cache: bool,
+        /// Fail on errors in configured caches instead of falling back.
+        #[arg(long)]
+        cache_required: bool,
+        /// Require configured cache hits; do not execute cached tasks on misses.
+        #[arg(long)]
+        cache_hit_required: bool,
         /// Logical task name to execute.
         task: String,
         /// Limit execution to affected packages and root tasks.

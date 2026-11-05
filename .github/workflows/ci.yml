@@ -157,6 +157,10 @@ jobs:
           - os: windows
             runner: windows-2025
     runs-on: ${{ matrix.runner }}
+    env:
+      AWS_ACCESS_KEY_ID: compiler-client-sentinel
+      AWS_SECRET_ACCESS_KEY: compiler-secret-sentinel
+      AWS_SESSION_TOKEN: compiler-token-sentinel
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -182,6 +186,11 @@ jobs:
           version: ${{ needs.release.outputs.version }}
           root: ${{ runner.temp }}/cargo-flux-action-smoke
           task: gated
+          cache: s3
+          cache-endpoint: https://cache.invalid
+          cache-bucket: action-cache-smoke
+          cache-access-key-id: flux-client-sentinel
+          cache-secret-access-key: flux-secret-sentinel
       - name: Verify Cargo Flux outputs and PATH
         shell: bash
         env:
@@ -189,5 +198,11 @@ jobs:
           TASK_OUTPUTS: ${{ steps.flux.outputs['task-outputs'] }}
         run: |
           test "$OUTCOME" = completed
+          test "$CARGO_FLUX_S3_BUCKET" = action-cache-smoke
+          test "$CARGO_FLUX_S3_ACCESS_KEY_ID" = flux-client-sentinel
+          test "$CARGO_FLUX_S3_SECRET_ACCESS_KEY" = flux-secret-sentinel
+          test "$AWS_ACCESS_KEY_ID" = compiler-client-sentinel
+          test "$AWS_SECRET_ACCESS_KEY" = compiler-secret-sentinel
+          test "$AWS_SESSION_TOKEN" = compiler-token-sentinel
           grep -q '"probe":{"version":"git version ' <<< "$TASK_OUTPUTS"
           cargo-flux --help

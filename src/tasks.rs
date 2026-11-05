@@ -160,6 +160,8 @@ impl TaskRegistry {
                 output_names: task.outputs.keys().cloned().collect(),
                 condition,
                 cache: task.cache.clone().map(|cache| crate::cache::ResolvedCache {
+                    required: false,
+                    hit_required: false,
                     store: self.cache.clone(),
                     task: cache,
                 }),

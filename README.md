@@ -74,6 +74,26 @@ defaults to the CLI version carried by the selected action release; it can be
 overridden explicitly. `root` defaults to `.`. A full checkout is required when
 using `affected` so Git can find the merge base.
 
+The same action can configure a dedicated S3 task-cache client:
+
+```yaml
+- uses: ignition-is-go/cargo-flux@v0.10.0
+  with:
+    cache: s3
+    cache-endpoint: ${{ secrets.CARGO_FLUX_S3_ENDPOINT }}
+    cache-bucket: ${{ secrets.CARGO_FLUX_S3_BUCKET }}
+    cache-access-key-id: ${{ secrets.CARGO_FLUX_S3_ACCESS_KEY_ID }}
+    cache-secret-access-key: ${{ secrets.CARGO_FLUX_S3_SECRET_ACCESS_KEY }}
+```
+
+This exports masked `CARGO_FLUX_S3_*` credentials and storage settings, leaving
+existing `AWS_*` compiler-cache credentials untouched. Flux uses the dedicated
+credentials only for its native S3 client. `cache-region` defaults to
+`us-east-1`; `cache-session-token` is optional. S3 transport is built into the
+Flux binary. The action configures the environment; `flux.toml`
+still owns task inputs, outputs, storage prefix and cache policy. With `task`,
+set `cache-required: 'true'` to fail on cache errors.
+
 When a task is supplied, the action exposes `outcome` (`completed` or `skipped`)
 and `task-outputs`, a compact JSON object keyed by root task and output name.
 GitHub expressions can read arbitrary values with
@@ -330,16 +350,28 @@ prefix = "cargo-flux/v1"
 timeout_seconds = 120
 ```
 
-The S3 adapter uses AWS CLI on `PATH` and its standard credential/region
-configuration; credentials are not placed in Flux configuration, argv, reports,
-or cache manifests. Socket timeouts and a complete-transfer deadline bound both
-downloads and uploads. Local filesystem caching needs no external tools.
+The native S3 adapter uses `CARGO_FLUX_S3_ACCESS_KEY_ID` and
+`CARGO_FLUX_S3_SECRET_ACCESS_KEY`, optional `CARGO_FLUX_S3_SESSION_TOKEN`, and
+`CARGO_FLUX_S3_REGION` (default `us-east-1`). It does not read ambient compiler
+credentials or cloud identity providers. Credentials are not placed in Flux
+configuration, argv, reports or cache manifests. Transfers stream with bounded
+memory, multipart uploads and complete-operation deadlines. Failed multipart
+uploads are aborted when their upload ID is known. No external storage CLI is
+needed; MinIO and other S3-compatible endpoints use the same native client.
+
+For action-provided settings, use `bucket_env = "CARGO_FLUX_S3_BUCKET"` and
+`endpoint_env = "CARGO_FLUX_S3_ENDPOINT"` instead of literal values. Each field
+accepts a literal or an environment reference, not both. Planning does not need
+the secret values.
 
 Keys include input content and executable modes, resolved commands, declared
 environment/tool probes, dependency task outputs, source location, OS, and
 architecture. Declare all inputs that influence the result. Missing input
 patterns disable reuse; inputs are checked again before saving so a concurrent
 edit cannot publish outputs under an obsolete key. Failed tasks never save.
+Use `optional_inputs` for configuration that may not exist yet; creating or
+removing those files changes the key. Environment declarations support patterns
+such as `CARGO_PROFILE_*` and `CARGO_TARGET_*`.
 
 A hit restores the declared output trees and captured stdout values, preserving
 downstream output conditions. Archives are verified in staging before promotion;
@@ -350,7 +382,15 @@ saves, and failures.
 
 ```bash
 cargo flux run bundle --no-cache
+cargo flux run bundle --cache-required
+cargo flux run bundle --cache-hit-required
 ```
+
+`--cache-required` makes cache preparation, transfer, integrity and save errors
+fatal while still allowing a normal miss. `--cache-hit-required` additionally
+fails on misses without executing the cached producer. It can verify an S3
+round trip or consume a previously produced artifact. Both conflict with
+`--no-cache`; these execution policies do not change cache keys.
 
 This is an opt-in **task-result cache**, separate from Cargo target-directory
 reuse. Validation remains uncached by default. Restoring compatible compiler
@@ -360,7 +400,7 @@ is not implemented by this result cache.
 The repository includes an explicit MinIO integration test:
 
 ```bash
-# Supply standard AWS credentials/region for a dedicated test bucket.
+# Supply CARGO_FLUX_S3_ACCESS_KEY_ID / SECRET_ACCESS_KEY for a dedicated test bucket.
 FLUX_TEST_S3_ENDPOINT=http://localhost:9000 \
 FLUX_TEST_S3_BUCKET=cargo-flux-canary \
 cargo test --test task_cache minio -- --ignored --nocapture

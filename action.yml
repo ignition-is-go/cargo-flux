@@ -19,6 +19,30 @@ inputs:
     description: Workspace root passed to cargo flux run --root
     required: false
     default: .
+  cache:
+    description: Optional task-cache environment setup; empty or s3
+    default: ''
+  cache-endpoint:
+    description: S3-compatible endpoint for the dedicated Flux task-cache client
+    default: ''
+  cache-bucket:
+    description: Bucket authorized for Flux task results
+    default: ''
+  cache-access-key-id:
+    description: Dedicated Flux S3 client access key ID
+    default: ''
+  cache-secret-access-key:
+    description: Dedicated Flux S3 client secret access key
+    default: ''
+  cache-session-token:
+    description: Optional dedicated Flux S3 session token
+    default: ''
+  cache-region:
+    description: S3 signing region
+    default: us-east-1
+  cache-required:
+    description: Fail on configured cache errors when running the requested task
+    default: 'false'
 
 outputs:
   version:
@@ -193,6 +217,44 @@ runs:
         "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
         "path=$binary" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+    - name: Configure optional S3 cache environment
+      shell: bash
+      env:
+        CACHE_MODE: ${{ inputs.cache }}
+        CACHE_ENDPOINT: ${{ inputs.cache-endpoint }}
+        CACHE_BUCKET: ${{ inputs.cache-bucket }}
+        CACHE_ACCESS_KEY_ID: ${{ inputs.cache-access-key-id }}
+        CACHE_SECRET_ACCESS_KEY: ${{ inputs.cache-secret-access-key }}
+        CACHE_SESSION_TOKEN: ${{ inputs.cache-session-token }}
+        CACHE_REGION: ${{ inputs.cache-region }}
+        CACHE_REQUIRED: ${{ inputs.cache-required }}
+      run: |
+        set -euo pipefail
+        case "$CACHE_REQUIRED" in true|false) ;; *) echo 'cache-required must be true or false.' >&2; exit 1 ;; esac
+        if [[ -z "$CACHE_MODE" ]]; then exit 0; fi
+        if [[ "$CACHE_MODE" != s3 ]]; then echo 'cache must be empty or s3.' >&2; exit 1; fi
+        for name in CACHE_ENDPOINT CACHE_BUCKET CACHE_ACCESS_KEY_ID CACHE_SECRET_ACCESS_KEY CACHE_REGION; do
+          value="${!name}"
+          if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+            echo "$name must be a nonempty single-line value." >&2
+            exit 1
+          fi
+        done
+        if [[ "$CACHE_SESSION_TOKEN" == *$'\n'* || "$CACHE_SESSION_TOKEN" == *$'\r'* ]]; then
+          echo 'CACHE_SESSION_TOKEN must be a single-line value.' >&2
+          exit 1
+        fi
+        for name in CACHE_ACCESS_KEY_ID CACHE_SECRET_ACCESS_KEY CACHE_SESSION_TOKEN; do
+          value="${!name}"
+          if [[ -n "$value" ]]; then printf '::add-mask::%s\n' "${value//'%'/'%25'}"; fi
+        done
+        printf 'CARGO_FLUX_S3_ENDPOINT=%s\n' "$CACHE_ENDPOINT" >> "$GITHUB_ENV"
+        printf 'CARGO_FLUX_S3_BUCKET=%s\n' "$CACHE_BUCKET" >> "$GITHUB_ENV"
+        printf 'CARGO_FLUX_S3_ACCESS_KEY_ID=%s\n' "$CACHE_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+        printf 'CARGO_FLUX_S3_SECRET_ACCESS_KEY=%s\n' "$CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+        printf 'CARGO_FLUX_S3_SESSION_TOKEN=%s\n' "$CACHE_SESSION_TOKEN" >> "$GITHUB_ENV"
+        printf 'CARGO_FLUX_S3_REGION=%s\n' "$CACHE_REGION" >> "$GITHUB_ENV"
+
     - name: Run Cargo Flux task
       id: run-unix
       if: inputs.task != '' && runner.os != 'Windows'
@@ -201,6 +263,7 @@ runs:
         CARGO_FLUX: ${{ steps.install-unix.outputs.path }}
         TASK: ${{ inputs.task }}
         AFFECTED: ${{ inputs.affected }}
+        CACHE_REQUIRED: ${{ inputs.cache-required }}
         WORKSPACE_ROOT: ${{ inputs.root }}
       run: |
         set -euo pipefail
@@ -209,6 +272,7 @@ runs:
         if [[ -n "$AFFECTED" ]]; then
           args+=(--affected "$AFFECTED")
         fi
+        if [[ "$CACHE_REQUIRED" == true ]]; then args+=(--cache-required); fi
         "$CARGO_FLUX" "${args[@]}"
         "$CARGO_FLUX" report github-output --input "$report" --output-file "$GITHUB_OUTPUT"
         rm -f "$report"
@@ -221,6 +285,7 @@ runs:
         CARGO_FLUX: ${{ steps.install-windows.outputs.path }}
         TASK: ${{ inputs.task }}
         AFFECTED: ${{ inputs.affected }}
+        CACHE_REQUIRED: ${{ inputs.cache-required }}
         WORKSPACE_ROOT: ${{ inputs.root }}
       run: |
         $ErrorActionPreference = 'Stop'
@@ -229,6 +294,7 @@ runs:
         if (-not [string]::IsNullOrWhiteSpace($env:AFFECTED)) {
           $arguments += @('--affected', $env:AFFECTED)
         }
+        if ($env:CACHE_REQUIRED -eq 'true') { $arguments += '--cache-required' }
         & $env:CARGO_FLUX @arguments
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         & $env:CARGO_FLUX report github-output --input $report --output-file $env:GITHUB_OUTPUT

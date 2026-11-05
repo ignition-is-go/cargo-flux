@@ -217,6 +217,8 @@ fn main() -> Result<()> {
                 }
                 Command::Run {
                     no_cache,
+                    cache_required,
+                    cache_hit_required,
                     task,
                     affected,
                     report,
@@ -242,9 +244,23 @@ fn main() -> Result<()> {
                             task.cache = None;
                         }
                     }
+                    if cache_required || cache_hit_required {
+                        for task in &mut root_plan {
+                            if let Some(cache) = &mut task.cache {
+                                cache.required = true;
+                                cache.hit_required = cache_hit_required;
+                            }
+                        }
+                    }
                     let plan =
                         task_execution_plan_with_scope(&graph, &tasks, &task, affected_packages)?;
                     let total_tasks = root_plan.len() + plan.tasks.len();
+                    if cache_hit_required && total_tasks > 0 {
+                        anyhow::ensure!(
+                            root_plan.iter().any(|task| task.cache.is_some()),
+                            "--cache-hit-required needs a configured cached task in the plan"
+                        );
+                    }
                     if total_tasks == 0 {
                         match affected_base {
                             Some(base) => println!(
@@ -525,32 +541,53 @@ fn execute_root_plan(
             .iter()
             .map(|command| command.interpolate_outputs(&task_outputs))
             .collect::<Result<Vec<_>>>()?;
-        let cache = resolved.cache.as_ref().and_then(|config| {
-            let dependency_outputs = resolved
-                .depends_on
-                .iter()
-                .filter_map(|name| {
-                    task_outputs
-                        .get(name)
-                        .map(|outputs| (name.clone(), outputs.clone()))
-                })
-                .collect();
-            match cache::Session::prepare(
-                root,
-                &resolved.task_name,
-                config,
-                &commands,
-                &dependency_outputs,
-            ) {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    eprintln!("cache unavailable for {}: {error}", resolved.task_name);
-                    None
-                }
+        let required = resolved
+            .cache
+            .as_ref()
+            .is_some_and(|config| config.required);
+        let prepared = resolved
+            .cache
+            .as_ref()
+            .map(|config| {
+                let dependency_outputs = resolved
+                    .depends_on
+                    .iter()
+                    .filter_map(|name| {
+                        task_outputs
+                            .get(name)
+                            .map(|outputs| (name.clone(), outputs.clone()))
+                    })
+                    .collect();
+                cache::Session::prepare(
+                    root,
+                    &resolved.task_name,
+                    config,
+                    &commands,
+                    &dependency_outputs,
+                )
+            })
+            .transpose();
+        let cache = match prepared {
+            Ok(cache) => cache,
+            Err(error) if required => {
+                return Err(error.context(format!(
+                    "required cache unavailable for {}",
+                    resolved.task_name
+                )));
             }
-        });
-        let restored = cache.as_ref().and_then(|cache| match cache.restore() {
-            Ok(value) => value,
+            Err(error) => {
+                eprintln!("cache unavailable for {}: {error}", resolved.task_name);
+                None
+            }
+        };
+        let restored = match cache.as_ref().map(|cache| cache.restore()).transpose() {
+            Ok(result) => result.flatten(),
+            Err(error) if required => {
+                return Err(error.context(format!(
+                    "required cache restore failed for {}",
+                    resolved.task_name
+                )));
+            }
             Err(error) => {
                 eprintln!(
                     "cache restore failed for {}: {error}; executing task",
@@ -558,8 +595,19 @@ fn execute_root_plan(
                 );
                 None
             }
-        });
+        };
         let mut captured_stdout = restored.clone().flatten();
+        if resolved
+            .cache
+            .as_ref()
+            .is_some_and(|config| config.hit_required)
+            && restored.is_none()
+        {
+            anyhow::bail!(
+                "required cache hit missing for {}; task was not executed",
+                resolved.task_name
+            );
+        }
         if restored.is_some() {
             println!("cache hit: {}", resolved.task_name);
         } else {
@@ -582,6 +630,12 @@ fn execute_root_plan(
             if let Some(cache) = &cache {
                 match cache.save(captured_stdout.clone()) {
                     Ok(()) => println!("cache saved: {}", resolved.task_name),
+                    Err(error) if required => {
+                        return Err(error.context(format!(
+                            "required cache save failed for {}",
+                            resolved.task_name
+                        )));
+                    }
                     Err(error) => {
                         eprintln!("cache save failed for {}: {error}", resolved.task_name)
                     }
