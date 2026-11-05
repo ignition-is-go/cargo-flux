@@ -30,6 +30,9 @@ toml_edit = "0.22"
 sha2 = "0.10"
 tar = "0.4"
 tempfile = "3"
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "tokio"] }
+tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
+futures-util = "0.3"
 
 # Keep linked worktrees independent of an enclosing development workspace.
 [workspace]

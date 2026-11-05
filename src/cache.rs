@@ -1,6 +1,6 @@
 //! Opt-in, content-addressed root-task outputs. Cargo target snapshots are a
 //! different cache: restoring compiler artifacts must not skip validation.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,9 +8,10 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use crate::tasks::TaskCommand;
+
+mod s3;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -22,8 +23,10 @@ pub struct Store {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct S3 {
-    pub bucket: String,
+    pub bucket: Option<String>,
+    pub bucket_env: Option<String>,
     pub endpoint: Option<String>,
+    pub endpoint_env: Option<String>,
     #[serde(default = "default_prefix")]
     pub prefix: String,
     #[serde(default = "default_timeout")]
@@ -37,10 +40,33 @@ fn default_timeout() -> u64 {
     120
 }
 
+fn configured_value(
+    literal: &Option<String>,
+    variable: &Option<String>,
+    label: &str,
+) -> Result<Option<String>> {
+    ensure!(
+        literal.is_none() || variable.is_none(),
+        "configure {label} or {label}_env, not both"
+    );
+    match variable {
+        Some(name) => Ok(Some(
+            std::env::var(name)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .with_context(|| {
+                    format!("cache {label} environment variable `{name}` is missing or empty")
+                })?,
+        )),
+        None => Ok(literal.clone()),
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TaskCache {
     pub inputs: Vec<String>,
+    pub optional_inputs: Vec<String>,
     pub paths: Vec<PathBuf>,
     pub env: Vec<String>,
     pub tools: Vec<Vec<String>>,
@@ -50,6 +76,8 @@ pub struct TaskCache {
 pub struct ResolvedCache {
     pub store: Store,
     pub task: TaskCache,
+    pub required: bool,
+    pub hit_required: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -161,6 +189,19 @@ impl<'a> Session<'a> {
         );
         for name in &config.task.env {
             field(&mut hash, name.as_bytes());
+            if name.contains(['*', '?', '[']) {
+                let pattern = glob::Pattern::new(name)?;
+                let values: BTreeMap<_, _> = std::env::vars_os()
+                    .filter(|(key, _)| key.to_str().is_some_and(|key| pattern.matches(key)))
+                    .collect();
+                field(&mut hash, b"environment-glob");
+                field(&mut hash, &(values.len() as u64).to_le_bytes());
+                for (key, value) in values {
+                    field(&mut hash, key.as_encoded_bytes());
+                    field(&mut hash, value.as_encoded_bytes());
+                }
+                continue;
+            }
             match std::env::var_os(name) {
                 Some(value) => {
                     field(&mut hash, b"present");
@@ -181,7 +222,13 @@ impl<'a> Session<'a> {
             field(&mut hash, &output.stderr);
         }
         let mut inputs = BTreeSet::new();
-        for pattern in &config.task.inputs {
+        for (pattern, required) in config
+            .task
+            .inputs
+            .iter()
+            .map(|p| (p, true))
+            .chain(config.task.optional_inputs.iter().map(|p| (p, false)))
+        {
             relative(Path::new(pattern))?;
             field(&mut hash, pattern.as_bytes());
             let mut matched = false;
@@ -190,7 +237,10 @@ impl<'a> Session<'a> {
                 matched = true;
                 files(root, path.strip_prefix(root)?, &mut inputs)?;
             }
-            ensure!(matched, "cache input pattern matched nothing: {pattern}");
+            ensure!(
+                matched || !required,
+                "cache input pattern matched nothing: {pattern}"
+            );
         }
         for path in inputs {
             field(&mut hash, path.as_os_str().as_encoded_bytes());
@@ -399,75 +449,13 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// AWS CLI supplies standard credentials, TLS, multipart upload and retries.
-    /// Credentials never appear in argv or Flux reports. The complete operation
-    /// has a deadline in addition to the CLI's socket timeouts.
     fn s3(&self, operation: &str, path: &Path) -> Result<bool> {
-        let s3 = self.config.store.s3.as_ref().context("missing S3 store")?;
-        ensure!(
-            !s3.bucket.is_empty() && !s3.bucket.contains('/'),
-            "invalid cache bucket"
-        );
-        if let Some(endpoint) = &s3.endpoint {
-            ensure!(
-                (endpoint.starts_with("http://") || endpoint.starts_with("https://"))
-                    && !endpoint.contains(['@', '?', '#']),
-                "cache endpoint must not contain credentials or query parameters"
-            );
-        }
-        let uri = format!(
-            "s3://{}/{}/{}.tar",
-            s3.bucket,
-            s3.prefix.trim_matches('/'),
-            self.key
-        );
-        let mut command = Command::new("aws");
-        command.args(["--cli-connect-timeout", "5", "--cli-read-timeout", "30"]);
-        if let Some(endpoint) = &s3.endpoint {
-            command.args(["--endpoint-url", endpoint]);
-        }
-        command.args(["s3", "cp", "--only-show-errors"]);
-        if operation == "download" {
-            command.arg(&uri).arg(path);
-        } else {
-            command.arg(path).arg(&uri);
-        }
-        let errors = tempfile::NamedTempFile::new()?;
-        let mut child = command
-            .env("AWS_PAGER", "")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(errors.reopen()?)
-            .spawn()
-            .context("S3 caching requires AWS CLI on PATH")?;
-        let deadline = Instant::now() + Duration::from_secs(s3.timeout_seconds.max(1));
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if status.success() {
-                    return Ok(true);
-                }
-                let error = fs::read_to_string(errors.path())?;
-                if operation == "download"
-                    && (error.contains("(404)")
-                        || error.contains("NoSuchKey")
-                        || error.contains("Not Found"))
-                {
-                    return Ok(false);
-                }
-                bail!(
-                    "S3 cache {operation} failed ({status}); check endpoint, credentials and bucket permissions"
-                );
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!(
-                    "S3 cache {operation} exceeded {} seconds",
-                    s3.timeout_seconds
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        s3::transfer(
+            self.config.store.s3.as_ref().context("missing S3 store")?,
+            &self.key,
+            operation,
+            path,
+        )
     }
 }
 
@@ -497,6 +485,8 @@ mod tests {
         fs::create_dir(root.join("dist")).unwrap();
         fs::write(root.join("dist/result"), "original").unwrap();
         let config = ResolvedCache {
+            required: false,
+            hit_required: false,
             store: Store::default(),
             task: TaskCache {
                 inputs: vec!["source".into()],

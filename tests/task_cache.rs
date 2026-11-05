@@ -1,3 +1,9 @@
+#[path = "support/s3.rs"]
+mod mock_s3;
+
+use futures_util::TryStreamExt;
+use object_store::{ObjectStore, ObjectStoreExt};
+
 use std::fs;
 use std::process::{Command, Output};
 
@@ -27,9 +33,8 @@ impl Fixture {
         ])
         .unwrap();
         let store = if s3 {
-            let endpoint =
-                std::env::var("FLUX_TEST_S3_ENDPOINT").expect("set FLUX_TEST_S3_ENDPOINT");
-            let bucket = std::env::var("FLUX_TEST_S3_BUCKET")
+            std::env::var("FLUX_TEST_S3_ENDPOINT").expect("set FLUX_TEST_S3_ENDPOINT");
+            std::env::var("FLUX_TEST_S3_BUCKET")
                 .expect("set FLUX_TEST_S3_BUCKET to a dedicated test bucket");
             let prefix = format!(
                 "tests/{}-{}",
@@ -38,7 +43,7 @@ impl Fixture {
             );
             fixture.s3_prefix = Some(prefix.clone());
             format!(
-                "[cache.s3]\nendpoint={endpoint:?}\nbucket={bucket:?}\nprefix={prefix:?}\ntimeout_seconds=10\n"
+                "[cache.s3]\nendpoint_env='FLUX_TEST_S3_ENDPOINT'\nbucket_env='FLUX_TEST_S3_BUCKET'\nprefix={prefix:?}\ntimeout_seconds=10\n"
             )
         } else {
             String::new()
@@ -76,6 +81,10 @@ root = ["git", "--version"]
     }
 
     fn run(&self, mode: &str, no_cache: bool) -> Output {
+        self.run_flags(mode, if no_cache { &["--no-cache"] } else { &[] })
+    }
+
+    fn run_flags(&self, mode: &str, flags: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-flux"));
         command
             .arg("--root")
@@ -84,10 +93,7 @@ root = ["git", "--version"]
             .arg(self.root.path().join("report.json"))
             .env("FLUX_CACHE_PRODUCER", "1")
             .env("CACHE_TEST_MODE", mode);
-        if no_cache {
-            command.arg("--no-cache");
-        }
-        command.output().unwrap()
+        command.args(flags).output().unwrap()
     }
 
     fn success(&self, mode: &str, no_cache: bool) -> String {
@@ -115,15 +121,27 @@ root = ["git", "--version"]
         fs::remove_dir_all(self.root.path().join("dist")).unwrap();
     }
 
-    fn aws(&self, args: &[&str]) -> Output {
-        Command::new("aws")
-            .arg("--endpoint-url")
-            .arg(std::env::var("FLUX_TEST_S3_ENDPOINT").unwrap())
-            .args(["--cli-connect-timeout", "5", "--cli-read-timeout", "10"])
-            .args(args)
-            .env("AWS_PAGER", "")
-            .env("AWS_EC2_METADATA_DISABLED", "true")
-            .output()
+    fn store(&self) -> object_store::aws::AmazonS3 {
+        let endpoint = std::env::var("FLUX_TEST_S3_ENDPOINT").unwrap();
+        object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(std::env::var("FLUX_TEST_S3_BUCKET").unwrap())
+            .with_endpoint(&endpoint)
+            .with_allow_http(endpoint.starts_with("http://"))
+            .with_virtual_hosted_style_request(false)
+            .with_access_key_id(std::env::var("CARGO_FLUX_S3_ACCESS_KEY_ID").unwrap())
+            .with_secret_access_key(std::env::var("CARGO_FLUX_S3_SECRET_ACCESS_KEY").unwrap())
+            .with_region(
+                std::env::var("CARGO_FLUX_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            )
+            .with_client_options(
+                object_store::ClientOptions::new().with_timeout(std::time::Duration::from_secs(5)),
+            )
+            .with_retry(object_store::RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .with_allow_http(endpoint.starts_with("http://"))
+            .build()
             .unwrap()
     }
 }
@@ -138,15 +156,15 @@ impl Drop for Fixture {
                 );
                 return;
             }
-            let uri = format!(
-                "s3://{}/{prefix}/",
-                std::env::var("FLUX_TEST_S3_BUCKET").unwrap()
-            );
-            let output = self.aws(&["s3", "rm", &uri, "--recursive", "--only-show-errors"]);
-            assert!(
-                output.status.success(),
-                "failed to remove owned S3 test prefix"
-            );
+            runtime().block_on(async {
+                let store = self.store();
+                let prefix = object_store::path::Path::from(prefix.clone());
+                if let Ok(objects) = store.list(Some(&prefix)).try_collect::<Vec<_>>().await {
+                    for object in objects {
+                        let _ = store.delete(&object.location).await;
+                    }
+                }
+            });
         }
     }
 }
@@ -174,6 +192,9 @@ fn cache_producer() {
         !std::path::Path::new("fail").exists(),
         "intentional producer failure"
     );
+    if std::path::Path::new("block-cache").exists() {
+        fs::write(".flux", "block store creation").unwrap();
+    }
     println!("generated");
 }
 
@@ -218,6 +239,23 @@ fn input_environment_tool_and_command_changes_invalidate_cached_results() {
     .unwrap();
     assert!(f.success("b", false).contains("cache miss: produce"));
     assert_eq!(f.count(), 5);
+}
+
+#[test]
+fn declared_environment_prefixes_invalidate_results() {
+    let f = Fixture::new(false);
+    let config = f.root.path().join("flux.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("env = [\"CACHE_TEST_MODE\"]", "env = [\"CACHE_TEST_*\"]"),
+    )
+    .unwrap();
+    f.success("one", false);
+    assert!(f.success("two", false).contains("cache miss: produce"));
+    assert_eq!(f.count(), 2);
+    assert!(f.success("two", false).contains("cache hit: produce"));
 }
 
 #[test]
@@ -311,39 +349,17 @@ fn inputs_changed_during_execution_are_not_saved_under_an_old_key() {
 }
 
 #[test]
-#[cfg(unix)]
 fn stalled_partial_s3_transfers_are_bounded_and_do_not_replace_outputs() {
-    use std::os::unix::fs::PermissionsExt;
+    let server = mock_s3::Server::new(true);
     let f = Fixture::new(false);
-    let config = f.root.path().join("flux.toml");
-    fs::write(
-        &config,
-        format!(
-            "{}\n[cache.s3]\nbucket='fixture'\nendpoint='http://127.0.0.1:9'\ntimeout_seconds=1\n",
-            fs::read_to_string(&config).unwrap()
-        ),
-    )
-    .unwrap();
-    let bin = f.root.path().join("bin");
-    fs::create_dir(&bin).unwrap();
-    let fake = bin.join("aws");
-    fs::write(&fake, "#!/bin/sh\nfor last do :; done\ncase \"$last\" in s3://*) ;; *) printf partial > \"$last\" ;; esac\nexec sleep 10\n").unwrap();
-    fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
+    configure_mock_store(&f, &server.endpoint, 1);
     let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-flux"))
-        .arg("--root")
-        .arg(f.root.path())
-        .args(["run", "produce"])
-        .env("PATH", path)
-        .env("FLUX_CACHE_PRODUCER", "1")
-        .env("CACHE_TEST_MODE", "a")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    let output = native_command(&f).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(started.elapsed().as_secs() < 6);
     assert!(String::from_utf8_lossy(&output.stderr).contains("exceeded 1 seconds"));
     assert_eq!(
@@ -354,12 +370,24 @@ fn stalled_partial_s3_transfers_are_bounded_and_do_not_replace_outputs() {
 }
 
 #[test]
-#[ignore = "requires dedicated MinIO bucket and standard AWS credential environment"]
+#[ignore = "requires dedicated MinIO bucket and CARGO_FLUX_S3_* credentials"]
 fn minio_restores_and_rejects_truncated_remote_artifacts() {
     let f = Fixture::new(true);
-    assert!(f.success("a", false).contains("cache saved: produce"));
+    let first = f.run_flags("a", &["--cache-required"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("cache saved: produce"));
     f.clear_outputs();
-    assert!(f.success("a", false).contains("cache hit: produce"));
+    let hit = f.run_flags("a", &["--cache-hit-required"]);
+    assert!(
+        hit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hit.stderr)
+    );
+    assert!(String::from_utf8_lossy(&hit.stdout).contains("cache hit: produce"));
     assert_eq!(f.count(), 1);
     assert_eq!(
         fs::read(f.root.path().join("source")).unwrap(),
@@ -379,34 +407,24 @@ fn minio_restores_and_rejects_truncated_remote_artifacts() {
                 .mode()
         );
     }
-    let bucket = std::env::var("FLUX_TEST_S3_BUCKET").unwrap();
-    let objects = f.aws(&[
-        "s3api",
-        "list-objects-v2",
-        "--bucket",
-        &bucket,
-        "--prefix",
-        f.s3_prefix.as_ref().unwrap(),
-    ]);
-    assert!(objects.status.success());
-    let objects: serde_json::Value = serde_json::from_slice(&objects.stdout).unwrap();
-    let key = objects["Contents"][0]["Key"].as_str().unwrap();
-    let broken = f.root.path().join("truncated.tar");
-    fs::write(&broken, "interrupted transfer").unwrap();
-    assert!(
-        f.aws(&[
-            "s3api",
-            "put-object",
-            "--bucket",
-            &bucket,
-            "--key",
-            key,
-            "--body",
-            broken.to_str().unwrap()
-        ])
-        .status
-        .success()
-    );
+    runtime().block_on(async {
+        let store = f.store();
+        let prefix = object_store::path::Path::from(f.s3_prefix.as_ref().unwrap().clone());
+        let objects = store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let key = &objects
+            .iter()
+            .find(|object| object.location.as_ref().ends_with(".tar"))
+            .unwrap()
+            .location;
+        store
+            .put(key, b"interrupted transfer".to_vec().into())
+            .await
+            .unwrap();
+    });
     f.clear_outputs();
     let output = f.run("a", false);
     assert!(output.status.success());
@@ -415,4 +433,170 @@ fn minio_restores_and_rejects_truncated_remote_artifacts() {
     f.clear_outputs();
     assert!(f.success("a", false).contains("cache hit: produce"));
     assert_eq!(f.count(), 2);
+}
+
+#[test]
+fn required_cache_errors_are_not_hidden_by_successful_task_execution() {
+    let f = Fixture::new(false);
+    fs::write(f.root.path().join("block-cache"), "").unwrap();
+    let output = f.run_flags("a", &["--cache-required"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required cache save failed"));
+    assert_eq!(f.count(), 1);
+}
+
+#[test]
+fn required_cache_rejects_restore_and_prepare_errors_before_running() {
+    let f = Fixture::new(false);
+    f.success("a", false);
+    let archive = fs::read_dir(f.root.path().join(".flux/cache"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(archive, "corrupt").unwrap();
+    assert!(!f.run_flags("a", &["--cache-required"]).status.success());
+    assert_eq!(f.count(), 1);
+    let config = f.root.path().join("flux.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("inputs = [\"source\"]", "inputs = [\"missing-input\"]"),
+    )
+    .unwrap();
+    let output = f.run_flags("a", &["--cache-required"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("required cache unavailable"));
+    assert_eq!(f.count(), 1);
+    assert!(
+        !f.run_flags("a", &["--no-cache", "--cache-required"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn missing_environment_store_configuration_is_visible_and_no_cache_can_bypass_it() {
+    let f = Fixture::new(false);
+    let config = f.root.path().join("flux.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[cache.s3]\nbucket_env='FLUX_DELIBERATELY_MISSING_BUCKET_01A1A316'\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    let output = f.run_flags("a", &["--cache-required"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("FLUX_DELIBERATELY_MISSING_BUCKET_01A1A316")
+    );
+    assert!(!f.root.path().join("executions").exists());
+    assert!(f.run_flags("a", &["--no-cache"]).status.success());
+    assert_eq!(f.count(), 1);
+}
+
+#[test]
+fn dedicated_flux_credentials_sign_requests_without_ambient_compiler_credentials() {
+    let server = mock_s3::Server::new(false);
+    let f = Fixture::new(false);
+    configure_mock_store(&f, &server.endpoint, 5);
+    let output = native_command(&f).arg("--cache-required").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cache saved: produce"));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request.contains("Credential=flux-key/"));
+        assert!(!request.contains("compiler-key"));
+        assert!(
+            !request
+                .to_ascii_lowercase()
+                .contains("x-amz-security-token")
+        );
+    }
+}
+
+#[test]
+fn hit_required_restores_without_executing_a_missing_producer() {
+    let f = Fixture::new(false);
+    let output = f.run_flags("a", &["--cache-hit-required"]);
+    assert!(!output.status.success());
+    assert!(!f.root.path().join("executions").exists());
+    f.success("a", false);
+    f.clear_outputs();
+    let output = f.run_flags("a", &["--cache-hit-required"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cache hit: produce"));
+    assert_eq!(f.count(), 1);
+}
+
+#[test]
+fn optional_input_creation_invalidates_the_result() {
+    let f = Fixture::new(false);
+    let config = f.root.path().join("flux.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config).unwrap().replace(
+            "inputs = [\"source\"]",
+            "inputs = [\"source\"], optional_inputs = [\"optional.conf\"]",
+        ),
+    )
+    .unwrap();
+    f.success("a", false);
+    assert!(f.success("a", false).contains("cache hit: produce"));
+    fs::write(f.root.path().join("optional.conf"), "new config").unwrap();
+    assert!(f.success("a", false).contains("cache miss: produce"));
+    assert_eq!(f.count(), 2);
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn configure_mock_store(f: &Fixture, endpoint: &str, timeout: u64) {
+    let config = f.root.path().join("flux.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[cache.s3]\nbucket='fixture'\nendpoint={endpoint:?}\ntimeout_seconds={timeout}\n",
+            fs::read_to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+}
+
+fn native_command(f: &Fixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-flux"));
+    command
+        .arg("--root")
+        .arg(f.root.path())
+        .args(["run", "produce"])
+        .env("FLUX_CACHE_PRODUCER", "1")
+        .env("CACHE_TEST_MODE", "a")
+        .env("AWS_ACCESS_KEY_ID", "compiler-key")
+        .env("AWS_SECRET_ACCESS_KEY", "compiler-secret")
+        .env("AWS_SESSION_TOKEN", "compiler-token")
+        .env("AWS_PROFILE", "compiler-profile")
+        .env("CARGO_FLUX_S3_ACCESS_KEY_ID", "flux-key")
+        .env("CARGO_FLUX_S3_SECRET_ACCESS_KEY", "flux-secret")
+        .env_remove("CARGO_FLUX_S3_SESSION_TOKEN")
+        .env("CARGO_FLUX_S3_REGION", "us-east-1")
+        .env("NO_PROXY", "*");
+    command
 }
