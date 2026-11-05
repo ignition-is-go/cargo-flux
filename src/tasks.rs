@@ -13,9 +13,21 @@ pub struct TaskRegistry {
     affected: AffectedConfig,
     selections: BTreeMap<String, PackageSelection>,
     cache: crate::cache::Store,
+    artifacts: BTreeMap<String, Vec<PathBuf>>,
 }
 
 impl TaskRegistry {
+    pub fn artifact_paths(&self, name: &str) -> Result<&[PathBuf]> {
+        self.artifacts
+            .get(name)
+            .map(Vec::as_slice)
+            .ok_or_else(|| anyhow!("undefined artifact contract `{name}`"))
+    }
+
+    pub fn cache_store(&self) -> &crate::cache::Store {
+        &self.cache
+    }
+
     pub fn selection(&self, name: &str) -> Result<&PackageSelection> {
         self.selections
             .get(name)
@@ -43,6 +55,7 @@ impl TaskRegistry {
             affected: config.affected,
             selections: config.selections,
             cache: config.cache,
+            artifacts: config.artifacts,
         })
     }
 
@@ -564,6 +577,8 @@ struct FluxConfig {
     selections: BTreeMap<String, PackageSelection>,
     #[serde(default)]
     cache: crate::cache::Store,
+    #[serde(default)]
+    artifacts: BTreeMap<String, Vec<PathBuf>>,
     channels: Option<toml::Value>,
     #[serde(default)]
     affected: AffectedConfig,

@@ -14,6 +14,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Transfer explicit artifacts or compiler snapshots without skipping tasks.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
     /// Print discovered packages and their internal dependencies.
     Graph,
     /// Print packages in topological order.
@@ -43,7 +48,7 @@ pub enum Command {
         /// Fail on errors in configured caches instead of falling back.
         #[arg(long)]
         cache_required: bool,
-        /// Require configured cache hits; do not execute cached tasks on misses.
+        /// Require configured intermediate-cache hits before executing tasks.
         #[arg(long)]
         cache_hit_required: bool,
         /// Logical task name to execute.
@@ -110,5 +115,57 @@ pub enum ReportCommand {
         /// GitHub Actions output file, normally `$GITHUB_OUTPUT`.
         #[arg(long, value_name = "PATH")]
         output_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StorageCommand {
+    /// Print compiler/flags/scope compatibility without keying on source hashes.
+    CargoKey {
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long, requires = "selection")]
+        affected: Option<String>,
+    },
+    /// Record or restore unchanged source timestamps alongside a Cargo snapshot.
+    Sources {
+        #[arg(long, default_value = "target")]
+        path: PathBuf,
+        #[arg(long)]
+        restore: bool,
+        #[arg(long = "include")]
+        include: Vec<PathBuf>,
+    },
+    /// Save declared paths as a verified compressed archive.
+    Save {
+        #[arg(long)]
+        key: String,
+        #[arg(
+            long = "path",
+            required_unless_present = "artifact",
+            conflicts_with = "artifact"
+        )]
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        artifact: Option<String>,
+    },
+    /// Restore the first existing key; validation commands must still run.
+    Restore {
+        #[arg(long = "key", required = true)]
+        keys: Vec<String>,
+        #[arg(
+            long = "path",
+            required_unless_present = "artifact",
+            conflicts_with = "artifact"
+        )]
+        paths: Vec<PathBuf>,
+        #[arg(long)]
+        artifact: Option<String>,
+        #[arg(long, default_value = ".")]
+        destination: PathBuf,
+        #[arg(long)]
+        required: bool,
     },
 }

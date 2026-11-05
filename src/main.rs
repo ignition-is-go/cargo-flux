@@ -6,6 +6,7 @@ mod graph;
 mod manifest;
 mod plugins;
 mod stamp;
+mod storage;
 mod tasks;
 mod version;
 
@@ -30,6 +31,78 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let root = cli.root.canonicalize()?;
+    if let Command::Storage { command } = &cli.command {
+        let tasks = TaskRegistry::load(&root)?;
+        match command {
+            cli::StorageCommand::CargoKey {
+                scope,
+                selection,
+                affected,
+            } => {
+                let packages = if let Some(selection) = selection {
+                    let graph = WorkspaceGraph::new(discover_workspace(&root)?.packages);
+                    let selected = calculate_affected_scope(
+                        &root,
+                        &graph,
+                        &tasks,
+                        affected.as_deref(),
+                        Some(selection),
+                    )?
+                    .expect("named selection");
+                    if selected.packages.is_empty() {
+                        return Ok(());
+                    }
+                    selected
+                        .packages
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                println!("{}", storage::cargo_key(&root, scope, &packages)?);
+            }
+            cli::StorageCommand::Sources {
+                path,
+                restore,
+                include,
+            } => storage::sources(&root, path, *restore, include)?,
+            cli::StorageCommand::Save {
+                key,
+                paths,
+                artifact,
+            } => {
+                let paths = artifact
+                    .as_deref()
+                    .map(|name| tasks.artifact_paths(name))
+                    .transpose()?
+                    .unwrap_or(paths);
+                storage::save(&root, tasks.cache_store(), key, paths)?;
+            }
+            cli::StorageCommand::Restore {
+                keys,
+                paths,
+                artifact,
+                destination,
+                required,
+            } => {
+                let paths = artifact
+                    .as_deref()
+                    .map(|name| tasks.artifact_paths(name))
+                    .transpose()?
+                    .unwrap_or(paths);
+                storage::restore_into(
+                    &root,
+                    tasks.cache_store(),
+                    keys,
+                    paths,
+                    *required,
+                    destination,
+                )?;
+            }
+        }
+        return Ok(());
+    }
     let discovery = discover_workspace(&root)?;
     let stdout_is_terminal = std::io::stdout().is_terminal();
     let use_color = std::io::stderr().is_terminal();
@@ -330,7 +403,10 @@ fn main() -> Result<()> {
                         write_execution_report(&path, &execution_report)?;
                     }
                 }
-                Command::Version { .. } | Command::Stamp { .. } | Command::Report { .. } => {
+                Command::Version { .. }
+                | Command::Stamp { .. }
+                | Command::Report { .. }
+                | Command::Storage { .. } => {
                     unreachable!()
                 }
             }
@@ -486,6 +562,71 @@ struct RootExecution {
     task_outputs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
+/// Fetch independently known keys with bounded parallelism, without touching
+/// workspace outputs. Runtime output references and unavailable inputs defer.
+fn prefetch_root_caches(
+    plan: &[ResolvedRootTask],
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<String, cache::Prefetched> {
+    let producers = plan
+        .iter()
+        .filter(|task| !task.output_names.is_empty())
+        .map(|task| task.task_name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let candidates = plan
+        .iter()
+        .filter(|task| {
+            task.cache.is_some()
+                && task.condition.is_none()
+                && !task
+                    .depends_on
+                    .iter()
+                    .any(|dependency| producers.contains(dependency.as_str()))
+        })
+        .collect::<Vec<_>>();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (send, receive) = std::sync::mpsc::channel();
+    // Bound connections, buffers and concurrent input hashing. Workers take
+    // another task immediately rather than waiting for a whole batch to finish.
+    std::thread::scope(|scope| {
+        for _ in 0..candidates.len().min(4) {
+            let send = send.clone();
+            let candidates = &candidates;
+            let next = &next;
+            scope.spawn(move || {
+                while let Some(task) =
+                    candidates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    let prepared = (|| {
+                        let commands = task
+                            .commands
+                            .iter()
+                            .map(|command| {
+                                command.interpolate_outputs(&std::collections::BTreeMap::new())
+                            })
+                            .collect::<Result<Vec<_>>>()
+                            .ok()?;
+                        let session = cache::Session::prepare(
+                            root,
+                            &task.task_name,
+                            task.cache.as_ref()?,
+                            &commands,
+                            &std::collections::BTreeMap::new(),
+                        )
+                        .ok()?;
+                        Some((task.task_name.clone(), session.prefetch()))
+                    })();
+                    if let Some(value) = prepared {
+                        let _ = send.send(value);
+                    }
+                }
+            });
+        }
+    });
+    drop(send);
+    receive.into_iter().collect()
+}
+
 fn execute_root_plan(
     plan: &[ResolvedRootTask],
     root: &std::path::Path,
@@ -493,6 +634,7 @@ fn execute_root_plan(
     use_color: bool,
     started: &mut usize,
 ) -> Result<RootExecution> {
+    let mut prefetched = prefetch_root_caches(plan, root);
     let mut task_outputs = std::collections::BTreeMap::new();
     let mut outcomes = std::collections::BTreeMap::new();
     for resolved in plan {
@@ -580,7 +722,11 @@ fn execute_root_plan(
                 None
             }
         };
-        let restored = match cache.as_ref().map(|cache| cache.restore()).transpose() {
+        let restored = match cache
+            .as_ref()
+            .map(|cache| cache.restore_prefetched(prefetched.remove(&resolved.task_name)))
+            .transpose()
+        {
             Ok(result) => result.flatten(),
             Err(error) if required => {
                 return Err(error.context(format!(
@@ -596,7 +742,7 @@ fn execute_root_plan(
                 None
             }
         };
-        let mut captured_stdout = restored.clone().flatten();
+        let mut captured_stdout = None;
         if resolved
             .cache
             .as_ref()
@@ -609,37 +755,35 @@ fn execute_root_plan(
             );
         }
         if restored.is_some() {
-            println!("cache hit: {}", resolved.task_name);
-        } else {
-            if cache.is_some() {
-                println!("cache miss: {}", resolved.task_name);
+            println!(
+                "cache hit: {} — intermediates restored; executing task",
+                resolved.task_name
+            );
+        } else if cache.is_some() {
+            println!("cache miss: {}", resolved.task_name);
+        }
+        for (index, command) in commands.iter().enumerate() {
+            let capture = !resolved.output_names.is_empty() && index + 1 == resolved.commands.len();
+            let output = execute_task_with_output(
+                command,
+                root,
+                &std::collections::BTreeMap::new(),
+                capture,
+            )?;
+            if output.is_some() {
+                captured_stdout = output;
             }
-            for (index, command) in commands.iter().enumerate() {
-                let capture =
-                    !resolved.output_names.is_empty() && index + 1 == resolved.commands.len();
-                let output = execute_task_with_output(
-                    command,
-                    root,
-                    &std::collections::BTreeMap::new(),
-                    capture,
-                )?;
-                if output.is_some() {
-                    captured_stdout = output;
+        }
+        if let Some(cache) = &cache {
+            match cache.save(captured_stdout.clone()) {
+                Ok(()) => println!("cache saved: {}", resolved.task_name),
+                Err(error) if required => {
+                    return Err(error.context(format!(
+                        "required cache save failed for {}",
+                        resolved.task_name
+                    )));
                 }
-            }
-            if let Some(cache) = &cache {
-                match cache.save(captured_stdout.clone()) {
-                    Ok(()) => println!("cache saved: {}", resolved.task_name),
-                    Err(error) if required => {
-                        return Err(error.context(format!(
-                            "required cache save failed for {}",
-                            resolved.task_name
-                        )));
-                    }
-                    Err(error) => {
-                        eprintln!("cache save failed for {}: {error}", resolved.task_name)
-                    }
-                }
+                Err(error) => eprintln!("cache save failed for {}: {error}", resolved.task_name),
             }
         }
         if !resolved.output_names.is_empty() {

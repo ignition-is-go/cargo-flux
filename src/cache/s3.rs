@@ -41,7 +41,7 @@ fn storage_error(operation: &str, error: impl std::fmt::Display) -> anyhow::Erro
     )
 }
 
-pub(super) fn transfer(config: &S3, key: &str, operation: &str, file: &Path) -> Result<bool> {
+pub(crate) fn transfer(config: &S3, key: &str, operation: &str, file: &Path) -> Result<bool> {
     let bucket = configured_value(&config.bucket, &config.bucket_env, "bucket")?
         .context("S3 cache requires bucket or bucket_env")?;
     ensure!(

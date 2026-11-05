@@ -199,7 +199,7 @@ fn cache_producer() {
 }
 
 #[test]
-fn restores_artifacts_and_stdout_without_rerunning_and_removes_stale_outputs() {
+fn restores_intermediates_but_reruns_commands_and_removes_stale_outputs() {
     let f = Fixture::new(false);
     assert!(f.success("a", false).contains("cache miss: produce"));
     let first: serde_json::Value =
@@ -207,7 +207,7 @@ fn restores_artifacts_and_stdout_without_rerunning_and_removes_stale_outputs() {
     fs::write(f.root.path().join("dist/stale"), "stale").unwrap();
     assert!(f.success("a", false).contains("cache hit: produce"));
     assert!(!f.root.path().join("dist/stale").exists());
-    assert_eq!(f.count(), 1);
+    assert_eq!(f.count(), 2);
     let second: serde_json::Value =
         serde_json::from_slice(&fs::read(f.root.path().join("report.json")).unwrap()).unwrap();
     assert_eq!(first["task_outputs"], second["task_outputs"]);
@@ -217,7 +217,7 @@ fn restores_artifacts_and_stdout_without_rerunning_and_removes_stale_outputs() {
         fs::read_to_string(f.root.path().join("dist/result")).unwrap(),
         "rship canary input\n"
     );
-    assert_eq!(f.count(), 1);
+    assert_eq!(f.count(), 3);
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn no_cache_executes_without_reading_or_writing_cache() {
     f.success("a", true);
     assert_eq!(f.count(), 3);
     assert!(f.success("a", false).contains("cache hit: produce"));
-    assert_eq!(f.count(), 3);
+    assert_eq!(f.count(), 4);
 }
 
 #[test]
@@ -285,7 +285,7 @@ fn file_only_cache_hits_without_captured_stdout() {
     f.success("a", false);
     f.clear_outputs();
     assert!(f.success("a", false).contains("cache hit: produce"));
-    assert_eq!(f.count(), 1);
+    assert_eq!(f.count(), 2);
 }
 
 #[test]
@@ -301,7 +301,7 @@ fn unrelated_root_outputs_do_not_invalidate_cached_task() {
     f.success("a", false);
     f.git(&["config", "flux.unrelated", "two"]);
     assert!(f.success("a", false).contains("cache hit: produce"));
-    assert_eq!(f.count(), 1);
+    assert_eq!(f.count(), 2);
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn corrupt_archive_falls_back_to_execution_and_repairs_cache() {
     assert_eq!(f.count(), 2);
     f.clear_outputs();
     assert!(f.success("a", false).contains("cache hit: produce"));
-    assert_eq!(f.count(), 2);
+    assert_eq!(f.count(), 3);
 }
 
 #[test]
@@ -335,7 +335,7 @@ fn failed_tasks_do_not_publish_partial_outputs() {
     assert!(f.success("a", false).contains("cache miss: produce"));
     f.clear_outputs();
     assert!(f.success("a", false).contains("cache hit: produce"));
-    assert_eq!(f.count(), 2);
+    assert_eq!(f.count(), 3);
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn minio_restores_and_rejects_truncated_remote_artifacts() {
         String::from_utf8_lossy(&hit.stderr)
     );
     assert!(String::from_utf8_lossy(&hit.stdout).contains("cache hit: produce"));
-    assert_eq!(f.count(), 1);
+    assert_eq!(f.count(), 2);
     assert_eq!(
         fs::read(f.root.path().join("source")).unwrap(),
         fs::read(f.root.path().join("dist/result")).unwrap()
@@ -429,10 +429,10 @@ fn minio_restores_and_rejects_truncated_remote_artifacts() {
     let output = f.run("a", false);
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cache restore failed"));
-    assert_eq!(f.count(), 2);
+    assert_eq!(f.count(), 3);
     f.clear_outputs();
     assert!(f.success("a", false).contains("cache hit: produce"));
-    assert_eq!(f.count(), 2);
+    assert_eq!(f.count(), 4);
 }
 
 #[test]
@@ -526,7 +526,7 @@ fn dedicated_flux_credentials_sign_requests_without_ambient_compiler_credentials
 }
 
 #[test]
-fn hit_required_restores_without_executing_a_missing_producer() {
+fn hit_required_rejects_misses_but_still_executes_on_hits() {
     let f = Fixture::new(false);
     let output = f.run_flags("a", &["--cache-hit-required"]);
     assert!(!output.status.success());
@@ -540,7 +540,7 @@ fn hit_required_restores_without_executing_a_missing_producer() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("cache hit: produce"));
-    assert_eq!(f.count(), 1);
+    assert_eq!(f.count(), 2);
 }
 
 #[test]
@@ -559,7 +559,7 @@ fn optional_input_creation_invalidates_the_result() {
     assert!(f.success("a", false).contains("cache hit: produce"));
     fs::write(f.root.path().join("optional.conf"), "new config").unwrap();
     assert!(f.success("a", false).contains("cache miss: produce"));
-    assert_eq!(f.count(), 2);
+    assert_eq!(f.count(), 3);
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -599,4 +599,23 @@ fn native_command(f: &Fixture) -> Command {
         .env("CARGO_FLUX_S3_REGION", "us-east-1")
         .env("NO_PROXY", "*");
     command
+}
+
+#[test]
+fn prefetched_entry_is_discarded_if_a_prerequisite_changes_the_key() {
+    let f = Fixture::new(false);
+    f.success("a", false);
+    let config = f.root.path().join("flux.toml");
+    let text = fs::read_to_string(&config).unwrap().replace(
+        "[tasks.produce]\n",
+        "[tasks.produce]\ndepends_on=['prepare']\n",
+    );
+    fs::write(
+        config,
+        format!("{text}\n[tasks.prepare]\nroot=['git','config','flux.cache-version','two']\n"),
+    )
+    .unwrap();
+    let output = f.success("a", false);
+    assert!(output.contains("cache miss: produce"), "{output}");
+    assert_eq!(f.count(), 2);
 }

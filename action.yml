@@ -7,6 +7,24 @@ inputs:
     description: Cargo Flux version to install, or "action" for the version in this action release
     required: false
     default: action
+  toolchain:
+    description: Optional Rust toolchain to install and select
+    default: ''
+  components:
+    description: Optional comma-separated Rust components
+    default: ''
+  targets:
+    description: Optional comma-separated Rust targets
+    default: ''
+  compiler-cache:
+    description: Set up sccache using the dedicated Flux S3 client
+    default: 'false'
+  compiler-cache-read-only:
+    description: Prevent this job from writing compiler-cache entries
+    default: 'false'
+  compiler-cache-prefix:
+    description: Object prefix for compiler outputs in the Flux bucket
+    default: compiler/v1
   task:
     description: Logical task to run after installation; omit for setup-only use
     required: false
@@ -254,6 +272,67 @@ runs:
         printf 'CARGO_FLUX_S3_SECRET_ACCESS_KEY=%s\n' "$CACHE_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
         printf 'CARGO_FLUX_S3_SESSION_TOKEN=%s\n' "$CACHE_SESSION_TOKEN" >> "$GITHUB_ENV"
         printf 'CARGO_FLUX_S3_REGION=%s\n' "$CACHE_REGION" >> "$GITHUB_ENV"
+
+    - name: Install optional Rust toolchain
+      if: inputs.toolchain != ''
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Install optional compiler cache
+      if: inputs.compiler-cache == 'true'
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      with:
+        version: v0.17.0
+        disable_annotations: 'true'
+
+    - name: Configure isolated compiler-cache daemon
+      shell: bash
+      env:
+        COMPILER_CACHE: ${{ inputs.compiler-cache }}
+        COMPILER_READ_ONLY: ${{ inputs.compiler-cache-read-only }}
+        COMPILER_PREFIX: ${{ inputs.compiler-cache-prefix }}
+      run: |
+        set -euo pipefail
+        case "$COMPILER_CACHE:$COMPILER_READ_ONLY" in true:true|true:false|false:true|false:false) ;; *) echo 'Compiler-cache flags must be true or false.' >&2; exit 1 ;; esac
+        if [[ "$COMPILER_CACHE" == false ]]; then exit 0; fi
+        for name in CARGO_FLUX_S3_ENDPOINT CARGO_FLUX_S3_BUCKET CARGO_FLUX_S3_ACCESS_KEY_ID CARGO_FLUX_S3_SECRET_ACCESS_KEY COMPILER_PREFIX; do
+          value="${!name:-}"
+          if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then echo "$name must be nonempty and single-line." >&2; exit 1; fi
+        done
+        export SCCACHE_BUCKET="$CARGO_FLUX_S3_BUCKET"
+        export SCCACHE_ENDPOINT="$CARGO_FLUX_S3_ENDPOINT"
+        export SCCACHE_REGION="${CARGO_FLUX_S3_REGION:-us-east-1}"
+        export SCCACHE_S3_KEY_PREFIX="$COMPILER_PREFIX"
+        export SCCACHE_BASEDIRS="$GITHUB_WORKSPACE"
+        export SCCACHE_IGNORE_SERVER_IO_ERROR=1
+        export SCCACHE_S3_USE_SSL=true
+        case "$SCCACHE_ENDPOINT" in http://*) SCCACHE_S3_USE_SSL=false ;; https://*) ;; *) echo 'Invalid compiler-cache endpoint.' >&2; exit 1 ;; esac
+        export SCCACHE_S3_RW_MODE=READ_WRITE
+        if [[ "$COMPILER_READ_ONLY" == true ]]; then SCCACHE_S3_RW_MODE=READ_ONLY; fi
+        export RUSTC_WRAPPER=sccache
+        if [[ "$RUNNER_OS" != Windows ]]; then
+          socket_dir="$(mktemp -d /tmp/flux-sccache.XXXXXX)"
+          export SCCACHE_SERVER_UDS="$socket_dir/server.sock"
+          printf 'SCCACHE_SERVER_UDS=%s\n' "$SCCACHE_SERVER_UDS" >> "$GITHUB_ENV"
+        else
+          export SCCACHE_SERVER_PORT="$(shuf -i 20000-60000 -n 1)"
+          printf 'SCCACHE_SERVER_PORT=%s\n' "$SCCACHE_SERVER_PORT" >> "$GITHUB_ENV"
+        fi
+        # Only the daemon receives S3 credential aliases required by sccache.
+        # Existing AWS_* values in subsequent workflow steps remain unchanged.
+        AWS_ACCESS_KEY_ID="$CARGO_FLUX_S3_ACCESS_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$CARGO_FLUX_S3_SECRET_ACCESS_KEY" \
+        AWS_SESSION_TOKEN="${CARGO_FLUX_S3_SESSION_TOKEN:-}" \
+        AWS_EC2_METADATA_DISABLED=true \
+        sccache --start-server
+        sccache --zero-stats
+        for name in SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX SCCACHE_BASEDIRS SCCACHE_IGNORE_SERVER_IO_ERROR SCCACHE_S3_USE_SSL SCCACHE_S3_RW_MODE RUSTC_WRAPPER; do
+          printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
+        done
+        echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
 
     - name: Run Cargo Flux task
       id: run-unix
