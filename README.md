@@ -200,6 +200,51 @@ history for Git to find a merge base. A missing or shallow base is an error, not
 an empty affected set. An empty diff succeeds, and `run` reports that there is
 nothing to run.
 
+### Named package selections
+
+Define product boundaries separately from task participation:
+
+```toml
+[selections.product]
+roots = ["cargo:server", "cargo:web"]
+cargo_publishable = true
+dependencies = true
+bridges = false
+
+[selections.workspace]
+all = true
+
+[tasks.check]
+selection = "product"
+autoapply = "none"
+workspace_batchable = true
+cargo = ["cargo", "clippy", "--locked", "--all-targets"]
+```
+
+`roots` resolve package identities using the same scoped syntax as bridges;
+unknown or ambiguous roots fail. `cargo_publishable` adds Cargo packages whose
+`publish` policy allows publication, including inherited workspace policies and
+restricted registries. `dependencies` follows runtime/build dependencies;
+`bridges` additionally follows declared cross-language bridges. Neither option
+includes test-only dependencies in the product closure.
+
+Selection is intersected with affected consumers and normal task availability.
+Test-only dependencies, including renamed and target-specific dependencies,
+participate in affected analysis without introducing build-order cycles.
+Unshipped reverse dependents do not join the product merely because they depend
+on a changed library. Empty selected scopes skip root work too.
+
+```bash
+cargo flux select product
+cargo flux select product --affected origin/main --stamp-args
+cargo flux plan check --affected origin/main
+cargo flux run check --selection workspace
+```
+
+The task's `selection` is the default for both `plan` and `run`; CLI
+`--selection` overrides it. Selection does not itself opt a package into a task.
+`select` queries the package set without executing tasks or tool probes.
+
 ### Workspace-root tasks
 
 A task can define a `root` command that runs once from the workspace root rather
@@ -262,6 +307,69 @@ cargo flux report github-output --input report.json --output-file "$GITHUB_OUTPU
 With `--affected`, reachable root variants run once when the committed diff is
 nonempty. An empty diff skips both root and package work. Root tasks are omitted
 from `plan --stamp-args` because they are not packages.
+
+### Task-output caching
+
+Root-only tasks can opt into content-addressed caching of declared files and
+captured task outputs:
+
+```toml
+[tasks.bundle]
+root = ["bun", "build", "src/main.ts", "--outfile", "dist/app.js"]
+cache = { inputs = ["src/**", "package.json", "bun.lock"], paths = ["dist"], env = ["NODE_ENV"], tools = [["bun", "--version"]] }
+```
+
+The default store is `.flux/cache` in the workspace. Add it to `.gitignore`, or
+set `[cache] directory = "/path/to/cache"`. To use S3-compatible storage:
+
+```toml
+[cache.s3]
+bucket = "build-cache"
+endpoint = "http://localhost:9000" # omit for AWS S3
+prefix = "cargo-flux/v1"
+timeout_seconds = 120
+```
+
+The S3 adapter uses AWS CLI on `PATH` and its standard credential/region
+configuration; credentials are not placed in Flux configuration, argv, reports,
+or cache manifests. Socket timeouts and a complete-transfer deadline bound both
+downloads and uploads. Local filesystem caching needs no external tools.
+
+Keys include input content and executable modes, resolved commands, declared
+environment/tool probes, dependency task outputs, source location, OS, and
+architecture. Declare all inputs that influence the result. Missing input
+patterns disable reuse; inputs are checked again before saving so a concurrent
+edit cannot publish outputs under an obsolete key. Failed tasks never save.
+
+A hit restores the declared output trees and captured stdout values, preserving
+downstream output conditions. Archives are verified in staging before promotion;
+unexpected paths, links, checksums, and incomplete archives are rejected. Stale
+files in declared output trees are removed. Cache failures fall back to task
+execution. Plans label cached root tasks; run logs distinguish hits, misses,
+saves, and failures.
+
+```bash
+cargo flux run bundle --no-cache
+```
+
+This is an opt-in **task-result cache**, separate from Cargo target-directory
+reuse. Validation remains uncached by default. Restoring compatible compiler
+artifacts must still execute checks and tests; Cargo target snapshot management
+is not implemented by this result cache.
+
+The repository includes an explicit MinIO integration test:
+
+```bash
+# Supply standard AWS credentials/region for a dedicated test bucket.
+FLUX_TEST_S3_ENDPOINT=http://localhost:9000 \
+FLUX_TEST_S3_BUCKET=cargo-flux-canary \
+cargo test --test task_cache minio -- --ignored --nocapture
+```
+
+It restores artifacts, verifies bytes and executable permissions, rejects a
+truncated remote archive, and verifies repair. Owned test prefixes are normally
+removed afterward; `FLUX_TEST_S3_KEEP=1` leaves them for inspection.
+`FLUX_TEST_CANARY_INPUT=/path/to/binary` uses an actual build artifact as input.
 
 ### `run <task>`
 

@@ -105,6 +105,7 @@ impl ManifestPlugin for PackageJsonPlugin {
             .dedup_by(|left, right| left.name == right.name && left.section == right.section);
 
         Ok(RawPackage {
+            cargo_publishable: false,
             id: PackageId::new(Ecosystem::Js, &name),
             name,
             ecosystem: Ecosystem::Js,
