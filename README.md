@@ -417,6 +417,14 @@ and source identities. Storage operations never skip build/check/test commands.
 Archives preserve executable modes, sparse holes and exact file timestamps;
 contents are verified in staging before existing outputs are replaced.
 
+Storage hashes and verifies files with up to eight workers and compresses with
+up to four zstd workers, bounded by available CPU parallelism. Native S3 transfers
+use up to four concurrent 8 MiB upload parts or download ranges; large downloads
+pin ranges to one ETag and buffer disk writes. Archives and keys remain compatible
+with existing snapshots. Storage reports hash, compression, verification, transfer
+and extraction times to stderr, including compressed byte counts and download
+throughput, so CPU and disk work can be distinguished from transfer costs.
+
 Named artifact contracts keep shared file lists in `flux.toml`:
 
 ```toml

@@ -81,6 +81,7 @@ fn respond(mut stream: TcpStream, stall: bool, capture: Arc<Mutex<Vec<String>>>)
         }
     }
     let get = headers.starts_with("GET ");
+    let head = headers.starts_with("HEAD ");
     let length = headers
         .lines()
         .find_map(|line| {
@@ -94,6 +95,15 @@ fn respond(mut stream: TcpStream, stall: bool, capture: Arc<Mutex<Vec<String>>>)
         return;
     }
     capture.lock().unwrap().push(headers);
+    if head {
+        let response: &[u8] = if stall {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\nETag: \"fixture\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\n"
+        } else {
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        };
+        let _ = stream.write_all(response);
+        return;
+    }
     if stall {
         if get {
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\npartial");

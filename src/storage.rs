@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::cache::Store;
 
+const HASH_WORKERS: usize = 8;
 const MANIFEST: &str = "__flux_storage_manifest.json";
 
 #[derive(Serialize, Deserialize)]
@@ -36,6 +37,46 @@ fn file_state(path: &Path) -> Result<FileState> {
         seconds: modified.as_secs(),
         nanos: modified.subsec_nanos(),
     })
+}
+
+/// Bound filesystem hashing independently of Cargo's compiler job count.
+fn map_files<T: Send>(
+    paths: &BTreeSet<PathBuf>,
+    operation: impl Fn(&Path) -> Result<T> + Sync,
+) -> Result<BTreeMap<PathBuf, T>> {
+    let paths = paths.iter().collect::<Vec<_>>();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (send, receive) = std::sync::mpsc::channel();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(HASH_WORKERS)
+        .min(paths.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let paths = &paths;
+            let next = &next;
+            let send = send.clone();
+            let operation = &operation;
+            scope.spawn(move || {
+                while let Some(path) =
+                    paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    if send
+                        .send(operation(path).map(|value| ((*path).clone(), value)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(send);
+    receive.into_iter().collect()
+}
+
+fn phase(name: &str, started: std::time::Instant) {
+    eprintln!("storage {name}: {:.2}s", started.elapsed().as_secs_f64());
 }
 
 fn relative(path: &Path) -> Result<()> {
@@ -150,10 +191,10 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         );
         collect(root, path, &mut files)?;
     }
-    let hashes: BTreeMap<PathBuf, FileState> = files
-        .into_iter()
-        .map(|path| Ok((path.clone(), file_state(&root.join(path))?)))
-        .collect::<Result<_>>()?;
+    let started = std::time::Instant::now();
+    eprintln!("storage hashing {} files (up to 8 workers)", files.len());
+    let hashes = map_files(&files, |path| file_state(&root.join(path)))?;
+    phase("hash", started);
     let manifest = serde_json::to_vec(&Manifest {
         version: 1,
         key: key.into(),
@@ -161,8 +202,15 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         files: hashes.clone(),
     })?;
     let mut temporary = tempfile::NamedTempFile::new()?;
+    let started = std::time::Instant::now();
+    eprintln!("storage compressing archive");
     {
-        let encoder = zstd::stream::Encoder::new(&mut temporary, 1)?;
+        let mut encoder = zstd::stream::Encoder::new(&mut temporary, 1)?;
+        encoder.multithread(
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4) as u32,
+        )?;
         let mut archive = tar::Builder::new(encoder);
         // Keep sparse linker outputs sparse in the archive and on restoration.
         archive.sparse(true);
@@ -182,6 +230,9 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         archive.into_inner()?.finish()?;
     }
     temporary.flush()?;
+    phase("compress", started);
+    let started = std::time::Instant::now();
+    eprintln!("storage verifying snapshot stability");
     // Recheck producer inputs without expanding a second target tree: a Cargo
     // snapshot can be hundreds of gigabytes of sparse files.
     let mut current = BTreeSet::new();
@@ -192,17 +243,25 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         current == hashes.keys().cloned().collect(),
         "storage files changed during upload preparation"
     );
-    for (path, expected) in hashes {
+    map_files(&current, |path| {
         ensure!(
-            digest(&root.join(path))? == expected.digest,
+            digest(&root.join(path))? == hashes[path].digest,
             "storage contents changed during upload preparation"
         );
-    }
+        Ok(())
+    })?;
+    phase("verify source", started);
+    let bytes = temporary.as_file().metadata()?.len();
+    let started = std::time::Instant::now();
+    eprintln!("storage uploading {bytes} compressed bytes");
     transfer(root, store, key, true, temporary.path())?;
+    phase("upload", started);
     Ok(())
 }
 
 fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<()> {
+    let started = std::time::Instant::now();
+    eprintln!("storage extracting archive");
     let decoder = zstd::stream::Decoder::new(fs::File::open(archive)?)?;
     let mut archive = tar::Archive::new(decoder);
     let mut entries = archive.entries()?;
@@ -237,6 +296,12 @@ fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<
         );
         ensure!(entry.unpack_in(stage)?, "invalid storage entry");
     }
+    phase("extract", started);
+    let started = std::time::Instant::now();
+    eprintln!(
+        "storage verifying {} files (up to 8 workers)",
+        manifest.files.len()
+    );
     let mut actual = BTreeSet::new();
     for path in paths {
         collect(stage, path, &mut actual)?;
@@ -245,15 +310,18 @@ fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<
         actual == manifest.files.keys().cloned().collect(),
         "storage file list mismatch"
     );
-    for (path, expected) in manifest.files {
+    map_files(&actual, |path| {
+        let expected = &manifest.files[path];
         ensure!(
-            digest(&stage.join(&path))? == expected.digest,
+            digest(&stage.join(path))? == expected.digest,
             "storage checksum mismatch"
         );
         fs::File::open(stage.join(path))?.set_times(fs::FileTimes::new().set_modified(
             std::time::UNIX_EPOCH + std::time::Duration::new(expected.seconds, expected.nanos),
         ))?;
-    }
+        Ok(())
+    })?;
+    phase("verify outputs", started);
     Ok(())
 }
 
@@ -268,9 +336,17 @@ pub fn restore(
     ensure!(!keys.is_empty(), "declare at least one storage key");
     let temporary = tempfile::NamedTempFile::new()?;
     for key in keys {
+        let started = std::time::Instant::now();
+        eprintln!("storage downloading archive");
         if !transfer(root, store, key, false, temporary.path())? {
             continue;
         }
+        let bytes = temporary.as_file().metadata()?.len();
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "storage download: {bytes} bytes in {seconds:.2}s ({:.1} MiB/s)",
+            bytes as f64 / (1024.0 * 1024.0) / seconds.max(0.001)
+        );
         // Same filesystem staging permits rename without dense copies of sparse
         // files. Every byte is checked before replacing any existing output.
         let stage = tempfile::tempdir_in(root)?;

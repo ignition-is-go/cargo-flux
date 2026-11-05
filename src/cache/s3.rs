@@ -1,9 +1,10 @@
 //! Native S3-compatible transport. Every client is built from explicit Flux
 //! credentials; compiler-cache credentials and ambient cloud providers are not read.
 use anyhow::{Context, Result, anyhow, ensure};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use object_store::{
-    ClientOptions, ObjectStoreExt, RetryConfig, aws::AmazonS3Builder, path::Path as ObjectPath,
+    ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt, RetryConfig,
+    aws::AmazonS3Builder, path::Path as ObjectPath,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -102,19 +103,67 @@ pub(crate) fn transfer(config: &S3, key: &str, operation: &str, file: &Path) -> 
         };
         if operation == "download" {
             return tokio::time::timeout_at(deadline, async {
-                let result = match store.get(&location).await {
+                let metadata = match store.head(&location).await {
                     Ok(result) => result,
                     Err(object_store::Error::NotFound { .. }) => return Ok(false),
                     Err(error) => return Err(storage_error(operation, error)),
                 };
-                let mut output = tokio::fs::File::create(file).await?;
-                let mut stream = result.into_stream();
-                while let Some(bytes) = stream
-                    .try_next()
-                    .await
-                    .map_err(|error| storage_error(operation, error))?
-                {
-                    output.write_all(&bytes).await?;
+                let mut destination = tokio::fs::File::create(file).await?;
+                destination.set_max_buf_size(PART_SIZE as usize);
+                let mut output = tokio::io::BufWriter::with_capacity(4 * 1024 * 1024, destination);
+                let length = metadata.size;
+                if length >= 64 * 1024 * 1024 && metadata.e_tag.is_some() {
+                    let etag = metadata.e_tag.clone();
+                    // Pin concurrent ranges to the probed ETag so a writer
+                    // replacing the cache cannot mix object versions.
+                    let mut chunks =
+                        futures_util::stream::iter((0..length).step_by(PART_SIZE as usize))
+                            .map(|start| {
+                                let range = start..start.saturating_add(PART_SIZE).min(length);
+                                let options = GetOptions {
+                                    if_match: etag.clone(),
+                                    range: Some(GetRange::Bounded(range.clone())),
+                                    ..Default::default()
+                                };
+                                let store = &store;
+                                let location = &location;
+                                async move {
+                                    let response = store
+                                        .get_opts(location, options)
+                                        .await
+                                        .map_err(|error| storage_error(operation, error))?;
+                                    ensure!(
+                                        response.range == range,
+                                        "S3 range response did not match requested bytes"
+                                    );
+                                    let bytes = response
+                                        .bytes()
+                                        .await
+                                        .map_err(|error| storage_error(operation, error))?;
+                                    ensure!(
+                                        bytes.len() as u64 == range.end - range.start,
+                                        "incomplete S3 range response"
+                                    );
+                                    Ok::<_, anyhow::Error>(bytes)
+                                }
+                            })
+                            .buffered(4);
+                    while let Some(bytes) = chunks.try_next().await? {
+                        output.write_all(&bytes).await?;
+                    }
+                } else {
+                    let result = store
+                        .get(&location)
+                        .await
+                        .map_err(|error| storage_error(operation, error))?;
+                    let mut stream = result.into_stream();
+                    while let Some(bytes) = stream
+                        .try_next()
+                        .await
+                        .map_err(|error| storage_error(operation, error))?
+                    {
+                        output.write_all(&bytes).await?;
+                    }
                 }
                 output.flush().await?;
                 Ok(true)
@@ -144,17 +193,28 @@ pub(crate) fn transfer(config: &S3, key: &str, operation: &str, file: &Path) -> 
             .map_err(|error| storage_error(operation, error))?;
         let result = tokio::time::timeout_at(deadline, async {
             let mut input = tokio::fs::File::open(file).await?;
+            input.set_max_buf_size(PART_SIZE as usize);
             let mut remaining = length;
+            let mut pending = FuturesUnordered::new();
             while remaining > 0 {
                 let size = remaining.min(PART_SIZE) as usize;
                 let mut bytes = vec![0; size];
                 input.read_exact(&mut bytes).await?;
-                upload
-                    .put_part(bytes.into())
-                    .await
-                    .map_err(|error| storage_error(operation, error))?;
+                pending.push(upload.put_part(bytes.into()));
+                if pending.len() >= 4 {
+                    pending
+                        .try_next()
+                        .await
+                        .map_err(|error| storage_error(operation, error))?;
+                }
                 remaining -= size as u64;
             }
+            while pending
+                .try_next()
+                .await
+                .map_err(|error| storage_error(operation, error))?
+                .is_some()
+            {}
             upload
                 .complete()
                 .await
