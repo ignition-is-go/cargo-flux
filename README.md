@@ -74,6 +74,12 @@ defaults to the CLI version carried by the selected action release; it can be
 overridden explicitly. `root` defaults to `.`. A full checkout is required when
 using `affected` so Git can find the merge base.
 
+The action exports `CARGO_FLUX_BIN`, the absolute path to its verified executable.
+Use `"$CARGO_FLUX_BIN" run build` in later shell steps and pass this path to nested
+helpers. This preserves the selected version when another setup step changes
+`PATH`. Invoking `cargo flux` can select a different installed plugin because
+Cargo searches `$CARGO_HOME/bin` before `PATH`.
+
 The same action can configure a dedicated S3 cache client:
 
 ```yaml
