@@ -10,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::cache::Store;
 
+mod parallel;
+
 const HASH_WORKERS: usize = 8;
 const MANIFEST: &str = "__flux_storage_manifest.json";
 
@@ -46,29 +48,25 @@ fn hash_workers(files: usize) -> usize {
         .min(files)
 }
 
-/// Bound filesystem hashing independently of Cargo's compiler job count.
-fn map_files<T: Send>(
-    paths: &BTreeSet<PathBuf>,
-    operation: impl Fn(&Path) -> Result<T> + Sync,
-) -> Result<BTreeMap<PathBuf, T>> {
-    let paths = paths.iter().collect::<Vec<_>>();
+/// Bound archive and filesystem work independently of Cargo's compiler jobs.
+fn parallel_map<T: Sync, U: Send>(
+    items: &[T],
+    operation: impl Fn(&T) -> Result<U> + Sync,
+) -> Result<Vec<U>> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let (send, receive) = std::sync::mpsc::channel();
-    let workers = hash_workers(paths.len());
     std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let paths = &paths;
+        for _ in 0..hash_workers(items.len()) {
             let next = &next;
             let send = send.clone();
             let operation = &operation;
             scope.spawn(move || {
-                while let Some(path) =
-                    paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-                {
-                    if send
-                        .send(operation(path).map(|value| ((*path).clone(), value)))
-                        .is_err()
-                    {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    if send.send((index, operation(item))).is_err() {
                         break;
                     }
                 }
@@ -76,7 +74,23 @@ fn map_files<T: Send>(
         }
     });
     drop(send);
-    receive.into_iter().collect()
+    let mut results = BTreeMap::new();
+    for (index, result) in receive {
+        results.insert(index, result?);
+    }
+    Ok(results.into_values().collect())
+}
+
+fn map_files<T: Send>(
+    paths: &BTreeSet<PathBuf>,
+    operation: impl Fn(&Path) -> Result<T> + Sync,
+) -> Result<BTreeMap<PathBuf, T>> {
+    let paths = paths.iter().cloned().collect::<Vec<_>>();
+    Ok(
+        parallel_map(&paths, |path| Ok((path.clone(), operation(path)?)))?
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn phase(name: &str, started: std::time::Instant) {
@@ -148,11 +162,23 @@ fn validate_paths(paths: &[PathBuf]) -> Result<()> {
 
 fn object_key(key: &str) -> Result<String> {
     ensure!(!key.trim().is_empty(), "empty storage key");
-    Ok(format!("objects/{:x}", Sha256::digest(key.as_bytes())))
+    Ok(format!("objects/v2/{:x}", Sha256::digest(key.as_bytes())))
 }
 
-fn transfer(root: &Path, store: &Store, key: &str, upload: bool, file: &Path) -> Result<bool> {
+fn transfer(
+    root: &Path,
+    store: &Store,
+    key: &str,
+    upload: bool,
+    file: &Path,
+    legacy: bool,
+) -> Result<bool> {
     let key = object_key(key)?;
+    let key = if legacy {
+        key.replacen("objects/v2/", "objects/", 1)
+    } else {
+        key
+    };
     if let Some(config) = &store.s3 {
         return crate::cache::s3::transfer(
             config,
@@ -203,40 +229,16 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
     );
     let hashes = map_files(&files, |path| file_state(&root.join(path)))?;
     phase("hash", started);
-    let manifest = serde_json::to_vec(&Manifest {
-        version: 1,
+    let manifest = Manifest {
+        version: 2,
         key: key.into(),
         paths: paths.to_vec(),
         files: hashes.clone(),
-    })?;
+    };
     let mut temporary = tempfile::NamedTempFile::new()?;
     let started = std::time::Instant::now();
     eprintln!("storage compressing archive");
-    {
-        let mut encoder = zstd::stream::Encoder::new(&mut temporary, 1)?;
-        encoder.multithread(
-            std::thread::available_parallelism()
-                .map_or(1, usize::from)
-                .min(4) as u32,
-        )?;
-        let mut archive = tar::Builder::new(encoder);
-        // Keep sparse linker outputs sparse in the archive and on restoration.
-        archive.sparse(true);
-        archive.follow_symlinks(false);
-        let mut header = tar::Header::new_gnu();
-        header.set_mode(0o600);
-        header.set_size(manifest.len() as u64);
-        header.set_cksum();
-        archive.append_data(&mut header, MANIFEST, &manifest[..])?;
-        for path in paths {
-            if root.join(path).is_dir() {
-                archive.append_dir_all(path, root.join(path))?;
-            } else {
-                archive.append_path_with_name(root.join(path), path)?;
-            }
-        }
-        archive.into_inner()?.finish()?;
-    }
+    parallel::save(root, temporary.as_file_mut(), manifest)?;
     temporary.flush()?;
     phase("compress", started);
     let started = std::time::Instant::now();
@@ -262,14 +264,19 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
     let bytes = temporary.as_file().metadata()?.len();
     let started = std::time::Instant::now();
     eprintln!("storage uploading {bytes} compressed bytes");
-    transfer(root, store, key, true, temporary.path())?;
+    transfer(root, store, key, true, temporary.path(), false)?;
     phase("upload", started);
     Ok(())
 }
 
 fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<()> {
+    let mut prefix = [0; 8];
+    fs::File::open(archive)?.read_exact(&mut prefix)?;
+    if &prefix == parallel::MAGIC {
+        return parallel::unpack(archive, stage, key, paths);
+    }
     let started = std::time::Instant::now();
-    eprintln!("storage extracting archive");
+    eprintln!("storage extracting legacy archive");
     let decoder = zstd::stream::Decoder::new(fs::File::open(archive)?)?;
     let mut archive = tar::Archive::new(decoder);
     let mut entries = archive.entries()?;
@@ -305,6 +312,10 @@ fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<
         ensure!(entry.unpack_in(stage)?, "invalid storage entry");
     }
     phase("extract", started);
+    verify(stage, &manifest, paths)
+}
+
+fn verify(stage: &Path, manifest: &Manifest, paths: &[PathBuf]) -> Result<()> {
     let started = std::time::Instant::now();
     eprintln!(
         "storage verifying {} files ({} workers)",
@@ -347,7 +358,9 @@ pub fn restore(
     for key in keys {
         let started = std::time::Instant::now();
         eprintln!("storage downloading archive");
-        if !transfer(root, store, key, false, temporary.path())? {
+        if !transfer(root, store, key, false, temporary.path(), false)?
+            && !transfer(root, store, key, false, temporary.path(), true)?
+        {
             continue;
         }
         let bytes = temporary.as_file().metadata()?.len();
