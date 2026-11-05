@@ -74,10 +74,10 @@ defaults to the CLI version carried by the selected action release; it can be
 overridden explicitly. `root` defaults to `.`. A full checkout is required when
 using `affected` so Git can find the merge base.
 
-The same action can configure a dedicated S3 task-cache client:
+The same action can configure a dedicated S3 cache client:
 
 ```yaml
-- uses: ignition-is-go/cargo-flux@v0.10.0
+- uses: ignition-is-go/cargo-flux@v0.11.0
   with:
     cache: s3
     cache-endpoint: ${{ secrets.CARGO_FLUX_S3_ENDPOINT }}
@@ -328,7 +328,7 @@ With `--affected`, reachable root variants run once when the committed diff is
 nonempty. An empty diff skips both root and package work. Root tasks are omitted
 from `plan --stamp-args` because they are not packages.
 
-### Task-output caching
+### Intermediate-file caching
 
 Root-only tasks can opt into content-addressed caching of declared files and
 captured task outputs:
@@ -373,8 +373,10 @@ Use `optional_inputs` for configuration that may not exist yet; creating or
 removing those files changes the key. Environment declarations support patterns
 such as `CARGO_PROFILE_*` and `CARGO_TARGET_*`.
 
-A hit restores the declared output trees and captured stdout values, preserving
-downstream output conditions. Archives are verified in staging before promotion;
+A hit restores the declared intermediate files, then **always executes the task**.
+Cargo decides whether restored compiler outputs satisfy its freshness checks.
+Task stdout and output conditions come from the current execution, never a
+previous successful run. Archives are verified in staging before promotion;
 unexpected paths, links, checksums, and incomplete archives are rejected. Stale
 files in declared output trees are removed. Cache failures fall back to task
 execution. Plans label cached root tasks; run logs distinguish hits, misses,
@@ -388,14 +390,58 @@ cargo flux run bundle --cache-hit-required
 
 `--cache-required` makes cache preparation, transfer, integrity and save errors
 fatal while still allowing a normal miss. `--cache-hit-required` additionally
-fails on misses without executing the cached producer. It can verify an S3
-round trip or consume a previously produced artifact. Both conflict with
+fails on misses before executing the task. A hit still runs the command. Both conflict with
 `--no-cache`; these execution policies do not change cache keys.
 
-This is an opt-in **task-result cache**, separate from Cargo target-directory
-reuse. Validation remains uncached by default. Restoring compatible compiler
-artifacts must still execute checks and tests; Cargo target snapshot management
-is not implemented by this result cache.
+Cache restoration never substitutes for a validation or test result. Known root-task
+cache keys are prefetched with up to four concurrent downloads before execution. Downloads
+are staged, then their keys are rechecked at the task boundary before restoration.
+Keys depending on runtime outputs or unavailable inputs defer until they can be
+resolved. A prerequisite changing an input invalidates the prefetched entry.
+
+For compiler snapshots and cross-job artifacts, explicit storage operations use
+the same configured store, compressed archives and native S3 transport:
+
+```bash
+cargo flux storage save --key compiler-compatible-scope --path target
+cargo flux storage restore --key compiler-compatible-scope --path target
+cargo flux storage save --key artifacts/run-123/linux --path dist --path target/release/server
+cargo flux storage restore --key artifacts/run-123/linux --path dist --path target/release/server --required
+```
+
+Restore accepts repeated `--key` arguments, tried in order. A missing optional
+snapshot is a normal miss; `--required` makes missing release artifacts fatal.
+Explicit keys are scoped by the caller: compiler snapshots need compiler,
+platform, flags and scope compatibility; cross-job artifacts need immutable run
+and source identities. Storage operations never skip build/check/test commands.
+Archives preserve executable modes, sparse holes and exact file timestamps;
+contents are verified in staging before existing outputs are replaced.
+
+Named artifact contracts keep shared file lists in `flux.toml`:
+
+```toml
+[artifacts]
+linux = ["target/release/server", "dist"]
+```
+
+Use `storage save --key run-123 --artifact linux` and
+`storage restore --key run-123 --artifact linux --destination prebuilt --required`
+to transfer that contract between jobs.
+
+`storage cargo-key --scope validation --selection product` prints a key based on
+compiler identity, platform, flags, source location and selected packages. Add
+`--affected BASE` for a narrower package pool; an empty selection prints no key.
+Source/manifest/lockfile content changes deliberately do not orphan compiler
+snapshots. Cargo makes the final freshness decision. `storage sources` records
+tracked source timestamps alongside the snapshot; `storage sources --restore`
+restores timestamps only for byte-identical files and touches changed content.
+Use repeated `--include PATH` for watched, ignored inputs.
+
+The setup action also accepts optional `toolchain`, `components`, `targets`,
+`compiler-cache: 'true'`, `compiler-cache-read-only` and `compiler-cache-prefix`.
+Compiler caching uses the dedicated Flux S3 client. Credential aliases needed
+by sccache are passed only to its isolated daemon, leaving the job's existing
+credential environment unchanged.
 
 The repository includes an explicit MinIO integration test:
 

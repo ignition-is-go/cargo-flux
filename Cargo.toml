@@ -33,6 +33,7 @@ tempfile = "3"
 object_store = { version = "0.14.2", default-features = false, features = ["aws", "tokio"] }
 tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
 futures-util = "0.3"
+zstd = "0.13"
 
 # Keep linked worktrees independent of an enclosing development workspace.
 [workspace]

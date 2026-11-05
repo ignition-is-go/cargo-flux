@@ -1,5 +1,5 @@
-//! Opt-in, content-addressed root-task outputs. Cargo target snapshots are a
-//! different cache: restoring compiler artifacts must not skip validation.
+//! Opt-in intermediate-file caches. A hit warms the workspace; commands always
+//! execute and decide whether restored compiler artifacts are fresh.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 
 use crate::tasks::TaskCommand;
 
-mod s3;
+pub(crate) mod s3;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -85,9 +85,17 @@ struct Manifest {
     key: String,
     stdout: Option<String>,
     files: BTreeMap<PathBuf, String>,
+    #[serde(default)]
+    timestamps: BTreeMap<PathBuf, (u64, u32)>,
 }
 
 const MANIFEST: &str = "__flux_cache_manifest.json";
+
+/// Downloaded bytes stay private until the executing task rechecks its key.
+pub struct Prefetched {
+    key: String,
+    archive: Result<Option<tempfile::NamedTempFile>>,
+}
 
 pub struct Session<'a> {
     root: &'a Path,
@@ -178,7 +186,7 @@ impl<'a> Session<'a> {
             );
         }
         let mut hash = Sha256::new();
-        field(&mut hash, b"cargo-flux-root-cache-v1");
+        field(&mut hash, b"cargo-flux-intermediate-cache-v2");
         field(&mut hash, root.as_os_str().as_encoded_bytes());
         field(&mut hash, std::env::consts::OS.as_bytes());
         field(&mut hash, std::env::consts::ARCH.as_bytes());
@@ -267,17 +275,40 @@ impl<'a> Session<'a> {
         })
     }
 
-    /// Validate the complete archive in isolation before modifying any output.
-    pub fn restore(&self) -> Result<Option<Option<String>>> {
-        let temporary = tempfile::tempdir()?;
-        let archive = temporary.path().join("cache.tar");
-        if !self.download(&archive)? {
-            return Ok(None);
+    pub fn prefetch(&self) -> Prefetched {
+        let archive = (|| {
+            let archive = tempfile::NamedTempFile::new()?;
+            let present = self.download(archive.path())?;
+            Ok(present.then_some(archive))
+        })();
+        Prefetched {
+            key: self.key.clone(),
+            archive,
         }
+    }
+
+    /// Validate the complete archive in isolation before modifying any output.
+    #[cfg(test)]
+    pub fn restore(&self) -> Result<Option<Option<String>>> {
+        self.restore_prefetched(None)
+    }
+
+    pub fn restore_prefetched(
+        &self,
+        prefetched: Option<Prefetched>,
+    ) -> Result<Option<Option<String>>> {
+        let prefetched = match prefetched {
+            Some(value) if value.key == self.key => value,
+            _ => self.prefetch(),
+        };
+        let Some(archive) = prefetched.archive? else {
+            return Ok(None);
+        };
+        let temporary = tempfile::tempdir()?;
         let stage = temporary.path().join("outputs");
         fs::create_dir(&stage)?;
         let stage = stage.canonicalize()?;
-        let mut archive = tar::Archive::new(fs::File::open(archive)?);
+        let mut archive = tar::Archive::new(fs::File::open(archive.path())?);
         let mut entries = archive.entries()?;
         let mut first = entries.next().context("empty cache archive")??;
         ensure!(
@@ -318,6 +349,15 @@ impl<'a> Session<'a> {
                 digest(&stage.join(path))? == *expected,
                 "cache content checksum mismatch"
             );
+        }
+        for (path, (seconds, nanos)) in &manifest.timestamps {
+            ensure!(
+                manifest.files.contains_key(path),
+                "unexpected cache timestamp path"
+            );
+            fs::File::open(stage.join(path))?.set_times(fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::new(*seconds, *nanos),
+            ))?;
         }
         for path in &self.config.task.paths {
             let output = self.root.join(path);
@@ -364,6 +404,9 @@ impl<'a> Session<'a> {
                 if existing.is_some_and(|meta| meta.is_dir()) {
                     fs::remove_dir_all(&output)?;
                 }
+                temp.as_file().set_times(
+                    fs::FileTimes::new().set_modified(fs::metadata(stage.join(path))?.modified()?),
+                )?;
                 temp.persist(&output)?;
             }
         }
@@ -386,14 +429,24 @@ impl<'a> Session<'a> {
         for path in &self.config.task.paths {
             files(self.root, path, &mut paths)?;
         }
-        let hashes = paths
+        let hashes: BTreeMap<PathBuf, String> = paths
             .into_iter()
             .map(|path| Ok((path.clone(), digest(&self.root.join(path))?)))
+            .collect::<Result<_>>()?;
+        let timestamps = hashes
+            .keys()
+            .map(|path| {
+                let modified = fs::metadata(self.root.join(path))?
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?;
+                Ok((path.clone(), (modified.as_secs(), modified.subsec_nanos())))
+            })
             .collect::<Result<_>>()?;
         let manifest = serde_json::to_vec(&Manifest {
             key: self.key.clone(),
             stdout,
             files: hashes,
+            timestamps,
         })?;
         let mut archive = tempfile::NamedTempFile::new()?;
         {
@@ -467,7 +520,9 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
         if entry.file_type()?.is_dir() {
             copy_directory(&entry.path(), &output)?;
         } else {
-            fs::copy(entry.path(), output)?;
+            fs::copy(entry.path(), &output)?;
+            fs::File::open(output)?
+                .set_times(fs::FileTimes::new().set_modified(entry.metadata()?.modified()?))?;
         }
     }
     Ok(())
@@ -501,6 +556,7 @@ mod tests {
             key: session.key.clone(),
             stdout: None,
             files: BTreeMap::new(),
+            timestamps: BTreeMap::new(),
         })
         .unwrap();
         let mut header = tar::Header::new_gnu();
