@@ -347,13 +347,17 @@ mod tests {
             "ownership",
             "traversal",
             "corruption",
+            "checksum",
+            "directory-collision",
         ] {
             let mut index: Index = serde_json::from_slice(&original[header_start..footer])?;
             match failure {
                 "length" => index.shards[0].extents[0].1 += 1,
-                "duplicate" => {
-                    index.shards[0].files.insert("dist/original".into());
+                "duplicate" if index.shards.len() > 1 => {
+                    let duplicate = index.shards[1].files.first().unwrap().clone();
+                    index.shards[0].files.insert(duplicate);
                 }
+                "duplicate" => continue,
                 "ownership" if index.shards.len() > 1 => {
                     let left = index.shards[0].files.pop_first().unwrap();
                     let right = index.shards[1].files.pop_first().unwrap();
@@ -363,6 +367,13 @@ mod tests {
                 "ownership" => continue,
                 "traversal" => {
                     index.directories.insert("../outside".into(), 0o755);
+                }
+                "checksum" => {
+                    index.manifest.files.values_mut().next().unwrap().digest =
+                        "incorrect checksum".into()
+                }
+                "directory-collision" => {
+                    index.directories.insert("dist/0".into(), 0o755);
                 }
                 "corruption" => (),
                 _ => unreachable!(),
