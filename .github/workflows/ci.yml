@@ -194,6 +194,7 @@ jobs:
       - name: Verify Cargo Flux outputs and PATH
         shell: bash
         env:
+          FLUX_BINARY: ${{ steps.flux.outputs.path }}
           OUTCOME: ${{ steps.flux.outputs.outcome }}
           TASK_OUTPUTS: ${{ steps.flux.outputs['task-outputs'] }}
         run: |
@@ -205,4 +206,17 @@ jobs:
           test "$AWS_SECRET_ACCESS_KEY" = compiler-secret-sentinel
           test "$AWS_SESSION_TOKEN" = compiler-token-sentinel
           grep -q '"probe":{"version":"git version ' <<< "$TASK_OUTPUTS"
+          test "$CARGO_FLUX_BIN" = "$FLUX_BINARY"
           cargo-flux --help
+          # A later tool install may prepend a stale global executable to PATH.
+          stale="$RUNNER_TEMP/stale-flux"
+          mkdir -p "$stale"
+          printf '#!/bin/sh\nexit 99\n' > "$stale/cargo-flux"
+          chmod +x "$stale/cargo-flux"
+          export PATH="$stale:$PATH"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            flux_binary="$(cygpath -u "$CARGO_FLUX_BIN")"
+          else
+            flux_binary="$CARGO_FLUX_BIN"
+          fi
+          "$flux_binary" --help

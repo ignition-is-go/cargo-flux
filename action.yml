@@ -334,6 +334,24 @@ runs:
         done
         echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
 
+    - name: Pin Cargo Flux executable
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        FLUX_BINARY: ${{ steps.install-unix.outputs.path }}
+      run: |
+        printf 'CARGO_FLUX_BIN=%s\n' "$FLUX_BINARY" >> "$GITHUB_ENV"
+        dirname "$FLUX_BINARY" >> "$GITHUB_PATH"
+
+    - name: Pin Cargo Flux executable
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        FLUX_BINARY: ${{ steps.install-windows.outputs.path }}
+      run: |
+        "CARGO_FLUX_BIN=$env:FLUX_BINARY" >> $env:GITHUB_ENV
+        Split-Path -Parent $env:FLUX_BINARY >> $env:GITHUB_PATH
+
     - name: Run Cargo Flux task
       id: run-unix
       if: inputs.task != '' && runner.os != 'Windows'
