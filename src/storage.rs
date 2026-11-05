@@ -39,6 +39,13 @@ fn file_state(path: &Path) -> Result<FileState> {
     })
 }
 
+fn hash_workers(files: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(HASH_WORKERS)
+        .min(files)
+}
+
 /// Bound filesystem hashing independently of Cargo's compiler job count.
 fn map_files<T: Send>(
     paths: &BTreeSet<PathBuf>,
@@ -47,10 +54,7 @@ fn map_files<T: Send>(
     let paths = paths.iter().collect::<Vec<_>>();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let (send, receive) = std::sync::mpsc::channel();
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(HASH_WORKERS)
-        .min(paths.len());
+    let workers = hash_workers(paths.len());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let paths = &paths;
@@ -192,7 +196,11 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         collect(root, path, &mut files)?;
     }
     let started = std::time::Instant::now();
-    eprintln!("storage hashing {} files (up to 8 workers)", files.len());
+    eprintln!(
+        "storage hashing {} files ({} workers)",
+        files.len(),
+        hash_workers(files.len())
+    );
     let hashes = map_files(&files, |path| file_state(&root.join(path)))?;
     phase("hash", started);
     let manifest = serde_json::to_vec(&Manifest {
@@ -299,8 +307,9 @@ fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<
     phase("extract", started);
     let started = std::time::Instant::now();
     eprintln!(
-        "storage verifying {} files (up to 8 workers)",
-        manifest.files.len()
+        "storage verifying {} files ({} workers)",
+        manifest.files.len(),
+        hash_workers(manifest.files.len())
     );
     let mut actual = BTreeSet::new();
     for path in paths {
