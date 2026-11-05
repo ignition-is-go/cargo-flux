@@ -35,7 +35,7 @@ fn sequential_tasks_prefetch_four_cache_entries_before_execution() {
                             headers.push_str(&line);
                             if line == "\r\n" { break; }
                         }
-                        if headers.starts_with("GET ") {
+                        if headers.starts_with("GET ") || headers.starts_with("HEAD ") {
                             let running = active.fetch_add(1, Ordering::SeqCst) + 1;
                             peak.fetch_max(running, Ordering::SeqCst);
                             let (lock, changed) = &*arrivals;
