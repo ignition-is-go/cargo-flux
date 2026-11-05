@@ -195,7 +195,7 @@ fn cache_producer() {
     if std::path::Path::new("block-cache").exists() {
         fs::write(".flux", "block store creation").unwrap();
     }
-    println!("generated");
+    println!("generated execution {}", count + 1);
 }
 
 #[test]
@@ -210,7 +210,19 @@ fn restores_intermediates_but_reruns_commands_and_removes_stale_outputs() {
     assert_eq!(f.count(), 2);
     let second: serde_json::Value =
         serde_json::from_slice(&fs::read(f.root.path().join("report.json")).unwrap()).unwrap();
-    assert_eq!(first["task_outputs"], second["task_outputs"]);
+    // Each command executes again; harness durations are deliberately variable.
+    assert!(
+        first["task_outputs"]["produce"]["result"]
+            .as_str()
+            .unwrap()
+            .contains("generated execution 1")
+    );
+    assert!(
+        second["task_outputs"]["produce"]["result"]
+            .as_str()
+            .unwrap()
+            .contains("generated execution 2")
+    );
     f.clear_outputs();
     assert!(f.success("a", false).contains("cache hit: produce"));
     assert_eq!(
