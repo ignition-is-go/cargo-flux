@@ -198,7 +198,10 @@ pub(super) fn unpack(path: &Path, stage: &Path, key: &str, paths: &[PathBuf]) ->
     );
     let index_start = size - 16 - length;
     input.seek(SeekFrom::Start(index_start))?;
-    let index: Index = serde_json::from_reader((&mut input).take(length))?;
+    let index: Index = serde_json::from_reader(BufReader::with_capacity(
+        1024 * 1024,
+        (&mut input).take(length),
+    ))?;
     ensure!(
         input.stream_position()? == size - 16,
         "storage index length mismatch"
