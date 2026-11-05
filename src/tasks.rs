@@ -1,7 +1,7 @@
 use crate::manifest::{Ecosystem, JsPackageManager, Package, colorize_display_label};
 use anyhow::{Context, Result, anyhow, bail};
 use glob::Pattern;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,26 @@ pub struct TaskRegistry {
     tasks: BTreeMap<String, TaskDefinition>,
     channels: Option<toml::Value>,
     affected: AffectedConfig,
+    selections: BTreeMap<String, PackageSelection>,
+    cache: crate::cache::Store,
 }
 
 impl TaskRegistry {
+    pub fn selection(&self, name: &str) -> Result<&PackageSelection> {
+        self.selections
+            .get(name)
+            .ok_or_else(|| anyhow!("undefined package selection `{name}`"))
+    }
+
+    pub fn task_selection(&self, task: &str) -> Result<Option<&str>> {
+        Ok(self
+            .tasks
+            .get(task)
+            .ok_or_else(|| anyhow!("undefined task `{task}`"))?
+            .selection
+            .as_deref())
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join("flux.toml");
         let content = fs::read_to_string(&path)
@@ -24,6 +41,8 @@ impl TaskRegistry {
             tasks: config.tasks.unwrap_or_default(),
             channels: config.channels,
             affected: config.affected,
+            selections: config.selections,
+            cache: config.cache,
         })
     }
 
@@ -78,6 +97,9 @@ impl TaskRegistry {
             .get(task_name)
             .ok_or_else(|| anyhow!("task `{task_name}` is not defined in flux.toml"))?;
         let has_root = task.has_root_command()?;
+        if task.cache.is_some() && (!has_root || task.has_package_command()) {
+            bail!("task `{task_name}` caching currently requires a root-only task");
+        }
         for dependency in &task.depends_on {
             let dependency_task = self.tasks.get(dependency).ok_or_else(|| {
                 anyhow!("task `{task_name}` depends on undefined task `{dependency}` in flux.toml")
@@ -137,6 +159,10 @@ impl TaskRegistry {
                 depends_on: task.depends_on.clone(),
                 output_names: task.outputs.keys().cloned().collect(),
                 condition,
+                cache: task.cache.clone().map(|cache| crate::cache::ResolvedCache {
+                    store: self.cache.clone(),
+                    task: cache,
+                }),
             });
         }
         Ok(())
@@ -490,15 +516,21 @@ pub struct ResolvedRootTask {
     pub depends_on: Vec<String>,
     pub output_names: Vec<String>,
     pub condition: Option<OutputCondition>,
+    pub cache: Option<crate::cache::ResolvedCache>,
 }
 
 impl ResolvedRootTask {
     pub fn render(&self) -> String {
         format!(
-            "workspace:{} [root]{}",
+            "workspace:{} [root]{}{}",
             self.task_name,
             if self.condition.is_some() {
                 " (conditional)"
+            } else {
+                ""
+            },
+            if self.cache.is_some() {
+                " (cached outputs)"
             } else {
                 ""
             }
@@ -526,6 +558,10 @@ fn infer_js_package_manager(label: &str) -> Option<JsPackageManager> {
 #[serde(deny_unknown_fields)]
 struct FluxConfig {
     tasks: Option<BTreeMap<String, TaskDefinition>>,
+    #[serde(default)]
+    selections: BTreeMap<String, PackageSelection>,
+    #[serde(default)]
+    cache: crate::cache::Store,
     channels: Option<toml::Value>,
     #[serde(default)]
     affected: AffectedConfig,
@@ -541,9 +577,23 @@ struct AffectedConfig {
     ignore: Vec<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackageSelection {
+    pub roots: Vec<String>,
+    pub cargo_publishable: bool,
+    pub all: bool,
+    /// Follow normal/build dependencies; test-only edges are not shipment edges.
+    pub dependencies: bool,
+    pub bridges: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskDefinition {
+    cache: Option<crate::cache::TaskCache>,
+    /// Default package execution scope; CLI --selection may override it.
+    selection: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
@@ -759,7 +809,7 @@ impl CommandSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TaskCommand {
     Shell(String),
     Argv(Vec<String>),
@@ -907,6 +957,8 @@ uv = ["uv", "run", "python", "-m", "build"]
             id: PackageId::new(Ecosystem::Cargo, "crate-a"),
             name: "crate-a".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("crate-a/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: Default::default(),
@@ -937,6 +989,8 @@ cargo = ["cargo", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("web/package.json"),
             js_package_manager: Some(JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -967,6 +1021,8 @@ pnpm = ["pnpm", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("web/package.json"),
             js_package_manager: Some(JsPackageManager::Pnpm),
             task_opt_ins: Default::default(),
@@ -997,6 +1053,8 @@ default = ["docker", "build", "."]
             id: PackageId::new(Ecosystem::Uv, "py-app"),
             name: "py-app".into(),
             ecosystem: Ecosystem::Uv,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("py-app/pyproject.toml"),
             js_package_manager: None,
             task_opt_ins: Default::default(),
@@ -1028,6 +1086,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("web/package.json"),
             js_package_manager: Some(JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -1250,6 +1310,8 @@ npm = ["npm", "run", "build:${mode}"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("web/package.json"),
             js_package_manager: Some(JsPackageManager::Npm),
             task_opt_ins: BTreeMap::from([(
@@ -1285,6 +1347,8 @@ npm = ["npm", "run", "build:${mode}"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("web/package.json"),
             js_package_manager: Some(JsPackageManager::Npm),
             task_opt_ins: BTreeMap::from([(
@@ -1321,6 +1385,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: root.join("web/package.json"),
             js_package_manager: Some(JsPackageManager::Npm),
             task_opt_ins: BTreeMap::from([(

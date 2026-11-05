@@ -59,12 +59,14 @@ impl ManifestPlugin for CargoPlugin {
                 CargoPackage {
                     name: fallback_name.to_string(),
                     metadata: None,
+                    publish: None,
                 }
             }
         };
 
         // Collect workspace-local dependencies from the top-level tables and every
         // `[target.<cfg>.*]` table, so platform-specific deps still form graph edges.
+        let workspace = inherited_workspace(path)?;
         let mut normal_dependencies = Vec::new();
         let mut build_dependencies = Vec::new();
         let mut dev_dependencies = Vec::new();
@@ -73,13 +75,16 @@ impl ManifestPlugin for CargoPlugin {
         for tables in dependency_tables {
             normal_dependencies.extend(local_cargo_dependencies(
                 tables.dependencies.clone().unwrap_or_default(),
-            ));
+                workspace.as_ref(),
+            )?);
             build_dependencies.extend(local_cargo_dependencies(
                 tables.build_dependencies.clone().unwrap_or_default(),
-            ));
+                workspace.as_ref(),
+            )?);
             dev_dependencies.extend(local_cargo_dependencies(
                 tables.dev_dependencies.clone().unwrap_or_default(),
-            ));
+                workspace.as_ref(),
+            )?);
         }
 
         let mut deps = normal_dependencies;
@@ -116,6 +121,28 @@ impl ManifestPlugin for CargoPlugin {
             };
 
         Ok(RawPackage {
+            cargo_publishable: {
+                let publish = match &package.publish {
+                    Some(value)
+                        if value.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
+                    {
+                        Some(
+                            workspace
+                                .as_ref()
+                                .and_then(|w| w.get("package"))
+                                .and_then(|p| p.get("publish"))
+                                .context("inherited workspace.package.publish is missing")?,
+                        )
+                    }
+                    value => value.as_ref(),
+                };
+                match publish {
+                    None => true,
+                    Some(toml::Value::Boolean(value)) => *value,
+                    Some(toml::Value::Array(registries)) => !registries.is_empty(),
+                    Some(_) => anyhow::bail!("unsupported package.publish in {}", path.display()),
+                }
+            },
             id: PackageId::new(Ecosystem::Cargo, &package.name),
             name: package.name,
             ecosystem: Ecosystem::Cargo,
@@ -129,10 +156,45 @@ impl ManifestPlugin for CargoPlugin {
     }
 }
 
-fn local_cargo_dependencies(dependencies: BTreeMap<String, toml::Value>) -> Vec<String> {
+fn inherited_workspace(path: &Path) -> Result<Option<toml::Value>> {
+    for directory in path.parent().context("manifest parent")?.ancestors() {
+        let manifest = directory.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let value: toml::Value = toml::from_str(&fs::read_to_string(&manifest)?)?;
+        if let Some(workspace) = value.get("workspace") {
+            return Ok(Some(workspace.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn local_cargo_dependencies(
+    dependencies: BTreeMap<String, toml::Value>,
+    workspace: Option<&toml::Value>,
+) -> Result<Vec<String>> {
     dependencies
         .into_iter()
-        .filter_map(|(name, value)| is_local_cargo_dependency(&value).then_some(name))
+        .filter(|(_, value)| is_local_cargo_dependency(value))
+        .map(|(name, value)| {
+            let inherited = if value.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                Some(
+                    workspace
+                        .and_then(|w| w.get("dependencies"))
+                        .and_then(|d| d.get(&name))
+                        .with_context(|| format!("workspace dependency `{name}` is missing"))?,
+                )
+            } else {
+                None
+            };
+            Ok(value
+                .get("package")
+                .or_else(|| inherited.and_then(|v| v.get("package")))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or(name))
+        })
         .collect()
 }
 
@@ -176,6 +238,7 @@ struct CargoWorkspace {
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
     name: String,
+    publish: Option<toml::Value>,
     metadata: Option<CargoPackageMetadata>,
 }
 

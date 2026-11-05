@@ -27,3 +27,9 @@ serde_yaml = "0.9"
 toml = "0.8"
 regex = "1"
 toml_edit = "0.22"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+
+# Keep linked worktrees independent of an enclosing development workspace.
+[workspace]

@@ -25,6 +25,9 @@ pub enum Command {
         /// Limit execution to affected packages and root tasks.
         #[arg(long, visible_alias = "affected-from", value_name = "BASE")]
         affected: Option<String>,
+        /// Use a named package selection from flux.toml.
+        #[arg(long)]
+        selection: Option<String>,
         /// Print the planned execution order instead of the dependency tree.
         #[arg(long, conflicts_with = "stamp_args")]
         ordered: bool,
@@ -34,6 +37,9 @@ pub enum Command {
     },
     /// Execute a logical task in planned order.
     Run {
+        /// Execute tasks without reading or writing task-output caches.
+        #[arg(long)]
+        no_cache: bool,
         /// Logical task name to execute.
         task: String,
         /// Limit execution to affected packages and root tasks.
@@ -42,6 +48,9 @@ pub enum Command {
         /// Write a machine-readable execution report to this path.
         #[arg(long, value_name = "PATH")]
         report: Option<std::path::PathBuf>,
+        /// Override the task's named package selection.
+        #[arg(long)]
+        selection: Option<String>,
     },
     /// Adapt a machine-readable execution report for another system.
     Report {
@@ -53,6 +62,15 @@ pub enum Command {
         /// Branch, tag, or commit the current branch will merge into.
         #[arg(long, value_name = "BASE")]
         base: String,
+    },
+    /// Print a named package selection, optionally intersected with affected packages.
+    Select {
+        selection: String,
+        #[arg(long, value_name = "BASE")]
+        affected: Option<String>,
+        /// Print repeatable --package=NAME arguments instead of scoped IDs.
+        #[arg(long)]
+        stamp_args: bool,
     },
     /// Print the next calculated semantic version.
     Version {

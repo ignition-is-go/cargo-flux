@@ -117,6 +117,9 @@ pub struct Package {
     pub task_opt_ins: BTreeMap<String, TaskOptIn>,
     pub bridged_dependencies: Vec<BridgeTarget>,
     pub internal_dependencies: Vec<PackageId>,
+    /// Test-only edges affect consumers without introducing build-order cycles.
+    pub development_dependencies: Vec<PackageId>,
+    pub cargo_publishable: bool,
 }
 
 impl Package {
@@ -208,6 +211,7 @@ pub(crate) struct RawPackage {
     pub(crate) bridged_dependencies: Vec<BridgeTarget>,
     pub(crate) declared_dependencies: Vec<String>,
     pub(crate) warned_declared_dependencies: Vec<WarnedDependencyRef>,
+    pub(crate) cargo_publishable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +309,14 @@ fn resolve_internal_dependencies(raw_packages: Vec<RawPackage>) -> WorkspaceDisc
                 task_opt_ins: pkg.task_opt_ins,
                 bridged_dependencies: pkg.bridged_dependencies,
                 internal_dependencies,
+                development_dependencies: pkg
+                    .warned_declared_dependencies
+                    .iter()
+                    .filter(|dep| dep.section == "dev-dependencies")
+                    .filter(|dep| candidates.is_some_and(|names| names.contains(&dep.name)))
+                    .map(|dep| PackageId::new(pkg.ecosystem, dep.name.clone()))
+                    .collect(),
+                cargo_publishable: pkg.cargo_publishable,
             }
         })
         .collect();

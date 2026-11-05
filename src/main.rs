@@ -1,3 +1,4 @@
+mod cache;
 mod channels;
 mod cli;
 mod git;
@@ -125,10 +126,16 @@ fn main() -> Result<()> {
                     affected,
                     ordered,
                     stamp_args,
+                    selection,
                 } => {
                     let tasks = TaskRegistry::load(&root)?;
-                    let affected =
-                        calculate_affected_scope(&root, &graph, &tasks, affected.as_deref())?;
+                    let affected = calculate_affected_scope(
+                        &root,
+                        &graph,
+                        &tasks,
+                        affected.as_deref(),
+                        selection.as_deref().or(tasks.task_selection(&task)?),
+                    )?;
                     let affected_packages = affected.as_ref().map(|scope| &scope.packages);
                     let root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
                         tasks.root_task_plan(&task)?
@@ -176,6 +183,30 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                Command::Select {
+                    selection,
+                    affected,
+                    stamp_args,
+                } => {
+                    let tasks = TaskRegistry::load(&root)?;
+                    let scope = calculate_affected_scope(
+                        &root,
+                        &graph,
+                        &tasks,
+                        affected.as_deref(),
+                        Some(&selection),
+                    )?
+                    .expect("selection supplies a scope");
+                    if stamp_args {
+                        for name in graph.package_names(&scope.packages) {
+                            println!("--package={name}");
+                        }
+                    } else {
+                        for id in scope.packages {
+                            println!("{id}");
+                        }
+                    }
+                }
                 Command::Affected { base } => {
                     let tasks = TaskRegistry::load(&root)?;
                     let changed = tasks.affected_paths(&git::get_changed_files(&root, &base)?)?;
@@ -185,20 +216,32 @@ fn main() -> Result<()> {
                     }
                 }
                 Command::Run {
+                    no_cache,
                     task,
                     affected,
                     report,
+                    selection,
                 } => {
                     let tasks = TaskRegistry::load(&root)?;
                     let affected_base = affected.clone();
-                    let affected =
-                        calculate_affected_scope(&root, &graph, &tasks, affected.as_deref())?;
+                    let affected = calculate_affected_scope(
+                        &root,
+                        &graph,
+                        &tasks,
+                        affected.as_deref(),
+                        selection.as_deref().or(tasks.task_selection(&task)?),
+                    )?;
                     let affected_packages = affected.as_ref().map(|scope| &scope.packages);
-                    let root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
+                    let mut root_plan = if affected.as_ref().is_none_or(|scope| scope.has_changes) {
                         tasks.root_task_plan(&task)?
                     } else {
                         Vec::new()
                     };
+                    if no_cache {
+                        for task in &mut root_plan {
+                            task.cache = None;
+                        }
+                    }
                     let plan =
                         task_execution_plan_with_scope(&graph, &tasks, &task, affected_packages)?;
                     let total_tasks = root_plan.len() + plan.tasks.len();
@@ -291,17 +334,34 @@ fn calculate_affected_scope(
     graph: &WorkspaceGraph,
     tasks: &TaskRegistry,
     base: Option<&str>,
+    selection: Option<&str>,
 ) -> Result<Option<AffectedScope>> {
-    base.map(|base| {
-        let changed = tasks.affected_paths(&git::get_changed_files(root, base)?)?;
-        let has_changes = !changed.is_empty();
-        let packages = graph.affected_packages(root, &changed)?;
-        Ok(AffectedScope {
-            packages,
-            has_changes,
+    let selected = selection
+        .map(|name| graph.select_packages(tasks.selection(name)?))
+        .transpose()?;
+    let mut scope = base
+        .map(|base| {
+            let changed = tasks.affected_paths(&git::get_changed_files(root, base)?)?;
+            let has_changes = !changed.is_empty();
+            let packages = graph.affected_packages(root, &changed)?;
+            Ok::<_, anyhow::Error>(AffectedScope {
+                packages,
+                has_changes,
+            })
         })
-    })
-    .transpose()
+        .transpose()?;
+    if let Some(selected) = selected {
+        if let Some(scope) = &mut scope {
+            scope.packages.retain(|id| selected.contains(id));
+            scope.has_changes &= !scope.packages.is_empty();
+        } else {
+            scope = Some(AffectedScope {
+                has_changes: !selected.is_empty(),
+                packages: selected,
+            });
+        }
+    }
+    Ok(scope)
 }
 
 fn task_plan_with_scope(
@@ -460,18 +520,72 @@ fn execute_root_plan(
                 use_color,
             )
         );
-        let mut captured_stdout = None;
-        for (index, command) in resolved.commands.iter().enumerate() {
-            let command = command.interpolate_outputs(&task_outputs)?;
-            let capture = !resolved.output_names.is_empty() && index + 1 == resolved.commands.len();
-            let output = execute_task_with_output(
-                &command,
+        let commands = resolved
+            .commands
+            .iter()
+            .map(|command| command.interpolate_outputs(&task_outputs))
+            .collect::<Result<Vec<_>>>()?;
+        let cache = resolved.cache.as_ref().and_then(|config| {
+            let dependency_outputs = resolved
+                .depends_on
+                .iter()
+                .filter_map(|name| {
+                    task_outputs
+                        .get(name)
+                        .map(|outputs| (name.clone(), outputs.clone()))
+                })
+                .collect();
+            match cache::Session::prepare(
                 root,
-                &std::collections::BTreeMap::new(),
-                capture,
-            )?;
-            if output.is_some() {
-                captured_stdout = output;
+                &resolved.task_name,
+                config,
+                &commands,
+                &dependency_outputs,
+            ) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    eprintln!("cache unavailable for {}: {error}", resolved.task_name);
+                    None
+                }
+            }
+        });
+        let restored = cache.as_ref().and_then(|cache| match cache.restore() {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "cache restore failed for {}: {error}; executing task",
+                    resolved.task_name
+                );
+                None
+            }
+        });
+        let mut captured_stdout = restored.clone().flatten();
+        if restored.is_some() {
+            println!("cache hit: {}", resolved.task_name);
+        } else {
+            if cache.is_some() {
+                println!("cache miss: {}", resolved.task_name);
+            }
+            for (index, command) in commands.iter().enumerate() {
+                let capture =
+                    !resolved.output_names.is_empty() && index + 1 == resolved.commands.len();
+                let output = execute_task_with_output(
+                    command,
+                    root,
+                    &std::collections::BTreeMap::new(),
+                    capture,
+                )?;
+                if output.is_some() {
+                    captured_stdout = output;
+                }
+            }
+            if let Some(cache) = &cache {
+                match cache.save(captured_stdout.clone()) {
+                    Ok(()) => println!("cache saved: {}", resolved.task_name),
+                    Err(error) => {
+                        eprintln!("cache save failed for {}: {error}", resolved.task_name)
+                    }
+                }
             }
         }
         if !resolved.output_names.is_empty() {
@@ -827,6 +941,7 @@ mod tests {
                 affected,
                 ordered,
                 stamp_args,
+                ..
             } => {
                 assert_eq!(task, "build");
                 assert_eq!(affected, None);
@@ -846,6 +961,7 @@ mod tests {
                 affected,
                 ordered,
                 stamp_args,
+                ..
             } => {
                 assert_eq!(task, "publish");
                 assert_eq!(affected, None);
@@ -1113,6 +1229,8 @@ cargo = ["cargo", "check"]
             id: PackageId::new(Ecosystem::Cargo, package_name),
             name: package_name.to_string(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from(format!("{package_name}/Cargo.toml")),
             js_package_manager: None,
             task_opt_ins: Default::default(),

@@ -14,6 +14,43 @@ pub struct WorkspaceGraph {
 }
 
 impl WorkspaceGraph {
+    pub fn select_packages(
+        &self,
+        selection: &crate::tasks::PackageSelection,
+    ) -> Result<BTreeSet<PackageId>> {
+        let mut pending = self
+            .packages
+            .values()
+            .filter(|p| selection.all || (selection.cargo_publishable && p.cargo_publishable))
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>();
+        for name in &selection.roots {
+            pending.push(self.package_id_by_bridge(&BridgeTarget::parse(name)?)?);
+        }
+        let mut selected = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !selected.insert(id.clone()) {
+                continue;
+            }
+            let package = &self.packages[&id];
+            if selection.dependencies {
+                pending.extend(package.internal_dependencies.iter().cloned());
+            }
+            if selection.bridges {
+                for bridge in &package.bridged_dependencies {
+                    pending.push(self.package_id_by_bridge(bridge)?);
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    pub fn package_names(&self, ids: &BTreeSet<PackageId>) -> BTreeSet<String> {
+        ids.iter()
+            .map(|id| self.packages[id].name.clone())
+            .collect()
+    }
+
     pub fn new(packages: Vec<Package>) -> Self {
         let packages = packages
             .into_iter()
@@ -107,7 +144,11 @@ impl WorkspaceGraph {
             .map(|id| (id.clone(), Vec::new()))
             .collect::<BTreeMap<_, Vec<PackageId>>>();
         for package in self.packages.values() {
-            for dependency in &package.internal_dependencies {
+            for dependency in package
+                .internal_dependencies
+                .iter()
+                .chain(&package.development_dependencies)
+            {
                 dependents
                     .get_mut(dependency)
                     .expect("native dependency must be a workspace package")
@@ -1612,6 +1653,8 @@ mod tests {
             id: PackageId::new(Ecosystem::Cargo, "a"),
             name: "a".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("a/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: Default::default(),
@@ -1622,6 +1665,8 @@ mod tests {
             id: PackageId::new(Ecosystem::Cargo, "b"),
             name: "b".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("b/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: Default::default(),
@@ -1721,6 +1766,8 @@ cargo = ["cargo", "build"]
             id: PackageId::new(Ecosystem::Cargo, "service"),
             name: "service".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("service/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -1785,6 +1832,8 @@ cargo = ["cargo", "run", "--bin", "codegen"]
             id: PackageId::new(Ecosystem::Cargo, "service"),
             name: "service".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("service/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["generate"]),
@@ -1823,6 +1872,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -1859,6 +1910,8 @@ npm = ["npm", "run", "test"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["test"]),
@@ -1894,6 +1947,8 @@ npm = ["npm", "run", "generate"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -1904,6 +1959,8 @@ npm = ["npm", "run", "generate"]
             id: PackageId::new(Ecosystem::Cargo, "service"),
             name: "service".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("service/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["generate"]),
@@ -1940,6 +1997,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "d"),
             name: "d".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("d/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -1984,6 +2043,8 @@ cargo = ["cargo", "run", "--bin", "gen"]
             id: PackageId::new(Ecosystem::Js, "leaf"),
             name: "leaf".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("leaf/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -1994,6 +2055,8 @@ cargo = ["cargo", "run", "--bin", "gen"]
             id: PackageId::new(Ecosystem::Js, "app"),
             name: "app".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("app/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -2217,6 +2280,8 @@ npm = ["npm", "run", "publish-docker"]
             id: PackageId::new(Ecosystem::Js, "@scope/web-bridge"),
             name: "@scope/web-bridge".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -2227,6 +2292,8 @@ npm = ["npm", "run", "publish-docker"]
             id: PackageId::new(Ecosystem::Cargo, "app"),
             name: "app".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("app/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["publish-docker"]),
@@ -2264,6 +2331,8 @@ npm = ["npm", "run", "publish-docker"]
             id: PackageId::new(Ecosystem::Cargo, "rust-bridge"),
             name: "rust-bridge".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("rust-bridge/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: Default::default(),
@@ -2274,6 +2343,8 @@ npm = ["npm", "run", "publish-docker"]
             id: PackageId::new(Ecosystem::Js, "@scope/web-bridge"),
             name: "@scope/web-bridge".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -2284,6 +2355,8 @@ npm = ["npm", "run", "publish-docker"]
             id: PackageId::new(Ecosystem::Cargo, "app"),
             name: "app".into(),
             ecosystem: Ecosystem::Cargo,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("app/Cargo.toml"),
             js_package_manager: None,
             task_opt_ins: make_task_opt_ins(["publish-docker"]),
@@ -2322,6 +2395,8 @@ npm = ["npm", "publish"]
             id: PackageId::new(Ecosystem::Js, "d"),
             name: "d".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("d/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["publish"]),
@@ -2478,6 +2553,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "codegen"),
             name: "codegen".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("codegen/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -2488,6 +2565,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -2523,6 +2602,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "codegen"),
             name: "codegen".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("codegen/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: Default::default(),
@@ -2533,6 +2614,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "web"),
             name: "web".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("web/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -2567,6 +2650,8 @@ npm = ["npm", "run", "build"]
             id: PackageId::new(Ecosystem::Js, "d"),
             name: "d".into(),
             ecosystem: Ecosystem::Js,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("d/package.json"),
             js_package_manager: Some(crate::manifest::JsPackageManager::Npm),
             task_opt_ins: make_task_opt_ins(["build"]),
@@ -2638,10 +2723,14 @@ npm = ["npm", "run", "build"]
     #[test]
     fn affected_mapping_uses_deepest_package_and_global_files_select_all() {
         let root = Package {
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("Cargo.toml"),
             ..pkg("root", vec![], vec![], vec![])
         };
         let nested = Package {
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: PathBuf::from("crates/nested/Cargo.toml"),
             ..pkg("nested", vec![], vec![], vec![])
         };
@@ -2829,6 +2918,8 @@ cargo = ["cargo", "check"]
             id: PackageId::new(ecosystem, name),
             name: name.into(),
             ecosystem,
+            cargo_publishable: false,
+            development_dependencies: Vec::new(),
             manifest_path: match ecosystem {
                 Ecosystem::Cargo => PathBuf::from(format!("{name}/Cargo.toml")),
                 Ecosystem::Js => PathBuf::from(format!("{name}/package.json")),

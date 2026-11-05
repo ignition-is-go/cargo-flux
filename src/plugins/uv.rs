@@ -133,6 +133,7 @@ impl ManifestPlugin for UvPlugin {
             };
 
         Ok(RawPackage {
+            cargo_publishable: false,
             id: PackageId::new(Ecosystem::Uv, &name),
             name,
             ecosystem: Ecosystem::Uv,
