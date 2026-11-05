@@ -141,6 +141,7 @@ fn restored_cargo_intermediates_remain_subject_to_cargo_freshness_checks() {
         let output = Command::new("cargo")
             .current_dir(root)
             .env("CARGO_TARGET_DIR", root.join("target"))
+            .env("CARGO_TERM_COLOR", "never")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .args(args)
