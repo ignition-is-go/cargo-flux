@@ -1,5 +1,6 @@
 self-hosted-runner:
   labels:
+    - ram-ge-8g
     - site-lucid-lab
     - ram-ge-16g
     - ram-ge-24g
