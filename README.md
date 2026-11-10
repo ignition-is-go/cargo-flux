@@ -740,7 +740,21 @@ Flux ignores normal published Python dependencies.
 
 ## Dev Dependency Policy
 
-Dev-only dependency edges are ignored when building topology.
+Dev-only dependency edges are ignored when building topology by default.
+A task can set `include_dev_dependencies = true` to include them in its native
+cascade and prerequisite ordering. Use this with `cascade = "all"` for Cargo
+publication: Cargo resolves dev dependencies when packaging, so their workspace
+crates must already be published. Self dev dependencies are ignored; real cycles
+between different packages are reported before execution. Ordinary build tasks
+keep the default and do not inherit publication-only ordering.
+
+```toml
+[tasks.publish]
+include_dev_dependencies = true
+cascade = "all"
+autoapply = "inherit"
+cargo = ["cargo", "publish", "--locked"]
+```
 
 Ignored dependency types:
 

@@ -308,6 +308,13 @@ impl TaskRegistry {
         })
     }
 
+    pub fn include_dev_dependencies(&self, task_name: &str) -> Result<bool> {
+        self.tasks
+            .get(task_name)
+            .map(|task| task.include_dev_dependencies)
+            .ok_or_else(|| anyhow!("task `{task_name}` is not defined in flux.toml"))
+    }
+
     pub fn cascades_to_native_dependencies(&self, task_name: &str) -> Result<bool> {
         self.tasks
             .get(task_name)
@@ -619,6 +626,8 @@ struct TaskDefinition {
     autoapply: AutoApply,
     #[serde(default)]
     cascade: Cascade,
+    #[serde(default)]
+    include_dev_dependencies: bool,
     #[serde(default)]
     workspace_batchable: bool,
     #[serde(default)]
