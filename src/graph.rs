@@ -577,6 +577,20 @@ impl WorkspaceGraph {
         Ok(())
     }
 
+    fn task_native_dependencies<'a>(
+        &'a self,
+        package: &'a Package,
+        task: &str,
+        tasks: &TaskRegistry,
+    ) -> Result<impl Iterator<Item = &'a PackageId>> {
+        let include_dev = tasks.include_dev_dependencies(task)?;
+        Ok(package.internal_dependencies.iter().chain(
+            package.development_dependencies.iter().filter(move |id| {
+                include_dev && **id != package.id && !package.internal_dependencies.contains(id)
+            }),
+        ))
+    }
+
     fn collect_propagated_task_nodes(
         &self,
         id: &PackageId,
@@ -588,7 +602,7 @@ impl WorkspaceGraph {
     ) -> Result<()> {
         let package = self.packages.get(id).expect("package must exist");
 
-        for dep in &package.internal_dependencies {
+        for dep in self.task_native_dependencies(package, task, tasks)? {
             self.collect_task_nodes(
                 dep,
                 task,
@@ -625,7 +639,7 @@ impl WorkspaceGraph {
         }
 
         let package = self.packages.get(id).expect("package must exist");
-        for dep in &package.internal_dependencies {
+        for dep in self.task_native_dependencies(package, task, tasks)? {
             self.collect_bridged_task_nodes(
                 dep,
                 task,
@@ -749,9 +763,8 @@ impl WorkspaceGraph {
             .packages
             .get(&node.package_id)
             .expect("task node package must exist");
-        let mut prereqs = package
-            .internal_dependencies
-            .iter()
+        let mut prereqs = self
+            .task_native_dependencies(package, &node.task_name, tasks)?
             .cloned()
             .map(|id| TaskNode::new(id, &node.task_name))
             .collect::<Vec<_>>();
@@ -789,7 +802,7 @@ impl WorkspaceGraph {
         }
 
         let package = self.packages.get(id).expect("package must exist");
-        for dep in &package.internal_dependencies {
+        for dep in self.task_native_dependencies(package, task, tasks)? {
             self.collect_direct_bridge_prerequisites(dep, task, prereqs, visited_native, tasks)?;
         }
         for bridge in &package.bridged_dependencies {
@@ -984,7 +997,13 @@ impl WorkspaceGraph {
             return Ok(node);
         }
 
-        let Some(path) = self.find_package_path(&source.package_id, &target.package_id)? else {
+        let Some(path) = self.find_package_path(
+            &source.package_id,
+            &target.package_id,
+            &source.task_name,
+            tasks,
+        )?
+        else {
             bail!(
                 "could not render task path from `{}` to prerequisite `{}`",
                 source,
@@ -1035,9 +1054,11 @@ impl WorkspaceGraph {
         &self,
         source: &PackageId,
         target: &PackageId,
+        task: &str,
+        tasks: &TaskRegistry,
     ) -> Result<Option<Vec<PackagePathStep>>> {
         let mut visited = BTreeSet::new();
-        self.find_package_path_recursive(source, target, &mut visited)
+        self.find_package_path_recursive(source, target, &mut visited, task, tasks)
     }
 
     fn find_package_path_recursive(
@@ -1045,6 +1066,8 @@ impl WorkspaceGraph {
         current: &PackageId,
         target: &PackageId,
         visited: &mut BTreeSet<PackageId>,
+        task: &str,
+        tasks: &TaskRegistry,
     ) -> Result<Option<Vec<PackagePathStep>>> {
         if current == target {
             return Ok(Some(Vec::new()));
@@ -1054,8 +1077,10 @@ impl WorkspaceGraph {
         }
 
         let package = self.packages.get(current).expect("package must exist");
-        for dependency in &package.internal_dependencies {
-            if let Some(mut path) = self.find_package_path_recursive(dependency, target, visited)? {
+        for dependency in self.task_native_dependencies(package, task, tasks)? {
+            if let Some(mut path) =
+                self.find_package_path_recursive(dependency, target, visited, task, tasks)?
+            {
                 let mut full = vec![PackagePathStep::Native(dependency.clone())];
                 full.append(&mut path);
                 return Ok(Some(full));
@@ -1064,7 +1089,9 @@ impl WorkspaceGraph {
 
         for bridge in &package.bridged_dependencies {
             let target_id = self.package_id_by_bridge(bridge)?;
-            if let Some(mut path) = self.find_package_path_recursive(&target_id, target, visited)? {
+            if let Some(mut path) =
+                self.find_package_path_recursive(&target_id, target, visited, task, tasks)?
+            {
                 let mut full = vec![PackagePathStep::Bridge(bridge.clone())];
                 full.append(&mut path);
                 return Ok(Some(full));
@@ -1679,6 +1706,76 @@ mod tests {
             .expect_err("cycle should fail");
 
         assert!(err.to_string().contains("cycle detected"));
+    }
+
+    #[test]
+    fn publish_orders_dev_dependencies_without_changing_build_topology() {
+        let root = temp_dir("publish-dev-dependencies");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.publish]
+include_dev_dependencies = true
+cascade = "all"
+autoapply = "inherit"
+depends_on = ["build"]
+cargo = ["cargo", "publish"]
+[tasks.build]
+cargo = ["cargo", "build"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let mut consumer = pkg("a-consumer", vec!["core"], vec!["publish"], vec![]);
+        consumer.development_dependencies = vec![PackageId::new(Ecosystem::Cargo, "z-server")];
+        let mut server = pkg("z-server", vec!["core"], vec![], vec![]);
+        server.development_dependencies =
+            vec![server.id.clone(), PackageId::new(Ecosystem::Cargo, "core")];
+        let graph =
+            WorkspaceGraph::new(vec![consumer, server, pkg("core", vec![], vec![], vec![])]);
+        let plan = graph.task_plan(&registry, "publish").expect("publish plan");
+        let published = plan
+            .iter()
+            .filter(|s| s.task_name == "publish")
+            .map(|s| s.package_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(published, vec!["core", "z-server", "a-consumer"]);
+        let tree = graph
+            .render_task_plan_tree(&registry, "publish")
+            .expect("tree");
+        assert!(tree.contains("z-server:publish"));
+        let native = graph.topological_order().expect("native order");
+        assert!(
+            native.iter().position(|p| p.name == "a-consumer")
+                < native.iter().position(|p| p.name == "z-server")
+        );
+    }
+
+    #[test]
+    fn publish_reports_mutual_dev_dependency_cycles() {
+        let root = temp_dir("publish-dev-cycle");
+        fs::write(
+            root.join("flux.toml"),
+            r#"[tasks.publish]
+include_dev_dependencies = true
+cascade = "all"
+autoapply = "inherit"
+cargo = ["cargo", "publish"]
+"#,
+        )
+        .expect("write config");
+        let registry = TaskRegistry::load(&root).expect("load registry");
+        let mut first = pkg("first", vec![], vec!["publish"], vec![]);
+        let mut second = pkg("second", vec![], vec![], vec![]);
+        first.development_dependencies = vec![second.id.clone()];
+        second.development_dependencies = vec![first.id.clone()];
+        let graph = WorkspaceGraph::new(vec![first, second]);
+        graph
+            .topological_order()
+            .expect("ordinary topology is acyclic");
+        let error = graph
+            .task_plan(&registry, "publish")
+            .expect_err("publication must reject cycle");
+        assert!(error.to_string().contains("cycle"), "{error}");
     }
 
     #[test]
