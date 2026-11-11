@@ -167,7 +167,7 @@ runs:
     - name: Install Cargo Flux
       id: install-windows
       if: runner.os == 'Windows'
-      shell: pwsh
+      shell: powershell
       env:
         REQUESTED_VERSION: ${{ inputs.version }}
         ACTION_PATH: ${{ github.action_path }}
@@ -205,7 +205,7 @@ runs:
         New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 
         $checksumPath = Join-Path $env:RUNNER_TEMP "cargo-flux-checksum-$([guid]::NewGuid()).txt"
-        Invoke-WebRequest -Uri "$base/$archive.sha256" -OutFile $checksumPath
+        Invoke-WebRequest -UseBasicParsing -Uri "$base/$archive.sha256" -OutFile $checksumPath
         $expected = ((Get-Content $checksumPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
         if ($expected -notmatch '^[0-9a-f]{64}$') {
           throw "Invalid SHA-256 file for $archive"
@@ -214,7 +214,7 @@ runs:
         $cacheValid = (Test-Path $cachedArchive -PathType Leaf) -and ((Get-FileHash -Algorithm SHA256 $cachedArchive).Hash.ToLowerInvariant() -eq $expected)
         if (-not $cacheValid) {
           $pending = Join-Path $env:RUNNER_TEMP "cargo-flux-archive-$([guid]::NewGuid()).tgz"
-          Invoke-WebRequest -Uri "$base/$archive" -OutFile $pending
+          Invoke-WebRequest -UseBasicParsing -Uri "$base/$archive" -OutFile $pending
           $actual = (Get-FileHash -Algorithm SHA256 $pending).Hash.ToLowerInvariant()
           if ($actual -ne $expected) {
             throw "Checksum mismatch for $archive"
@@ -345,12 +345,12 @@ runs:
 
     - name: Pin Cargo Flux executable
       if: runner.os == 'Windows'
-      shell: pwsh
+      shell: powershell
       env:
         FLUX_BINARY: ${{ steps.install-windows.outputs.path }}
       run: |
-        "CARGO_FLUX_BIN=$env:FLUX_BINARY" >> $env:GITHUB_ENV
-        Split-Path -Parent $env:FLUX_BINARY >> $env:GITHUB_PATH
+        "CARGO_FLUX_BIN=$env:FLUX_BINARY" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        Split-Path -Parent $env:FLUX_BINARY | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
     - name: Run Cargo Flux task
       id: run-unix
@@ -377,7 +377,7 @@ runs:
     - name: Run Cargo Flux task
       id: run-windows
       if: inputs.task != '' && runner.os == 'Windows'
-      shell: pwsh
+      shell: powershell
       env:
         CARGO_FLUX: ${{ steps.install-windows.outputs.path }}
         TASK: ${{ inputs.task }}
