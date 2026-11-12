@@ -267,12 +267,16 @@ fn source_timestamp_restore_preserves_unchanged_sources_and_invalidates_older_ch
     let original = unchanged.metadata().unwrap().modified().unwrap();
     flux(root.path(), &["storage", "sources"]);
     let old = UNIX_EPOCH + Duration::from_secs(100);
-    fs::File::open(&unchanged)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&unchanged)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(old))
         .unwrap();
     fs::write(&changed, "different").unwrap();
-    fs::File::open(&changed)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&changed)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(old))
         .unwrap();
