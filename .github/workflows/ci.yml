@@ -40,6 +40,11 @@ jobs:
           windows-sparse-index: true
       - name: Build the Windows release binary
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Test Windows storage timestamp restoration
+        run: |
+          cargo test --release --locked --target x86_64-pc-windows-msvc --bin cargo-flux storage::tests::timestamp_update_preserves_read_only_contents
+          cargo test --release --locked --target x86_64-pc-windows-msvc --test storage artifact_cli_works_without_a_language_workspace
+          cargo test --release --locked --target x86_64-pc-windows-msvc --test storage source_timestamp_restore_preserves_unchanged_sources_and_invalidates_older_changed_inputs
       - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
         if: always()
 

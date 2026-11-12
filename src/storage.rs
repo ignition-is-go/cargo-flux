@@ -111,6 +111,21 @@ fn relative(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn set_modified(path: &Path, modified: std::time::SystemTime) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // SetFileTime needs metadata write access, including for read-only files.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        options.access_mode(FILE_WRITE_ATTRIBUTES);
+    }
+    options
+        .open(path)?
+        .set_times(fs::FileTimes::new().set_modified(modified))
+}
+
 fn digest(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();
@@ -336,9 +351,10 @@ fn verify(stage: &Path, manifest: &Manifest, paths: &[PathBuf]) -> Result<()> {
             digest(&stage.join(path))? == expected.digest,
             "storage checksum mismatch"
         );
-        fs::File::open(stage.join(path))?.set_times(fs::FileTimes::new().set_modified(
+        set_modified(
+            &stage.join(path),
             std::time::UNIX_EPOCH + std::time::Duration::new(expected.seconds, expected.nanos),
-        ))?;
+        )?;
         Ok(())
     })?;
     phase("verify outputs", started);
@@ -413,6 +429,24 @@ pub fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timestamp_update_preserves_read_only_contents() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("readonly");
+        fs::write(&path, b"unchanged")?;
+        let original = fs::metadata(&path)?.permissions();
+        let mut readonly = original.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly)?;
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let result = set_modified(&path, modified);
+        fs::set_permissions(&path, original)?;
+        result?;
+        assert_eq!(fs::metadata(&path)?.modified()?, modified);
+        assert_eq!(fs::read(&path)?, b"unchanged");
+        Ok(())
+    }
+
     #[test]
     fn archives_restore_across_roots_replace_stale_files_and_try_fallbacks() -> Result<()> {
         let producer = tempfile::tempdir()?;
@@ -668,7 +702,7 @@ pub fn sources(root: &Path, target: &Path, restore: bool, include: &[PathBuf]) -
                 changed += 1;
                 std::time::SystemTime::now()
             };
-            fs::File::open(absolute)?.set_times(fs::FileTimes::new().set_modified(modified))?;
+            set_modified(&absolute, modified)?;
         }
         println!("source timestamps: {unchanged} unchanged, {changed} changed");
     } else {
