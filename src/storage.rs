@@ -239,6 +239,11 @@ fn transfer(
     }
 }
 
+pub fn cargo(root: &Path, paths: &[PathBuf], args: &[String]) -> Result<()> {
+    validate_paths(paths)?;
+    compiler::record::run(root, paths, args)
+}
+
 pub fn save(
     root: &Path,
     store: &Store,
@@ -248,6 +253,11 @@ pub fn save(
     manifests: &[PathBuf],
 ) -> Result<()> {
     validate_paths(paths)?;
+    let _cache_locks = if compiler {
+        compiler::record::lock(root, paths)?
+    } else {
+        Vec::new()
+    };
     let mut files = BTreeSet::new();
     for path in paths {
         ensure!(
@@ -258,7 +268,7 @@ pub fn save(
     }
     let original_files = files.clone();
     let _locks = if compiler {
-        compiler::select(root, &mut files, manifests)?
+        compiler::select(root, &mut files, paths, manifests)?
     } else {
         Vec::new()
     };
@@ -398,9 +408,9 @@ pub fn restore(
 ) -> Result<bool> {
     validate_paths(paths)?;
     ensure!(!keys.is_empty(), "declare at least one storage key");
-    let temporary = tempfile::NamedTempFile::new()?;
     for key in keys {
         let attempt = (|| -> Result<bool> {
+            let temporary = tempfile::NamedTempFile::new()?;
             let started = std::time::Instant::now();
             eprintln!("storage downloading archive");
             let mut found = false;

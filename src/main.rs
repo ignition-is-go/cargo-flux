@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     if let Command::Storage { command } = &cli.command {
         let tasks = TaskRegistry::load(&root)?;
         match command {
+            cli::StorageCommand::Cargo { paths, args } => storage::cargo(&root, paths, args)?,
             cli::StorageCommand::CargoKey {
                 scope,
                 selection,

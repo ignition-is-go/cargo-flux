@@ -21,15 +21,23 @@ fn flux(root: &Path, args: &[&str]) -> Command {
 }
 
 fn cargo(root: &Path, home: &Path, args: &[&str]) -> Output {
+    let mut command = if args.first() == Some(&"build") {
+        let mut command = flux(root, &["storage", "cargo", "--path", "target", "--"]);
+        command.args(args);
+        command
+    } else {
+        let mut command = Command::new("cargo");
+        command.args(args);
+        command
+    };
     success(
-        Command::new("cargo")
+        command
             .current_dir(root)
             .env("CARGO_HOME", home)
             .env("CARGO_TARGET_DIR", root.join("target"))
             .env("CARGO_INCREMENTAL", "0")
             .env_remove("RUSTC_WRAPPER")
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .args(args),
+            .env_remove("RUSTC_WORKSPACE_WRAPPER"),
     )
 }
 
@@ -193,6 +201,7 @@ fn compiler_snapshots_discard_obsolete_graphs_and_keep_both_feature_variants_war
             }
         };
         if compatibility_binary.is_some() && version == 1 {
+            fs::remove_file(root.join("target/.flux-compiler-units.json")).unwrap();
             save.args(["storage", "save"]);
         }
         success(
@@ -320,6 +329,7 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let home = root.join("cargo-home");
+    fs::write(root.join("flux.toml"), "").unwrap();
     for name in ["first", "second"] {
         let project = root.join(name);
         fs::create_dir_all(project.join("src")).unwrap();
@@ -404,4 +414,317 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
         );
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "42");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rejected_download_releases_space_before_fallback() {
+    use sha2::{Digest, Sha256};
+    // A bounded tmpfs makes admission deterministic while other builds use the root disk.
+    let temporary = tempfile::Builder::new()
+        .prefix("flux-fallback-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let root = temporary.path();
+    assert!(fs2::available_space(root).unwrap() > 48 * 1024 * 1024);
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::create_dir(root.join("dist")).unwrap();
+    let mut noise = Vec::with_capacity(8 * 1024 * 1024);
+    for counter in 0_u64..(8 * 1024 * 1024 / 32) {
+        noise.extend(Sha256::digest(counter.to_le_bytes()));
+    }
+    let mut large = noise.clone();
+    large.resize(32 * 1024 * 1024, 0);
+    fs::write(root.join("dist/data"), large).unwrap();
+    success(flux(root, &["storage", "save", "--key", "big", "--path", "dist"]).env("TMPDIR", root));
+    fs::write(root.join("dist/data"), &noise[..3 * 1024 * 1024]).unwrap();
+    success(
+        flux(
+            root,
+            &["storage", "save", "--key", "small", "--path", "dist"],
+        )
+        .env("TMPDIR", root),
+    );
+    fs::remove_dir_all(root.join("dist")).unwrap();
+    let reserve = (fs2::available_space(root).unwrap() - 10 * 1024 * 1024).to_string();
+    let result = success(
+        flux(
+            root,
+            &[
+                "storage",
+                "restore",
+                "--key",
+                "big",
+                "--key",
+                "small",
+                "--path",
+                "dist",
+                "--reserve-bytes",
+                &reserve,
+            ],
+        )
+        .env("TMPDIR", root),
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("storage hit: small"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(root.join("dist/data")).unwrap(),
+        &noise[..3 * 1024 * 1024]
+    );
+}
+
+#[test]
+fn local_version_changes_keep_snapshots_bounded_and_feature_variants_warm() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"CARGO_PKG_VERSION\")); }",
+    )
+    .unwrap();
+    let mut counts = Vec::new();
+    for version in 1..=3 {
+        fs::write(root.join("Cargo.toml"), format!("[package]\nname='local-version'\nversion='0.1.{version}'\nedition='2024'\n[workspace]\n[features]\nextra=[]\n")).unwrap();
+        if version == 2 {
+            std::thread::scope(|scope| {
+                let default = scope.spawn(|| build(root, &home, false, false));
+                let extra = scope.spawn(|| build(root, &home, true, false));
+                default.join().unwrap();
+                extra.join().unwrap();
+            });
+        } else {
+            build(root, &home, false, false);
+            build(root, &home, true, false);
+        }
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "save",
+                "--compiler",
+                "--key",
+                "local",
+                "--path",
+                "target",
+            ],
+        ));
+        fs::remove_dir_all(root.join("target")).unwrap();
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "restore",
+                "--key",
+                "local",
+                "--path",
+                "target",
+                "--required",
+            ],
+        ));
+        counts.push(fingerprint_count(&root.join("target")));
+        build(root, &home, false, true);
+        // A later job using only the default feature set must preserve the other warm variant.
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "save",
+                "--compiler",
+                "--key",
+                "local",
+                "--path",
+                "target",
+            ],
+        ));
+        fs::remove_dir_all(root.join("target")).unwrap();
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "restore",
+                "--key",
+                "local",
+                "--path",
+                "target",
+                "--required",
+            ],
+        ));
+        build(root, &home, true, true);
+        let result = cargo(root, &home, &["run", "--quiet"]);
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            format!("0.1.{version}")
+        );
+    }
+    assert_eq!(counts, vec![2, 2, 2]);
+}
+
+#[test]
+fn failed_build_preserves_previous_compiler_provenance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='failed-build'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    cargo(root, &home, &["build"]);
+    let recorded = fs::read(root.join("target/.flux-compiler-units.json")).unwrap();
+    fs::write(root.join("src/main.rs"), "invalid rust\n").unwrap();
+    let result = flux(
+        root,
+        &["storage", "cargo", "--path", "target", "--", "build"],
+    )
+    .env("CARGO_HOME", home)
+    .env("CARGO_TARGET_DIR", root.join("target"))
+    .output()
+    .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        recorded,
+        fs::read(root.join("target/.flux-compiler-units.json")).unwrap()
+    );
+}
+
+#[test]
+fn recorded_check_and_test_units_remain_warm() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='compile-modes'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    for args in [&["check"][..], &["test", "--no-run"][..]] {
+        success(
+            flux(root, &["storage", "cargo", "--path", "target", "--"])
+                .args(args)
+                .env("CARGO_HOME", &home)
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_TARGET_DIR", root.join("target")),
+        );
+    }
+    success(&mut flux(
+        root,
+        &[
+            "storage",
+            "save",
+            "--compiler",
+            "--key",
+            "modes",
+            "--path",
+            "target",
+        ],
+    ));
+    fs::remove_dir_all(root.join("target")).unwrap();
+    success(&mut flux(
+        root,
+        &[
+            "storage",
+            "restore",
+            "--key",
+            "modes",
+            "--path",
+            "target",
+            "--required",
+        ],
+    ));
+    for args in [
+        &["check", "--message-format=json"][..],
+        &["test", "--no-run", "--message-format=json"][..],
+    ] {
+        let result = cargo(root, &home, args);
+        let artifacts = artifacts(&result);
+        assert!(!artifacts.is_empty());
+        assert!(
+            artifacts.iter().all(|artifact| artifact["fresh"] == true),
+            "{artifacts:?}"
+        );
+    }
+}
+
+#[test]
+fn local_patch_version_changes_discard_previous_compiler_units() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("patch/src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", patched_local::value()); }\n",
+    )
+    .unwrap();
+    let mut counts = Vec::new();
+    for version in 1..=3 {
+        fs::write(root.join("Cargo.toml"), format!("[package]\nname='patch-consumer'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[dependencies]\npatched-local='=0.1.{version}'\n[patch.crates-io]\npatched-local={{path='patch'}}\n")).unwrap();
+        fs::write(root.join("patch/Cargo.toml"), format!("[package]\nname='patched-local'\nversion='0.1.{version}'\nedition='2024'\n[workspace]\n")).unwrap();
+        fs::write(
+            root.join("patch/src/lib.rs"),
+            format!("pub fn value() -> u32 {{ {version} }}\n"),
+        )
+        .unwrap();
+        cargo(
+            root,
+            &home,
+            &["build", "--offline", "--message-format=json"],
+        );
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "save",
+                "--compiler",
+                "--key",
+                "patch",
+                "--path",
+                "target",
+            ],
+        ));
+        fs::remove_dir_all(root.join("target")).unwrap();
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "restore",
+                "--key",
+                "patch",
+                "--path",
+                "target",
+                "--required",
+            ],
+        ));
+        counts.push(fingerprint_count(&root.join("target")));
+        let output = cargo(
+            root,
+            &home,
+            &["build", "--offline", "--message-format=json"],
+        );
+        assert!(
+            artifacts(&output)
+                .iter()
+                .all(|artifact| artifact["fresh"] == true)
+        );
+        let output = cargo(root, &home, &["run", "--offline", "--quiet"]);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            version.to_string()
+        );
+    }
+    assert_eq!(counts, vec![2, 2, 2]);
 }

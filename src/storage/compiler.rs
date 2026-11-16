@@ -2,6 +2,7 @@
 use super::*;
 use std::process::Command;
 
+pub(super) mod record;
 mod sources;
 
 #[derive(Default)]
@@ -116,20 +117,13 @@ fn unit_id(path: &Path, profiles: &BTreeSet<PathBuf>) -> Option<(PathBuf, String
     None
 }
 
-pub(super) fn select(
+fn lock_profiles(
     root: &Path,
+    profiles: &BTreeSet<PathBuf>,
     files: &mut BTreeSet<PathBuf>,
-    manifests: &[PathBuf],
 ) -> Result<Vec<fs::File>> {
-    let sources = sources::Sources::load(root, manifests)?;
-    let mut profiles = BTreeSet::new();
-    for path in files.iter() {
-        if let Some((profile, _, _)) = fingerprint_location(path) {
-            profiles.insert(profile);
-        }
-    }
     let mut locks = Vec::new();
-    for profile in &profiles {
+    for profile in profiles {
         for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
             let path = root.join(profile).join(name);
             match fs::OpenOptions::new().read(true).write(true).open(&path) {
@@ -145,6 +139,28 @@ pub(super) fn select(
             }
         }
     }
+    Ok(locks)
+}
+
+pub(super) fn select(
+    root: &Path,
+    files: &mut BTreeSet<PathBuf>,
+    paths: &[PathBuf],
+    manifests: &[PathBuf],
+) -> Result<Vec<fs::File>> {
+    let sources = sources::Sources::load(root, manifests)?;
+    let records = record::load(root, paths)?;
+    ensure!(
+        !records.is_empty(),
+        "compiler snapshots require recorded builds; use storage cargo --path <target> -- <cargo command>"
+    );
+    let mut profiles = BTreeSet::new();
+    for path in files.iter() {
+        if let Some((profile, _, _)) = fingerprint_location(path) {
+            profiles.insert(profile);
+        }
+    }
+    let locks = lock_profiles(root, &profiles, files)?;
     let mut units = BTreeMap::<(PathBuf, String), Unit>::new();
     for path in files.iter() {
         let Some(id) = unit_id(path, &profiles) else {
@@ -197,12 +213,17 @@ pub(super) fn select(
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
-        if !unit.fingerprint
+        let provenance = records
+            .get(&id.0.join(&id.1))
+            .filter(|record| record.fingerprints == unit.values)
+            .and_then(|record| sources.current_record(record));
+        if provenance == Some(false)
+            || !unit.fingerprint
             || (!statuses.is_empty() && statuses.iter().all(|status| *status == Some(false)))
         {
             obsolete.insert(id.clone());
         }
-        if unit.fingerprint && statuses.iter().any(Option::is_none) {
+        if provenance != Some(false) && unit.fingerprint && statuses.iter().any(Option::is_none) {
             protected.insert(id.clone());
             protected_values.extend(unit.values.iter().chain(&unit.dependencies).copied());
         }

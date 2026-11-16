@@ -409,6 +409,7 @@ For compiler snapshots and cross-job artifacts, explicit storage operations use
 the same configured store, compressed archives and native S3 transport:
 
 ```bash
+cargo flux storage cargo --path target -- build --release
 cargo flux storage save --compiler --key compiler-compatible-scope --path target
 cargo flux storage restore --key compiler-compatible-scope --path target
 cargo flux storage save --key artifacts/run-123/linux --path dist --path target/release/server
@@ -431,10 +432,19 @@ directly into one temporary snapshot; an index supports parallel extraction
 without temporary shard copies. Restored files are verified before promotion.
 All temporary archives and staging are removed on success or failure.
 
+Run each Cargo compilation through `storage cargo --path target -- <command>`
+to capture Cargo's JSON artifact reports before output aliases are replaced by
+another build. It preserves Cargo output and records successful local package
+identities with their actual compiler-unit fingerprints in
+`target/.flux-compiler-units.json`. Failed commands preserve prior provenance.
+Compiler saves require these records. Regular artifact saves keep their existing
+command syntax.
+
 Compiler snapshots saved with `--compiler` select Cargo units using declared
 package sources, enabled features and fingerprint dependency relationships.
-Obsolete units and incremental sessions are excluded from the archive. Units
-with unknown source ownership and their dependencies are retained conservatively.
+Recorded local units from obsolete package versions and incremental sessions
+are excluded from the archive. Existing cached units with unknown provenance
+and their dependencies are retained conservatively.
 Files in the producer's target directory remain available after saving. The
 caller can remove that directory after a successful upload.
 

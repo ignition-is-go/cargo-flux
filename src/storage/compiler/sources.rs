@@ -8,6 +8,7 @@ struct Metadata {
 
 #[derive(Deserialize)]
 struct Package {
+    id: String,
     name: String,
     manifest_path: PathBuf,
     targets: Vec<Target>,
@@ -47,6 +48,7 @@ pub(super) struct Sources {
     targets: BTreeMap<PathBuf, Vec<Owner>>,
     package_roots: BTreeMap<String, BTreeSet<PathBuf>>,
     manifests: BTreeSet<PathBuf>,
+    identities: BTreeMap<PathBuf, String>,
     registry: BTreeSet<(String, String)>,
     git: BTreeSet<(String, String)>,
     cargo_home: Option<PathBuf>,
@@ -80,6 +82,7 @@ impl Sources {
             targets: BTreeMap::new(),
             package_roots: BTreeMap::new(),
             manifests: BTreeSet::new(),
+            identities: BTreeMap::new(),
             registry: BTreeSet::new(),
             git: BTreeSet::new(),
             cargo_home,
@@ -135,7 +138,34 @@ impl Sources {
                     }
                 }
             }
-            let consuming_root = consuming_root.unwrap_or(metadata.workspace_root.clone());
+            let consuming_root = consuming_root
+                .unwrap_or(metadata.workspace_root.clone())
+                .canonicalize()?;
+            if declared {
+                let manifest: toml::Value = toml::from_str(&fs::read_to_string(
+                    metadata.workspace_root.join("Cargo.toml"),
+                )?)?;
+                let patches = manifest
+                    .get("patch")
+                    .and_then(toml::Value::as_table)
+                    .into_iter()
+                    .flat_map(|registries| registries.values())
+                    .filter_map(toml::Value::as_table)
+                    .flat_map(|dependencies| dependencies.values());
+                let replacements = manifest
+                    .get("replace")
+                    .and_then(toml::Value::as_table)
+                    .into_iter()
+                    .flat_map(|dependencies| dependencies.values());
+                for dependency in patches.chain(replacements) {
+                    if let Some(path) = dependency.get("path").and_then(toml::Value::as_str) {
+                        pending.push((
+                            metadata.workspace_root.join(path).join("Cargo.toml"),
+                            Some(consuming_root.clone()),
+                        ));
+                    }
+                }
+            }
             sources.roots.insert(consuming_root.clone());
             for package in metadata.packages {
                 if !declared && dunce::canonicalize(&package.manifest_path)? != manifest {
@@ -153,6 +183,9 @@ impl Sources {
                     .entry(package.name.clone())
                     .or_default()
                     .insert(consuming_root.clone());
+                sources
+                    .identities
+                    .insert(package.manifest_path.canonicalize()?, package.id);
                 sources.manifests.insert(
                     package
                         .manifest_path
@@ -170,6 +203,17 @@ impl Sources {
             }
         }
         Ok(sources)
+    }
+
+    pub(super) fn current_identity(&self, manifest: &Path, package: &str) -> Option<bool> {
+        self.identities
+            .get(manifest)
+            .map(|current| current == package)
+    }
+
+    pub(super) fn current_record(&self, record: &super::record::Record) -> Option<bool> {
+        self.current_identity(&record.manifest, &record.package)
+            .or_else(|| self.roots.contains(&record.workspace).then_some(false))
     }
 
     pub(super) fn roots_for(&self, package: Option<&str>) -> &BTreeSet<PathBuf> {
