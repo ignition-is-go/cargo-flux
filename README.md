@@ -409,7 +409,7 @@ For compiler snapshots and cross-job artifacts, explicit storage operations use
 the same configured store, compressed archives and native S3 transport:
 
 ```bash
-cargo flux storage save --key compiler-compatible-scope --path target
+cargo flux storage save --compiler --key compiler-compatible-scope --path target
 cargo flux storage restore --key compiler-compatible-scope --path target
 cargo flux storage save --key artifacts/run-123/linux --path dist --path target/release/server
 cargo flux storage restore --key artifacts/run-123/linux --path dist --path target/release/server --required
@@ -431,12 +431,31 @@ directly into one temporary snapshot; an index supports parallel extraction
 without temporary shard copies. Restored files are verified before promotion.
 All temporary archives and staging are removed on success or failure.
 
-New snapshots use the versioned `objects/v2/` object path. Restore tries that
-format first, then reads legacy `objects/` snapshots, so existing caches can
-seed the new format without overwriting objects used by older Flux versions.
-This format versioning is internal; explicit compatibility and artifact keys
-remain unchanged. The first run using legacy data still extracts that legacy
-archive serially; subsequent runs can restore the new parallel format.
+Compiler snapshots saved with `--compiler` select Cargo units using declared
+package sources, enabled features and fingerprint dependency relationships.
+Obsolete units and incremental sessions are excluded from the archive. Units
+with unknown source ownership and their dependencies are retained conservatively.
+Files in the producer's target directory remain available after saving. The
+caller can remove that directory after a successful upload. Actual hard links
+are stored once and recreated during restore.
+
+Declare each independent workspace sharing a target directory with repeated
+`--manifest-path PATH` on both `storage cargo-key` and `storage save --compiler`.
+The default manifest is `Cargo.toml`. Selection uses offline Cargo metadata and
+the declared workspaces' lockfiles. Existing Cargo profile locks are held while
+the snapshot is prepared. Complete builds before saving.
+
+Compiler snapshots use `objects/v3/`. Generic artifact saves use `objects/v2/`.
+Restore tries v3, v2 and legacy `objects/` for each key. Older Flux versions can
+continue reading generic artifact snapshots. They cannot read v3 compiler
+snapshots.
+
+Restore checks free space before downloading the compressed archive and before
+extracting its expanded contents. `--reserve-bytes N` preserves additional free
+space on each filesystem involved. Insufficient space skips an optional
+snapshot. A required restore fails and preserves existing outputs. These checks
+use available space at the time of admission. Concurrent writers can consume
+space during a restore.
 
 Native S3 transfers use up to four concurrent 8 MiB upload parts or download
 ranges; large downloads pin ranges to one ETag and buffer disk writes. Storage
@@ -458,8 +477,9 @@ to transfer that contract between jobs.
 `storage cargo-key --scope validation --selection product` prints a key based on
 compiler identity, platform, flags, source location and selected packages. Add
 `--affected BASE` for a narrower package pool; an empty selection prints no key.
-Source/manifest/lockfile content changes deliberately do not orphan compiler
-snapshots. Cargo makes the final freshness decision. `storage sources` records
+Source edits and external dependency version or revision updates reuse the key.
+Local package identities, manifest build configuration and Cargo configuration
+partition compiler snapshots. Cargo makes the final freshness decision. `storage sources` records
 tracked source timestamps alongside the snapshot; `storage sources --restore`
 restores timestamps only for byte-identical files and touches changed content.
 Use repeated `--include PATH` for watched, ignored inputs.

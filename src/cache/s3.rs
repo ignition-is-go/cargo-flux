@@ -42,7 +42,13 @@ fn storage_error(operation: &str, error: impl std::fmt::Display) -> anyhow::Erro
     )
 }
 
-pub(crate) fn transfer(config: &S3, key: &str, operation: &str, file: &Path) -> Result<bool> {
+pub(crate) fn transfer(
+    config: &S3,
+    key: &str,
+    operation: &str,
+    file: &Path,
+    reserve: u64,
+) -> Result<bool> {
     let bucket = configured_value(&config.bucket, &config.bucket_env, "bucket")?
         .context("S3 cache requires bucket or bucket_env")?;
     ensure!(
@@ -108,6 +114,7 @@ pub(crate) fn transfer(config: &S3, key: &str, operation: &str, file: &Path) -> 
                     Err(object_store::Error::NotFound { .. }) => return Ok(false),
                     Err(error) => return Err(storage_error(operation, error)),
                 };
+                crate::storage::space::check(file, metadata.size, reserve)?;
                 let mut destination = tokio::fs::File::create(file).await?;
                 destination.set_max_buf_size(PART_SIZE as usize);
                 let mut output = tokio::io::BufWriter::with_capacity(4 * 1024 * 1024, destination);

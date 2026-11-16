@@ -38,6 +38,7 @@ fn main() -> Result<()> {
                 scope,
                 selection,
                 affected,
+                manifests,
             } => {
                 let packages = if let Some(selection) = selection {
                     let graph = WorkspaceGraph::new(discover_workspace(&root)?.packages);
@@ -60,7 +61,10 @@ fn main() -> Result<()> {
                 } else {
                     Vec::new()
                 };
-                println!("{}", storage::cargo_key(&root, scope, &packages)?);
+                println!(
+                    "{}",
+                    storage::cargo_key(&root, scope, &packages, manifests)?
+                );
             }
             cli::StorageCommand::Sources {
                 path,
@@ -71,13 +75,15 @@ fn main() -> Result<()> {
                 key,
                 paths,
                 artifact,
+                compiler,
+                manifests,
             } => {
                 let paths = artifact
                     .as_deref()
                     .map(|name| tasks.artifact_paths(name))
                     .transpose()?
                     .unwrap_or(paths);
-                storage::save(&root, tasks.cache_store(), key, paths)?;
+                storage::save(&root, tasks.cache_store(), key, paths, *compiler, manifests)?;
             }
             cli::StorageCommand::Restore {
                 keys,
@@ -85,6 +91,7 @@ fn main() -> Result<()> {
                 artifact,
                 destination,
                 required,
+                reserve_bytes,
             } => {
                 let paths = artifact
                     .as_deref()
@@ -98,6 +105,7 @@ fn main() -> Result<()> {
                     paths,
                     *required,
                     destination,
+                    *reserve_bytes,
                 )?;
             }
         }

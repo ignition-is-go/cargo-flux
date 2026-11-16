@@ -122,6 +122,9 @@ pub enum ReportCommand {
 pub enum StorageCommand {
     /// Print compiler/flags/scope compatibility without keying on source hashes.
     CargoKey {
+        /// Workspace manifests whose local package identities belong to this snapshot.
+        #[arg(long = "manifest-path")]
+        manifests: Vec<PathBuf>,
         #[arg(long)]
         scope: String,
         #[arg(long)]
@@ -140,6 +143,12 @@ pub enum StorageCommand {
     },
     /// Save declared paths as a verified compressed archive.
     Save {
+        /// Retain current Cargo units and exclude incremental sessions from the snapshot.
+        #[arg(long)]
+        compiler: bool,
+        /// Workspace manifests contributing compiler outputs, repeatable for shared targets.
+        #[arg(long = "manifest-path", requires = "compiler")]
+        manifests: Vec<PathBuf>,
         #[arg(long)]
         key: String,
         #[arg(
@@ -153,6 +162,9 @@ pub enum StorageCommand {
     },
     /// Restore the first existing key; validation commands must still run.
     Restore {
+        /// Leave this many free bytes after downloading and extracting the snapshot.
+        #[arg(long, default_value_t = 0)]
+        reserve_bytes: u64,
         #[arg(long = "key", required = true)]
         keys: Vec<String>,
         #[arg(

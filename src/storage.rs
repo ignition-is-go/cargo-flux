@@ -10,7 +10,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::cache::Store;
 
+mod compiler;
 mod parallel;
+pub(crate) mod space;
 
 const HASH_WORKERS: usize = 8;
 const MANIFEST: &str = "__flux_storage_manifest.json";
@@ -23,11 +25,13 @@ struct Manifest {
     files: BTreeMap<PathBuf, FileState>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct FileState {
     digest: String,
     seconds: u64,
     nanos: u32,
+    #[serde(default)]
+    footprint: Option<space::Footprint>,
 }
 
 fn file_state(path: &Path) -> Result<FileState> {
@@ -38,6 +42,7 @@ fn file_state(path: &Path) -> Result<FileState> {
         digest: digest(path)?,
         seconds: modified.as_secs(),
         nanos: modified.subsec_nanos(),
+        footprint: Some(space::Footprint::of(path)?),
     })
 }
 
@@ -175,6 +180,20 @@ fn validate_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn hardlinks(root: &Path, files: &BTreeSet<PathBuf>) -> Result<BTreeMap<PathBuf, PathBuf>> {
+    let mut identities = std::collections::HashMap::<file_id::FileId, PathBuf>::new();
+    let mut aliases = BTreeMap::new();
+    for path in files {
+        let id = file_id::get_file_id(root.join(path))?;
+        if let Some(canonical) = identities.get(&id) {
+            aliases.insert(path.clone(), canonical.clone());
+        } else {
+            identities.insert(id, path.clone());
+        }
+    }
+    Ok(aliases)
+}
+
 fn object_key(key: &str) -> Result<String> {
     ensure!(!key.trim().is_empty(), "empty storage key");
     Ok(format!("objects/v2/{:x}", Sha256::digest(key.as_bytes())))
@@ -186,13 +205,14 @@ fn transfer(
     key: &str,
     upload: bool,
     file: &Path,
-    legacy: bool,
+    version: u8,
+    reserve: u64,
 ) -> Result<bool> {
     let key = object_key(key)?;
-    let key = if legacy {
-        key.replacen("objects/v2/", "objects/", 1)
-    } else {
-        key
+    let key = match version {
+        1 => key.replacen("objects/v2/", "objects/", 1),
+        3 => key.replacen("objects/v2/", "objects/v3/", 1),
+        _ => key,
     };
     if let Some(config) = &store.s3 {
         return crate::cache::s3::transfer(
@@ -200,6 +220,7 @@ fn transfer(
             &key,
             if upload { "upload" } else { "download" },
             file,
+            reserve,
         );
     }
     let destination = root
@@ -218,6 +239,12 @@ fn transfer(
         pending.persist(destination)?;
         Ok(true)
     } else {
+        let length = match fs::metadata(&destination) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        space::check(file, length, reserve)?;
         match fs::copy(destination, file) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -226,7 +253,14 @@ fn transfer(
     }
 }
 
-pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<()> {
+pub fn save(
+    root: &Path,
+    store: &Store,
+    key: &str,
+    paths: &[PathBuf],
+    compiler: bool,
+    manifests: &[PathBuf],
+) -> Result<()> {
     validate_paths(paths)?;
     let mut files = BTreeSet::new();
     for path in paths {
@@ -236,16 +270,35 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         );
         collect(root, path, &mut files)?;
     }
+    let original_files = files.clone();
+    let _locks = if compiler {
+        compiler::select(root, &mut files, manifests)?
+    } else {
+        Vec::new()
+    };
     let started = std::time::Instant::now();
     eprintln!(
         "storage hashing {} files ({} workers)",
         files.len(),
         hash_workers(files.len())
     );
-    let hashes = map_files(&files, |path| file_state(&root.join(path)))?;
+    let hardlinks = if compiler {
+        hardlinks(root, &files)?
+    } else {
+        BTreeMap::new()
+    };
+    let canonical = files
+        .iter()
+        .filter(|path| !hardlinks.contains_key(*path))
+        .cloned()
+        .collect();
+    let mut hashes = map_files(&canonical, |path| file_state(&root.join(path)))?;
+    for (alias, canonical) in &hardlinks {
+        hashes.insert(alias.clone(), hashes[canonical].clone());
+    }
     phase("hash", started);
     let manifest = Manifest {
-        version: 2,
+        version: if compiler { 3 } else { 2 },
         key: key.into(),
         paths: paths.to_vec(),
         files: hashes.clone(),
@@ -253,7 +306,13 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
     let mut temporary = tempfile::NamedTempFile::new()?;
     let started = std::time::Instant::now();
     eprintln!("storage compressing archive");
-    parallel::save(root, temporary.as_file_mut(), manifest)?;
+    parallel::save(
+        root,
+        temporary.as_file_mut(),
+        manifest,
+        compiler,
+        hardlinks.clone(),
+    )?;
     temporary.flush()?;
     phase("compress", started);
     let started = std::time::Instant::now();
@@ -265,12 +324,18 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
         collect(root, path, &mut current)?;
     }
     ensure!(
-        current == hashes.keys().cloned().collect(),
+        current == original_files,
         "storage files changed during upload preparation"
     );
-    map_files(&current, |path| {
+    if compiler {
         ensure!(
-            digest(&root.join(path))? == hashes[path].digest,
+            self::hardlinks(root, &files)? == hardlinks,
+            "storage file links changed during upload preparation"
+        );
+    }
+    map_files(&canonical, |path| {
+        ensure!(
+            file_state(&root.join(path))? == hashes[path],
             "storage contents changed during upload preparation"
         );
         Ok(())
@@ -279,17 +344,26 @@ pub fn save(root: &Path, store: &Store, key: &str, paths: &[PathBuf]) -> Result<
     let bytes = temporary.as_file().metadata()?.len();
     let started = std::time::Instant::now();
     eprintln!("storage uploading {bytes} compressed bytes");
-    transfer(root, store, key, true, temporary.path(), false)?;
+    transfer(
+        root,
+        store,
+        key,
+        true,
+        temporary.path(),
+        if compiler { 3 } else { 2 },
+        0,
+    )?;
     phase("upload", started);
     Ok(())
 }
 
-fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<()> {
+fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf], reserve: u64) -> Result<()> {
     let mut prefix = [0; 8];
     fs::File::open(archive)?.read_exact(&mut prefix)?;
-    if &prefix == parallel::MAGIC {
-        return parallel::unpack(archive, stage, key, paths);
+    if &prefix == parallel::MAGIC || &prefix == parallel::LEGACY_MAGIC {
+        return parallel::unpack(archive, stage, key, paths, reserve);
     }
+    space::check_legacy(archive, stage, reserve)?;
     let started = std::time::Instant::now();
     eprintln!("storage extracting legacy archive");
     let decoder = zstd::stream::Decoder::new(fs::File::open(archive)?)?;
@@ -367,59 +441,77 @@ pub fn restore(
     keys: &[String],
     paths: &[PathBuf],
     required: bool,
+    reserve: u64,
 ) -> Result<bool> {
     validate_paths(paths)?;
     ensure!(!keys.is_empty(), "declare at least one storage key");
     let temporary = tempfile::NamedTempFile::new()?;
     for key in keys {
-        let started = std::time::Instant::now();
-        eprintln!("storage downloading archive");
-        if !transfer(root, store, key, false, temporary.path(), false)?
-            && !transfer(root, store, key, false, temporary.path(), true)?
-        {
-            continue;
-        }
-        let bytes = temporary.as_file().metadata()?.len();
-        let seconds = started.elapsed().as_secs_f64();
-        eprintln!(
-            "storage download: {bytes} bytes in {seconds:.2}s ({:.1} MiB/s)",
-            bytes as f64 / (1024.0 * 1024.0) / seconds.max(0.001)
-        );
-        // Same filesystem staging permits rename without dense copies of sparse
-        // files. Every byte is checked before replacing any existing output.
-        let stage = tempfile::tempdir_in(root)?;
-        unpack(temporary.path(), stage.path(), key, paths)?;
-        for path in paths {
-            let output = root.join(path);
-            let parent = output.parent().context("storage output parent")?;
-            let mut ancestor = parent;
-            while !ancestor.exists() {
-                ancestor = ancestor.parent().context("storage output ancestor")?;
-            }
-            ensure!(
-                ancestor.canonicalize()?.starts_with(root),
-                "storage output parent leaves workspace"
-            );
-            fs::create_dir_all(parent)?;
-            match output.symlink_metadata() {
-                Ok(metadata) => {
-                    ensure!(
-                        !metadata.file_type().is_symlink(),
-                        "refusing to replace symlink output"
-                    );
-                    if metadata.is_dir() {
-                        fs::remove_dir_all(&output)?;
-                    } else {
-                        fs::remove_file(&output)?;
-                    }
+        let attempt = (|| -> Result<bool> {
+            let started = std::time::Instant::now();
+            eprintln!("storage downloading archive");
+            let mut found = false;
+            for version in [3, 2, 1] {
+                if transfer(root, store, key, false, temporary.path(), version, reserve)? {
+                    found = true;
+                    break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                Err(error) => return Err(error.into()),
             }
-            fs::rename(stage.path().join(path), output)?;
+            if !found {
+                return Ok(false);
+            }
+            let bytes = temporary.as_file().metadata()?.len();
+            let seconds = started.elapsed().as_secs_f64();
+            eprintln!(
+                "storage download: {bytes} bytes in {seconds:.2}s ({:.1} MiB/s)",
+                bytes as f64 / (1024.0 * 1024.0) / seconds.max(0.001)
+            );
+            // Same filesystem staging permits rename without dense copies of sparse
+            // files. Every byte is checked before replacing any existing output.
+            let stage = tempfile::tempdir_in(root)?;
+            unpack(temporary.path(), stage.path(), key, paths, reserve)?;
+            for path in paths {
+                let output = root.join(path);
+                let parent = output.parent().context("storage output parent")?;
+                let mut ancestor = parent;
+                while !ancestor.exists() {
+                    ancestor = ancestor.parent().context("storage output ancestor")?;
+                }
+                ensure!(
+                    ancestor.canonicalize()?.starts_with(root),
+                    "storage output parent leaves workspace"
+                );
+                fs::create_dir_all(parent)?;
+                match output.symlink_metadata() {
+                    Ok(metadata) => {
+                        ensure!(
+                            !metadata.file_type().is_symlink(),
+                            "refusing to replace symlink output"
+                        );
+                        if metadata.is_dir() {
+                            fs::remove_dir_all(&output)?;
+                        } else {
+                            fs::remove_file(&output)?;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+                fs::rename(stage.path().join(path), output)?;
+            }
+            println!("storage hit: {key}");
+            Ok(true)
+        })();
+        match attempt {
+            Ok(true) => return Ok(true),
+            Ok(false) => (),
+            Err(error)
+                if !required && error.downcast_ref::<space::InsufficientSpace>().is_some() =>
+            {
+                eprintln!("storage skipped snapshot: {error}");
+            }
+            Err(error) => return Err(error),
         }
-        println!("storage hit: {key}");
-        return Ok(true);
     }
     ensure!(!required, "required storage artifact was not found");
     println!("storage miss");
@@ -459,7 +551,14 @@ mod tests {
         fs::create_dir(producer.path().join("dist"))?;
         fs::write(producer.path().join("dist/binary"), "compiled")?;
         let paths = vec![PathBuf::from("dist")];
-        save(producer.path(), &store, "artifact/run/one", &paths)?;
+        save(
+            producer.path(),
+            &store,
+            "artifact/run/one",
+            &paths,
+            false,
+            &[],
+        )?;
         fs::create_dir(consumer.path().join("dist"))?;
         fs::write(consumer.path().join("dist/stale"), "stale")?;
         assert!(restore(
@@ -467,7 +566,8 @@ mod tests {
             &store,
             &["absent".into(), "artifact/run/one".into()],
             &paths,
-            true
+            true,
+            0,
         )?);
         assert_eq!(fs::read(consumer.path().join("dist/binary"))?, b"compiled");
         assert!(!consumer.path().join("dist/stale").exists());
@@ -476,16 +576,18 @@ mod tests {
             &store,
             &["absent".into()],
             &paths,
-            false
+            false,
+            0,
         )?);
-        assert!(restore(consumer.path(), &store, &["absent".into()], &paths, true).is_err());
+        assert!(restore(consumer.path(), &store, &["absent".into()], &paths, true, 0).is_err());
         assert!(
             restore(
                 consumer.path(),
                 &store,
                 &["artifact/run/one".into()],
                 &["other".into()],
-                true
+                true,
+                0,
             )
             .is_err()
         );
@@ -499,24 +601,133 @@ mod tests {
         let store = Store::default();
         fs::create_dir(root.path().join("dist"))?;
         fs::write(root.path().join("dist/binary"), "original")?;
-        save(root.path(), &store, "one", &["dist".into()])?;
+        save(root.path(), &store, "one", &["dist".into()], false, &[])?;
         let object = root
             .path()
             .join(format!(".flux/cache/{}.tar", object_key("one")?));
         let bytes = fs::read(&object)?;
         fs::write(object, &bytes[..bytes.len() / 2])?;
-        assert!(restore(root.path(), &store, &["one".into()], &["dist".into()], true).is_err());
+        assert!(
+            restore(
+                root.path(),
+                &store,
+                &["one".into()],
+                &["dist".into()],
+                true,
+                0
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(root.path().join("dist/binary"))?, b"original");
-        assert!(save(root.path(), &store, "bad", &["../outside".into()]).is_err());
         assert!(
             save(
                 root.path(),
                 &store,
                 "bad",
-                &["dist".into(), "dist/binary".into()]
+                &["../outside".into()],
+                false,
+                &[]
             )
             .is_err()
         );
+        assert!(
+            save(
+                root.path(),
+                &store,
+                "bad",
+                &["dist".into(), "dist/binary".into()],
+                false,
+                &[],
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hardlinks_survive_without_linking_independent_copies() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='link-fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n[workspace]\n",
+        )?;
+        fs::write(
+            root.path().join("Cargo.lock"),
+            "version=4\n[[package]]\nname='link-fixture'\nversion='0.1.0'\n",
+        )?;
+        fs::write(root.path().join("lib.rs"), "")?;
+        fs::create_dir(root.path().join("dist"))?;
+        let original = root.path().join("dist/original");
+        fs::write(&original, b"same contents")?;
+        fs::hard_link(&original, root.path().join("dist/alias"))?;
+        fs::copy(&original, root.path().join("dist/independent"))?;
+        save(
+            root.path(),
+            &Store::default(),
+            "links",
+            &["dist".into()],
+            true,
+            &[],
+        )?;
+        fs::remove_dir_all(root.path().join("dist"))?;
+        restore(
+            root.path(),
+            &Store::default(),
+            &["links".into()],
+            &["dist".into()],
+            true,
+            0,
+        )?;
+        let id = file_id::get_file_id(&original)?;
+        assert_eq!(id, file_id::get_file_id(root.path().join("dist/alias"))?);
+        assert_ne!(
+            id,
+            file_id::get_file_id(root.path().join("dist/independent"))?
+        );
+        fs::write(root.path().join("dist/alias"), b"changed")?;
+        assert_eq!(fs::read(&original)?, b"changed");
+        assert_eq!(
+            fs::read(root.path().join("dist/independent"))?,
+            b"same contents"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_archive_fits_but_expanded_snapshot_is_skipped_before_writing_outputs()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir(root.path().join("dist"))?;
+        let mut output = fs::File::create(root.path().join("dist/large"))?;
+        let data = [b'a'; 1024 * 1024];
+        for _ in 0..128 {
+            output.write_all(&data)?;
+        }
+        drop(output);
+        save(
+            root.path(),
+            &Store::default(),
+            "expanded",
+            &["dist".into()],
+            false,
+            &[],
+        )?;
+        fs::remove_dir_all(root.path().join("dist"))?;
+        fs::create_dir(root.path().join("dist"))?;
+        fs::write(root.path().join("dist/original"), b"preserved")?;
+        let reserve = fs2::available_space(root.path())?
+            .checked_sub(64 * 1024 * 1024)
+            .context("test needs 64 MiB of free disk")?;
+        assert!(!restore(
+            root.path(),
+            &Store::default(),
+            &["expanded".into()],
+            &["dist".into()],
+            false,
+            reserve
+        )?);
+        assert_eq!(fs::read(root.path().join("dist/original"))?, b"preserved");
+        assert!(!root.path().join("dist/large").exists());
         Ok(())
     }
 
@@ -537,7 +748,14 @@ mod tests {
         drop(file);
         let before = fs::metadata(&path)?;
         let store = Store::default();
-        save(root.path(), &store, "snapshot", &["target".into()])?;
+        save(
+            root.path(),
+            &store,
+            "snapshot",
+            &["target".into()],
+            false,
+            &[],
+        )?;
         fs::remove_dir_all(root.path().join("target"))?;
         restore(
             root.path(),
@@ -545,6 +763,7 @@ mod tests {
             &["snapshot".into()],
             &["target".into()],
             true,
+            0,
         )?;
         let after = fs::metadata(&path)?;
         assert_eq!(after.len(), before.len());
@@ -568,7 +787,12 @@ mod tests {
 
 /// Source contents deliberately do not enter compiler compatibility. Cargo's
 /// fingerprints own source freshness, including manifests and dependency locks.
-pub fn cargo_key(root: &Path, scope: &str, packages: &[String]) -> Result<String> {
+pub fn cargo_key(
+    root: &Path,
+    scope: &str,
+    packages: &[String],
+    manifests: &[PathBuf],
+) -> Result<String> {
     ensure!(
         !scope.is_empty() && !scope.contains(['\n', '\r']),
         "invalid Cargo cache scope"
@@ -582,6 +806,9 @@ pub fn cargo_key(root: &Path, scope: &str, packages: &[String]) -> Result<String
             matches!(
                 name.as_str(),
                 "RUSTFLAGS"
+                    | "CARGO_HOME"
+                    | "HOME"
+                    | "USERPROFILE"
                     | "RUSTDOCFLAGS"
                     | "CARGO_ENCODED_RUSTFLAGS"
                     | "CARGO_BUILD_TARGET"
@@ -597,6 +824,7 @@ pub fn cargo_key(root: &Path, scope: &str, packages: &[String]) -> Result<String
         })
         .collect::<BTreeMap<_, _>>();
     let identity = serde_json::to_vec(&(
+        "compiler-snapshot-v2",
         std::env::consts::OS,
         std::env::consts::ARCH,
         root,
@@ -604,6 +832,8 @@ pub fn cargo_key(root: &Path, scope: &str, packages: &[String]) -> Result<String
         packages,
         output.stdout,
         flags,
+        compiler::local_packages(root, manifests)?,
+        compiler::configuration(root, manifests)?,
     ))?;
     Ok(format!("cargo/{:x}", Sha256::digest(identity)))
 }
@@ -615,9 +845,10 @@ pub fn restore_into(
     paths: &[PathBuf],
     required: bool,
     destination: &Path,
+    reserve: u64,
 ) -> Result<bool> {
     if destination == Path::new(".") {
-        return restore(root, store, keys, paths, required);
+        return restore(root, store, keys, paths, required, reserve);
     }
     relative(destination)?;
     let output = root.join(destination);
@@ -647,7 +878,7 @@ pub fn restore_into(
         ),
         s3: store.s3.clone(),
     };
-    restore(&output, &store, keys, paths, required)
+    restore(&output, &store, keys, paths, required, reserve)
 }
 
 #[derive(Serialize, Deserialize)]
