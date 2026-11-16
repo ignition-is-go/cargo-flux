@@ -578,7 +578,11 @@ fn failed_build_preserves_previous_compiler_provenance() {
     )
     .unwrap();
     fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-    cargo(root, &home, &["build"]);
+    let output = cargo(root, &home, &["build"]);
+    assert!(
+        output.stdout.is_empty(),
+        "default Cargo output should retain its human format"
+    );
     let recorded = fs::read(root.join("target/.flux-compiler-units.json")).unwrap();
     fs::write(root.join("src/main.rs"), "invalid rust\n").unwrap();
     let result = flux(

@@ -98,6 +98,7 @@ pub(in crate::storage) fn run(root: &Path, paths: &[PathBuf], args: &[String]) -
                         .flatten()
                 })
         });
+    let forward_json = format.is_some();
     if let Some(format) = format {
         ensure!(
             format.split(',').any(|part| part.starts_with("json")),
@@ -118,8 +119,23 @@ pub(in crate::storage) fn run(root: &Path, paths: &[PathBuf], args: &[String]) -
     let mut artifacts = Vec::new();
     let mut line = Vec::new();
     while output.read_until(b'\n', &mut line)? != 0 {
-        std::io::stdout().write_all(&line)?;
-        if let Ok(message) = serde_json::from_slice::<serde_json::Value>(&line)
+        let message = serde_json::from_slice::<serde_json::Value>(&line).ok();
+        let cargo_message = message
+            .as_ref()
+            .and_then(|message| message["reason"].as_str())
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "compiler-artifact"
+                        | "build-script-executed"
+                        | "build-finished"
+                        | "compiler-message"
+                )
+            });
+        if forward_json || !cargo_message {
+            std::io::stdout().write_all(&line)?;
+        }
+        if let Some(message) = message
             && message["reason"] == "compiler-artifact"
         {
             let artifact: Artifact = serde_json::from_value(message)?;
