@@ -137,6 +137,8 @@ pub(super) fn select(
                     file.try_lock()
                         .with_context(|| format!("Cargo profile is busy: {}", profile.display()))?;
                     locks.push(file);
+                    // Locked coordination files are transient and cannot be read on Windows.
+                    files.remove(&profile.join(name));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error.into()),

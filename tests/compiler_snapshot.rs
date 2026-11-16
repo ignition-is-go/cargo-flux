@@ -369,6 +369,12 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
             "--required",
         ],
     ));
+    for lock in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+        assert!(
+            !root.join("target/debug").join(lock).exists(),
+            "coordination locks must not be archived"
+        );
+    }
     for name in ["first", "second"] {
         let output = cargo(
             root,
