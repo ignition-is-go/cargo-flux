@@ -202,6 +202,7 @@ pub(super) fn select(
         }
     }
     let mut obsolete = BTreeSet::new();
+    let mut obsolete_versions = BTreeSet::new();
     let mut protected = BTreeSet::new();
     let mut protected_values = BTreeSet::new();
     for (id, unit) in &units {
@@ -217,6 +218,9 @@ pub(super) fn select(
             .get(&id.0.join(&id.1))
             .filter(|record| record.fingerprints == unit.values)
             .and_then(|record| sources.current_record(record));
+        if provenance == Some(false) {
+            obsolete_versions.insert(id.clone());
+        }
         if provenance == Some(false)
             || !unit.fingerprint
             || (!statuses.is_empty() && statuses.iter().all(|status| *status == Some(false)))
@@ -231,7 +235,7 @@ pub(super) fn select(
     loop {
         let before = protected_values.len();
         for (id, unit) in &units {
-            if !unit.values.is_disjoint(&protected_values) {
+            if !obsolete_versions.contains(id) && !unit.values.is_disjoint(&protected_values) {
                 protected.insert(id.clone());
                 protected_values.extend(unit.dependencies.iter().copied());
             }
@@ -240,7 +244,7 @@ pub(super) fn select(
             break;
         }
     }
-    obsolete.retain(|id| !protected.contains(id));
+    obsolete.retain(|id| obsolete_versions.contains(id) || !protected.contains(id));
     loop {
         let live_values = units
             .iter()

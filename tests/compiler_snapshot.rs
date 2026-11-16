@@ -732,3 +732,104 @@ fn local_patch_version_changes_discard_previous_compiler_units() {
     }
     assert_eq!(counts, vec![2, 2, 2]);
 }
+
+#[test]
+fn unknown_vendor_units_do_not_protect_obsolete_recorded_versions() {
+    use sha2::{Digest, Sha256};
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::create_dir(root.join(".cargo")).unwrap();
+    fs::create_dir_all(root.join("patch/src")).unwrap();
+    fs::create_dir_all(root.join("vendor/vendor-parent/src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        "[source.crates-io]\nreplace-with='vendored'\n[source.vendored]\ndirectory='vendor'\n",
+    )
+    .unwrap();
+    fs::write(root.join("Cargo.toml"), "[package]\nname='vendor-consumer'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[dependencies]\nvendor-parent='1.0'\n[patch.crates-io]\npatched-local={path='patch'}\n").unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"{}\", vendor_parent::value()); }\n",
+    )
+    .unwrap();
+    let vendor = root.join("vendor/vendor-parent");
+    fs::write(vendor.join("Cargo.toml"), "[package]\nname='vendor-parent'\nversion='1.0.0'\nedition='2024'\n[dependencies]\npatched-local='0.1'\n").unwrap();
+    fs::write(
+        vendor.join("src/lib.rs"),
+        "pub fn value() -> u32 { patched_local::value() }\n",
+    )
+    .unwrap();
+    let checksums = ["Cargo.toml", "src/lib.rs"]
+        .into_iter()
+        .map(|path| {
+            (
+                path,
+                format!("{:x}", Sha256::digest(fs::read(vendor.join(path)).unwrap())),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    fs::write(
+        vendor.join(".cargo-checksum.json"),
+        serde_json::to_vec(&serde_json::json!({"files":checksums,"package":null})).unwrap(),
+    )
+    .unwrap();
+    let mut counts = Vec::new();
+    for version in 1..=2 {
+        fs::write(root.join("patch/Cargo.toml"), format!("[package]\nname='patched-local'\nversion='0.1.{version}'\nedition='2024'\n[workspace]\n")).unwrap();
+        fs::write(
+            root.join("patch/src/lib.rs"),
+            format!("pub fn value() -> u32 {{ {version} }}\n"),
+        )
+        .unwrap();
+        cargo(
+            root,
+            &home,
+            &["build", "--offline", "--message-format=json"],
+        );
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "save",
+                "--compiler",
+                "--key",
+                "vendor",
+                "--path",
+                "target",
+            ],
+        ));
+        fs::remove_dir_all(root.join("target")).unwrap();
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "restore",
+                "--key",
+                "vendor",
+                "--path",
+                "target",
+                "--required",
+            ],
+        ));
+        counts.push(fingerprint_count(&root.join("target")));
+        let output = cargo(
+            root,
+            &home,
+            &["build", "--offline", "--message-format=json"],
+        );
+        assert!(
+            artifacts(&output)
+                .iter()
+                .all(|artifact| artifact["fresh"] == true)
+        );
+        let output = cargo(root, &home, &["run", "--offline", "--quiet"]);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            version.to_string()
+        );
+    }
+    assert_eq!(counts, vec![3, 3]);
+}

@@ -444,7 +444,7 @@ Compiler snapshots saved with `--compiler` select Cargo units using declared
 package sources, enabled features and fingerprint dependency relationships.
 Recorded local units from obsolete package versions and incremental sessions
 are excluded from the archive. Existing cached units with unknown provenance
-and their dependencies are retained conservatively.
+are retained when their dependency graph remains usable.
 Files in the producer's target directory remain available after saving. The
 caller can remove that directory after a successful upload.
 
