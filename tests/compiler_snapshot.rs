@@ -84,6 +84,7 @@ fn compiler_snapshots_discard_obsolete_graphs_and_keep_both_feature_variants_war
     )
     .unwrap();
     success(Command::new("git").current_dir(&dependency).args(["init"]));
+    let compatibility_binary = std::env::var_os("CARGO_FLUX_COMPAT_BIN");
     let mut previous = Vec::new();
     let mut snapshot_counts = Vec::new();
     let mut previous_key = None;
@@ -147,38 +148,60 @@ fn compiler_snapshots_discard_obsolete_graphs_and_keep_both_feature_variants_war
             &["storage", "cargo-key", "--scope", "fixture"],
         ))
         .stdout;
+        if let Some(binary) = &compatibility_binary {
+            let old_key = success(Command::new(binary).arg("--root").arg(&root).args([
+                "storage",
+                "cargo-key",
+                "--scope",
+                "fixture",
+            ]))
+            .stdout;
+            assert_eq!(
+                old_key, key,
+                "existing compiler cache keys must remain identical"
+            );
+        }
         if let Some(previous) = previous_key {
             assert_eq!(previous, key);
         }
         previous_key = Some(key);
+        let mut save = match (&compatibility_binary, version) {
+            (Some(binary), 1) => {
+                let mut command = Command::new(binary);
+                command.arg("--root").arg(&root);
+                command
+            }
+            _ => {
+                let mut command = flux(&root, &[]);
+                command.arg("storage").arg("save").arg("--compiler");
+                command
+            }
+        };
+        if compatibility_binary.is_some() && version == 1 {
+            save.args(["storage", "save"]);
+        }
         success(
-            flux(
-                &root,
-                &[
-                    "storage",
-                    "save",
-                    "--compiler",
-                    "--key",
-                    "compiler",
-                    "--path",
-                    "target",
-                ],
-            )
-            .env("CARGO_HOME", &home),
+            save.args(["--key", "compiler", "--path", "target"])
+                .env("CARGO_HOME", &home),
         );
         fs::remove_dir_all(root.join("target")).unwrap();
-        success(&mut flux(
-            &root,
-            &[
-                "storage",
-                "restore",
-                "--key",
-                "compiler",
-                "--path",
-                "target",
-                "--required",
-            ],
-        ));
+        let mut restore = match (&compatibility_binary, version) {
+            (Some(binary), 2) => {
+                let mut command = Command::new(binary);
+                command.arg("--root").arg(&root);
+                command
+            }
+            _ => flux(&root, &[]),
+        };
+        success(restore.args([
+            "storage",
+            "restore",
+            "--key",
+            "compiler",
+            "--path",
+            "target",
+            "--required",
+        ]));
         for artifact in &current {
             for file in artifact["filenames"].as_array().unwrap() {
                 assert!(Path::new(file.as_str().unwrap()).exists());
@@ -364,30 +387,4 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
         );
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "42");
     }
-}
-
-#[test]
-fn compiler_key_partitions_manifest_configuration_without_writing_a_lockfile() {
-    let temporary = tempfile::tempdir().unwrap();
-    let root = temporary.path();
-    fs::write(root.join("flux.toml"), "").unwrap();
-    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
-    let manifest = "[package]\nname='key-fixture'\nversion='0.1.0'\nedition='2024'\n[[bin]]\nname='key-fixture'\npath='main.rs'\n[workspace]\n";
-    fs::write(root.join("Cargo.toml"), manifest).unwrap();
-    let args = ["storage", "cargo-key", "--scope", "fixture"];
-    let before = success(&mut flux(root, &args)).stdout;
-    assert!(!root.join("Cargo.lock").exists());
-    fs::write(
-        root.join("main.rs"),
-        "fn main() { println!(\"changed\"); }\n",
-    )
-    .unwrap();
-    assert_eq!(before, success(&mut flux(root, &args)).stdout);
-    fs::write(
-        root.join("Cargo.toml"),
-        format!("{manifest}\n[profile.dev]\nopt-level=1\n"),
-    )
-    .unwrap();
-    assert_ne!(before, success(&mut flux(root, &args)).stdout);
-    assert!(!root.join("Cargo.lock").exists());
 }

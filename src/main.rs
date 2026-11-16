@@ -38,7 +38,6 @@ fn main() -> Result<()> {
                 scope,
                 selection,
                 affected,
-                manifests,
             } => {
                 let packages = if let Some(selection) = selection {
                     let graph = WorkspaceGraph::new(discover_workspace(&root)?.packages);
@@ -61,10 +60,7 @@ fn main() -> Result<()> {
                 } else {
                     Vec::new()
                 };
-                println!(
-                    "{}",
-                    storage::cargo_key(&root, scope, &packages, manifests)?
-                );
+                println!("{}", storage::cargo_key(&root, scope, &packages)?);
             }
             cli::StorageCommand::Sources {
                 path,

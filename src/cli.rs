@@ -122,9 +122,6 @@ pub enum ReportCommand {
 pub enum StorageCommand {
     /// Print compiler/flags/scope compatibility without keying on source hashes.
     CargoKey {
-        /// Workspace manifests whose local package identities belong to this snapshot.
-        #[arg(long = "manifest-path")]
-        manifests: Vec<PathBuf>,
         #[arg(long)]
         scope: String,
         #[arg(long)]

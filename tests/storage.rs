@@ -287,7 +287,7 @@ fn source_timestamp_restore_preserves_unchanged_sources_and_invalidates_older_ch
 }
 
 #[test]
-fn compiler_compatibility_preserves_dependency_reuse_and_partitions_local_versions() {
+fn compiler_compatibility_ignores_source_changes_but_partitions_flags_and_purpose() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("flux.toml"), "").unwrap();
     let key = |scope: &str, flags: &str| {
@@ -305,19 +305,9 @@ fn compiler_compatibility_preserves_dependency_reuse_and_partitions_local_versio
         );
         output.stdout
     };
-    let lock = |local: &str, dependency: &str| {
-        format!(
-            "version=4\n[[package]]\nname='local'\nversion='{local}'\n\
-         [[package]]\nname='external'\nversion='{dependency}'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n"
-        )
-    };
-    fs::write(root.path().join("Cargo.lock"), lock("0.1.0", "1.0.0")).unwrap();
     let before = key("validation", "");
-    fs::write(root.path().join("source.rs"), "changed source identity").unwrap();
-    fs::write(root.path().join("Cargo.lock"), lock("0.1.0", "1.0.1")).unwrap();
+    fs::write(root.path().join("Cargo.lock"), "changed source identity").unwrap();
     assert_eq!(before, key("validation", ""));
     assert_ne!(before, key("release", ""));
     assert_ne!(before, key("validation", "-C opt-level=1"));
-    fs::write(root.path().join("Cargo.lock"), lock("0.2.0", "1.0.1")).unwrap();
-    assert_ne!(before, key("validation", ""));
 }

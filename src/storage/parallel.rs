@@ -3,8 +3,7 @@ use super::*;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom};
 use std::sync::Mutex;
 
-pub(super) const MAGIC: &[u8; 8] = b"FLUXSH03";
-pub(super) const LEGACY_MAGIC: &[u8; 8] = b"FLUXSH02";
+pub(super) const MAGIC: &[u8; 8] = b"FLUXSH02";
 const MAX_HEADER: u64 = 64 * 1024 * 1024;
 const MAX_SHARDS: usize = 8;
 
@@ -13,8 +12,6 @@ struct Index {
     manifest: Manifest,
     directories: BTreeMap<PathBuf, u32>,
     shards: Vec<Shard>,
-    #[serde(default)]
-    hardlinks: BTreeMap<PathBuf, PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,16 +44,12 @@ pub(super) fn save(
     output: &mut fs::File,
     manifest: Manifest,
     compiler: bool,
-    hardlinks: BTreeMap<PathBuf, PathBuf>,
 ) -> Result<()> {
     let workers = hash_workers(manifest.files.len()).clamp(1, MAX_SHARDS);
     let mut groups = vec![BTreeSet::new(); workers];
     let mut weights = vec![0_u64; workers];
     let mut files = Vec::new();
     for path in manifest.files.keys() {
-        if hardlinks.contains_key(path) {
-            continue;
-        }
         let metadata = fs::metadata(root.join(path))?;
         // Sparse linker files should be balanced by bytes actually archived.
         #[cfg(unix)]
@@ -90,11 +83,7 @@ pub(super) fn save(
         }
         dirs.retain(|path, _| retained.contains(path));
     }
-    let magic = if manifest.version == 3 {
-        MAGIC
-    } else {
-        LEGACY_MAGIC
-    };
+    let magic = MAGIC;
     output.write_all(magic)?;
     eprintln!(
         "storage creating {} archive shards concurrently",
@@ -146,7 +135,6 @@ pub(super) fn save(
         manifest,
         directories: dirs,
         shards,
-        hardlinks,
     };
     let header = serde_json::to_vec(&index)?;
     ensure!(header.len() as u64 <= MAX_HEADER, "oversized storage index");
@@ -224,7 +212,7 @@ pub(super) fn unpack(
     let mut footer = [0; 16];
     input.read_exact(&mut footer)?;
     ensure!(
-        (&prefix == MAGIC || &prefix == LEGACY_MAGIC) && prefix == footer[8..],
+        &prefix == MAGIC && prefix == footer[8..],
         "invalid storage footer"
     );
     let length = u64::from_le_bytes(footer[..8].try_into()?);
@@ -243,12 +231,7 @@ pub(super) fn unpack(
         "storage index length mismatch"
     );
     ensure!(
-        ((index.manifest.version == 3 && &prefix == MAGIC)
-            || (index.manifest.version == 2
-                && &prefix == LEGACY_MAGIC
-                && index.hardlinks.is_empty()))
-            && index.manifest.key == key
-            && index.manifest.paths == paths,
+        index.manifest.version == 2 && index.manifest.key == key && index.manifest.paths == paths,
         "storage identity or paths mismatch"
     );
     ensure!(
@@ -281,18 +264,6 @@ pub(super) fn unpack(
     }
     ensure!(end == index_start, "storage extent length mismatch");
     let canonical = seen.clone();
-    for (alias, target) in &index.hardlinks {
-        relative(alias)?;
-        ensure!(
-            canonical.contains(target),
-            "storage hardlink target is not a regular entry"
-        );
-        ensure!(seen.insert(alias.clone()), "duplicate storage hardlink");
-        ensure!(
-            index.manifest.files.get(alias) == index.manifest.files.get(target),
-            "storage hardlink metadata mismatch"
-        );
-    }
     ensure!(
         seen == index.manifest.files.keys().cloned().collect(),
         "storage file list mismatch"
@@ -394,9 +365,6 @@ pub(super) fn unpack(
         ensure!(extracted == shard.files, "incomplete storage shard");
         Ok(())
     })?;
-    for (alias, target) in &index.hardlinks {
-        fs::hard_link(stage.join(target), stage.join(alias))?;
-    }
     phase("extract", started);
     verify(stage, &index.manifest, paths)?;
     #[cfg(unix)]
@@ -460,7 +428,6 @@ mod tests {
             "directory-collision",
             "version",
             "footprint",
-            "hardlink",
         ] {
             let mut index: Index = serde_json::from_slice(&original[header_start..footer])?;
             match failure {
@@ -499,9 +466,6 @@ mod tests {
                         .as_mut()
                         .unwrap()
                         .length += 1
-                }
-                "hardlink" => {
-                    index.hardlinks.insert("dist/alias".into(), "dist/0".into());
                 }
                 "corruption" => (),
                 _ => unreachable!(),

@@ -22,6 +22,15 @@ jobs:
           linux-dependencies: build
           cache-shared-key: check-v1
       - run: cargo test
+      - name: Install the published compatibility baseline
+        id: compatibility
+        uses: ./
+        with:
+          version: '0.11.8'
+      - name: Verify warm compiler caches with the published binary
+        env:
+          CARGO_FLUX_COMPAT_BIN: ${{ steps.compatibility.outputs.path }}
+        run: cargo test --locked --test compiler_snapshot
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0
         if: always()
@@ -40,7 +49,14 @@ jobs:
           windows-sparse-index: true
       - name: Build the Windows release binary
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Install the published Windows compatibility baseline
+        id: compatibility
+        uses: ./
+        with:
+          version: '0.11.8'
       - name: Test Windows storage timestamp restoration
+        env:
+          CARGO_FLUX_COMPAT_BIN: ${{ steps.compatibility.outputs.path }}
         run: |
           cargo test --release --locked --target x86_64-pc-windows-msvc --bin cargo-flux storage::tests::timestamp_update_preserves_read_only_contents
           cargo test --release --locked --target x86_64-pc-windows-msvc --test storage artifact_cli_works_without_a_language_workspace

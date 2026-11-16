@@ -436,19 +436,18 @@ package sources, enabled features and fingerprint dependency relationships.
 Obsolete units and incremental sessions are excluded from the archive. Units
 with unknown source ownership and their dependencies are retained conservatively.
 Files in the producer's target directory remain available after saving. The
-caller can remove that directory after a successful upload. Actual hard links
-are stored once and recreated during restore.
+caller can remove that directory after a successful upload.
 
 Declare each independent workspace sharing a target directory with repeated
-`--manifest-path PATH` on both `storage cargo-key` and `storage save --compiler`.
+`--manifest-path PATH` on `storage save --compiler`.
 The default manifest is `Cargo.toml`. Selection uses offline Cargo metadata and
 the declared workspaces' lockfiles. Existing Cargo profile locks are held while
 the snapshot is prepared. Complete builds before saving.
 
-Compiler snapshots use `objects/v3/`. Generic artifact saves use `objects/v2/`.
-Restore tries v3, v2 and legacy `objects/` for each key. Older Flux versions can
-continue reading generic artifact snapshots. They cannot read v3 compiler
-snapshots.
+Compiler snapshots and generic artifacts use the existing `objects/v2/` format.
+Published v0.11.8 readers can restore compiler snapshots written with pruning.
+Restore also reads legacy `objects/` snapshots. Existing compatibility keys
+continue to address warm snapshots across this update.
 
 Restore checks free space before downloading the compressed archive and before
 extracting its expanded contents. `--reserve-bytes N` preserves additional free
@@ -477,9 +476,8 @@ to transfer that contract between jobs.
 `storage cargo-key --scope validation --selection product` prints a key based on
 compiler identity, platform, flags, source location and selected packages. Add
 `--affected BASE` for a narrower package pool; an empty selection prints no key.
-Source edits and external dependency version or revision updates reuse the key.
-Local package identities, manifest build configuration and Cargo configuration
-partition compiler snapshots. Cargo makes the final freshness decision. `storage sources` records
+Source/manifest/lockfile content changes deliberately do not orphan compiler
+snapshots. Cargo makes the final freshness decision. `storage sources` records
 tracked source timestamps alongside the snapshot; `storage sources --restore`
 restores timestamps only for byte-identical files and touches changed content.
 Use repeated `--include PATH` for watched, ignored inputs.

@@ -8,7 +8,6 @@ struct Metadata {
 
 #[derive(Deserialize)]
 struct Package {
-    id: String,
     name: String,
     manifest_path: PathBuf,
     targets: Vec<Target>,
@@ -43,12 +42,6 @@ struct Owner {
     features: BTreeSet<String>,
 }
 
-#[derive(Default, Serialize)]
-pub(in crate::storage) struct Identity {
-    configurations: BTreeMap<PathBuf, toml::Value>,
-    packages: BTreeMap<PathBuf, String>,
-}
-
 pub(super) struct Sources {
     pub(super) roots: BTreeSet<PathBuf>,
     targets: BTreeMap<PathBuf, Vec<Owner>>,
@@ -57,7 +50,6 @@ pub(super) struct Sources {
     registry: BTreeSet<(String, String)>,
     git: BTreeSet<(String, String)>,
     cargo_home: Option<PathBuf>,
-    pub(super) identity: Identity,
 }
 
 pub(super) fn manifests(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -91,7 +83,6 @@ impl Sources {
             registry: BTreeSet::new(),
             git: BTreeSet::new(),
             cargo_home,
-            identity: Identity::default(),
         };
         let mut pending = manifests(paths)
             .into_iter()
@@ -146,17 +137,10 @@ impl Sources {
             }
             let consuming_root = consuming_root.unwrap_or(metadata.workspace_root.clone());
             sources.roots.insert(consuming_root.clone());
-            sources.record_configuration(&metadata.workspace_root.join("Cargo.toml"))?;
             for package in metadata.packages {
                 if !declared && package.manifest_path != manifest {
                     continue;
                 }
-                sources.record_configuration(&package.manifest_path)?;
-                // Cargo package IDs carry local versions even when Cargo.lock is not written yet.
-                sources
-                    .identity
-                    .packages
-                    .insert(package.manifest_path.clone(), package.id);
                 pending.extend(
                     package
                         .dependencies
@@ -186,32 +170,6 @@ impl Sources {
             }
         }
         Ok(sources)
-    }
-
-    fn record_configuration(&mut self, manifest: &Path) -> Result<()> {
-        if self.identity.configurations.contains_key(manifest) {
-            return Ok(());
-        }
-        let mut value: toml::Value = toml::from_str(&fs::read_to_string(manifest)?)?;
-        normalize_dependencies(&mut value);
-        self.identity
-            .configurations
-            .insert(manifest.to_owned(), value);
-        if let Some(directory) = manifest.parent() {
-            for name in [".cargo/config", ".cargo/config.toml"] {
-                let path = directory.join(name);
-                match fs::read_to_string(&path) {
-                    Ok(text) => {
-                        self.identity
-                            .configurations
-                            .insert(path, toml::from_str(&text)?);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn roots_for(&self, package: Option<&str>) -> &BTreeSet<PathBuf> {
@@ -277,41 +235,5 @@ impl Sources {
             }
         }
         Ok(None)
-    }
-}
-
-fn dependency_table(value: &mut toml::Value) {
-    let Some(dependencies) = value.as_table_mut() else {
-        return;
-    };
-    for (_, dependency) in dependencies.iter_mut() {
-        if dependency.is_str() {
-            *dependency = toml::Value::String("*".into());
-        } else if let Some(table) = dependency.as_table_mut() {
-            for field in ["version", "rev"] {
-                table.remove(field);
-            }
-        }
-    }
-}
-
-fn normalize_dependencies(value: &mut toml::Value) {
-    for name in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(dependencies) = value.get_mut(name) {
-            dependency_table(dependencies);
-        }
-    }
-    if let Some(workspace) = value.get_mut("workspace") {
-        normalize_dependencies(workspace);
-    }
-    if let Some(targets) = value.get_mut("target").and_then(toml::Value::as_table_mut) {
-        for (_, target) in targets.iter_mut() {
-            normalize_dependencies(target);
-        }
-    }
-    if let Some(patches) = value.get_mut("patch").and_then(toml::Value::as_table_mut) {
-        for (_, dependencies) in patches.iter_mut() {
-            dependency_table(dependencies);
-        }
     }
 }

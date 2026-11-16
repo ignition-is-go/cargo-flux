@@ -180,20 +180,6 @@ fn validate_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn hardlinks(root: &Path, files: &BTreeSet<PathBuf>) -> Result<BTreeMap<PathBuf, PathBuf>> {
-    let mut identities = std::collections::HashMap::<file_id::FileId, PathBuf>::new();
-    let mut aliases = BTreeMap::new();
-    for path in files {
-        let id = file_id::get_file_id(root.join(path))?;
-        if let Some(canonical) = identities.get(&id) {
-            aliases.insert(path.clone(), canonical.clone());
-        } else {
-            identities.insert(id, path.clone());
-        }
-    }
-    Ok(aliases)
-}
-
 fn object_key(key: &str) -> Result<String> {
     ensure!(!key.trim().is_empty(), "empty storage key");
     Ok(format!("objects/v2/{:x}", Sha256::digest(key.as_bytes())))
@@ -205,14 +191,14 @@ fn transfer(
     key: &str,
     upload: bool,
     file: &Path,
-    version: u8,
+    legacy: bool,
     reserve: u64,
 ) -> Result<bool> {
     let key = object_key(key)?;
-    let key = match version {
-        1 => key.replacen("objects/v2/", "objects/", 1),
-        3 => key.replacen("objects/v2/", "objects/v3/", 1),
-        _ => key,
+    let key = if legacy {
+        key.replacen("objects/v2/", "objects/", 1)
+    } else {
+        key
     };
     if let Some(config) = &store.s3 {
         return crate::cache::s3::transfer(
@@ -282,23 +268,10 @@ pub fn save(
         files.len(),
         hash_workers(files.len())
     );
-    let hardlinks = if compiler {
-        hardlinks(root, &files)?
-    } else {
-        BTreeMap::new()
-    };
-    let canonical = files
-        .iter()
-        .filter(|path| !hardlinks.contains_key(*path))
-        .cloned()
-        .collect();
-    let mut hashes = map_files(&canonical, |path| file_state(&root.join(path)))?;
-    for (alias, canonical) in &hardlinks {
-        hashes.insert(alias.clone(), hashes[canonical].clone());
-    }
+    let hashes = map_files(&files, |path| file_state(&root.join(path)))?;
     phase("hash", started);
     let manifest = Manifest {
-        version: if compiler { 3 } else { 2 },
+        version: 2,
         key: key.into(),
         paths: paths.to_vec(),
         files: hashes.clone(),
@@ -306,13 +279,7 @@ pub fn save(
     let mut temporary = tempfile::NamedTempFile::new()?;
     let started = std::time::Instant::now();
     eprintln!("storage compressing archive");
-    parallel::save(
-        root,
-        temporary.as_file_mut(),
-        manifest,
-        compiler,
-        hardlinks.clone(),
-    )?;
+    parallel::save(root, temporary.as_file_mut(), manifest, compiler)?;
     temporary.flush()?;
     phase("compress", started);
     let started = std::time::Instant::now();
@@ -327,13 +294,7 @@ pub fn save(
         current == original_files,
         "storage files changed during upload preparation"
     );
-    if compiler {
-        ensure!(
-            self::hardlinks(root, &files)? == hardlinks,
-            "storage file links changed during upload preparation"
-        );
-    }
-    map_files(&canonical, |path| {
+    map_files(&files, |path| {
         ensure!(
             file_state(&root.join(path))? == hashes[path],
             "storage contents changed during upload preparation"
@@ -344,15 +305,7 @@ pub fn save(
     let bytes = temporary.as_file().metadata()?.len();
     let started = std::time::Instant::now();
     eprintln!("storage uploading {bytes} compressed bytes");
-    transfer(
-        root,
-        store,
-        key,
-        true,
-        temporary.path(),
-        if compiler { 3 } else { 2 },
-        0,
-    )?;
+    transfer(root, store, key, true, temporary.path(), false, 0)?;
     phase("upload", started);
     Ok(())
 }
@@ -360,7 +313,7 @@ pub fn save(
 fn unpack(archive: &Path, stage: &Path, key: &str, paths: &[PathBuf], reserve: u64) -> Result<()> {
     let mut prefix = [0; 8];
     fs::File::open(archive)?.read_exact(&mut prefix)?;
-    if &prefix == parallel::MAGIC || &prefix == parallel::LEGACY_MAGIC {
+    if &prefix == parallel::MAGIC {
         return parallel::unpack(archive, stage, key, paths, reserve);
     }
     space::check_legacy(archive, stage, reserve)?;
@@ -451,8 +404,8 @@ pub fn restore(
             let started = std::time::Instant::now();
             eprintln!("storage downloading archive");
             let mut found = false;
-            for version in [3, 2, 1] {
-                if transfer(root, store, key, false, temporary.path(), version, reserve)? {
+            for legacy in [false, true] {
+                if transfer(root, store, key, false, temporary.path(), legacy, reserve)? {
                     found = true;
                     break;
                 }
@@ -645,55 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn hardlinks_survive_without_linking_independent_copies() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[package]\nname='link-fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n[workspace]\n",
-        )?;
-        fs::write(
-            root.path().join("Cargo.lock"),
-            "version=4\n[[package]]\nname='link-fixture'\nversion='0.1.0'\n",
-        )?;
-        fs::write(root.path().join("lib.rs"), "")?;
-        fs::create_dir(root.path().join("dist"))?;
-        let original = root.path().join("dist/original");
-        fs::write(&original, b"same contents")?;
-        fs::hard_link(&original, root.path().join("dist/alias"))?;
-        fs::copy(&original, root.path().join("dist/independent"))?;
-        save(
-            root.path(),
-            &Store::default(),
-            "links",
-            &["dist".into()],
-            true,
-            &[],
-        )?;
-        fs::remove_dir_all(root.path().join("dist"))?;
-        restore(
-            root.path(),
-            &Store::default(),
-            &["links".into()],
-            &["dist".into()],
-            true,
-            0,
-        )?;
-        let id = file_id::get_file_id(&original)?;
-        assert_eq!(id, file_id::get_file_id(root.path().join("dist/alias"))?);
-        assert_ne!(
-            id,
-            file_id::get_file_id(root.path().join("dist/independent"))?
-        );
-        fs::write(root.path().join("dist/alias"), b"changed")?;
-        assert_eq!(fs::read(&original)?, b"changed");
-        assert_eq!(
-            fs::read(root.path().join("dist/independent"))?,
-            b"same contents"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn compressed_archive_fits_but_expanded_snapshot_is_skipped_before_writing_outputs()
     -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -787,12 +691,7 @@ mod tests {
 
 /// Source contents deliberately do not enter compiler compatibility. Cargo's
 /// fingerprints own source freshness, including manifests and dependency locks.
-pub fn cargo_key(
-    root: &Path,
-    scope: &str,
-    packages: &[String],
-    manifests: &[PathBuf],
-) -> Result<String> {
+pub fn cargo_key(root: &Path, scope: &str, packages: &[String]) -> Result<String> {
     ensure!(
         !scope.is_empty() && !scope.contains(['\n', '\r']),
         "invalid Cargo cache scope"
@@ -806,9 +705,6 @@ pub fn cargo_key(
             matches!(
                 name.as_str(),
                 "RUSTFLAGS"
-                    | "CARGO_HOME"
-                    | "HOME"
-                    | "USERPROFILE"
                     | "RUSTDOCFLAGS"
                     | "CARGO_ENCODED_RUSTFLAGS"
                     | "CARGO_BUILD_TARGET"
@@ -824,7 +720,6 @@ pub fn cargo_key(
         })
         .collect::<BTreeMap<_, _>>();
     let identity = serde_json::to_vec(&(
-        "compiler-snapshot-v2",
         std::env::consts::OS,
         std::env::consts::ARCH,
         root,
@@ -832,8 +727,6 @@ pub fn cargo_key(
         packages,
         output.stdout,
         flags,
-        compiler::local_packages(root, manifests)?,
-        compiler::configuration(root, manifests)?,
     ))?;
     Ok(format!("cargo/{:x}", Sha256::digest(identity)))
 }
