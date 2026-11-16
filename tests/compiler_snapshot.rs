@@ -54,6 +54,21 @@ fn build(root: &Path, home: &Path, feature: bool, fresh: bool) -> Vec<Value> {
     messages
 }
 
+fn fingerprint_count(path: &Path) -> usize {
+    if path.file_name().is_some_and(|name| name == "fingerprint") {
+        return 1;
+    }
+    let entries = fs::read_dir(path).unwrap();
+    if path.file_name().is_some_and(|name| name == ".fingerprint") {
+        return entries.count();
+    }
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .map(|path| fingerprint_count(&path))
+        .sum()
+}
+
 #[test]
 fn compiler_snapshots_discard_obsolete_graphs_and_keep_both_feature_variants_warm() {
     let temporary = tempfile::Builder::new()
@@ -221,11 +236,7 @@ fn compiler_snapshots_discard_obsolete_graphs_and_keep_both_feature_variants_war
             .collect();
         build(&root, &home, false, true);
         build(&root, &home, true, true);
-        snapshot_counts.push(
-            fs::read_dir(root.join("target/debug/.fingerprint"))
-                .unwrap()
-                .count(),
-        );
+        snapshot_counts.push(fingerprint_count(&root.join("target")));
         let output = cargo(&root, &home, &["run", "--quiet"]);
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),

@@ -35,6 +35,7 @@ tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
 futures-util = "0.3"
 fs2 = "0.4"
 file-id = "0.2"
+dunce = "1"
 zstd = { version = "0.13", features = ["zstdmt"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]

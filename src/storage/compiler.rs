@@ -53,6 +53,41 @@ fn source_path(workspace: &Path, dep_info: &str) -> Option<PathBuf> {
     Some(path.canonicalize().unwrap_or(path))
 }
 
+/// Cargo uses both `.fingerprint/package-hash` and `build/package/hash/fingerprint`.
+fn fingerprint_location(path: &Path) -> Option<(PathBuf, String, String)> {
+    let directory = path.parent()?;
+    if directory.file_name()? == "fingerprint" {
+        let unit = directory.parent()?;
+        let package = unit.parent()?;
+        let build = package.parent()?;
+        if build.file_name()? != "build" {
+            return None;
+        }
+        let hash = unit.file_name()?.to_str()?;
+        if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        return Some((
+            build.parent()?.to_owned(),
+            package.file_name()?.to_str()?.to_owned(),
+            hash.to_owned(),
+        ));
+    }
+    let fingerprints = directory.parent()?;
+    if fingerprints.file_name()? != ".fingerprint" {
+        return None;
+    }
+    let (package, hash) = directory.file_name()?.to_str()?.rsplit_once('-')?;
+    if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        fingerprints.parent()?.to_owned(),
+        package.to_owned(),
+        hash.to_owned(),
+    ))
+}
+
 /// Identify one Cargo unit in a declared profile, including nested debug bundles.
 fn unit_id(path: &Path, profiles: &BTreeSet<PathBuf>) -> Option<(PathBuf, String)> {
     for profile in profiles {
@@ -71,6 +106,12 @@ fn unit_id(path: &Path, profiles: &BTreeSet<PathBuf>) -> Option<(PathBuf, String
         if let Some(hash) = artifact_hash(name) {
             return Some((profile.clone(), hash.to_owned()));
         }
+        if category == "build" {
+            let hash = components.next()?.as_os_str().to_str()?;
+            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Some((profile.clone(), hash.to_owned()));
+            }
+        }
     }
     None
 }
@@ -83,13 +124,8 @@ pub(super) fn select(
     let sources = sources::Sources::load(root, manifests)?;
     let mut profiles = BTreeSet::new();
     for path in files.iter() {
-        for ancestor in path.ancestors() {
-            if ancestor
-                .file_name()
-                .is_some_and(|name| name == ".fingerprint")
-            {
-                profiles.insert(ancestor.parent().context("Cargo profile")?.to_owned());
-            }
+        if let Some((profile, _, _)) = fingerprint_location(path) {
+            profiles.insert(profile);
         }
     }
     let mut locks = Vec::new();
@@ -115,22 +151,15 @@ pub(super) fn select(
         let unit = units.entry(id).or_default();
         unit.files.insert(path.clone());
         if path
-            .components()
-            .any(|component| component.as_os_str() == ".fingerprint")
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "json")
+            .extension()
+            .is_some_and(|extension| extension == "json")
+            && let Some((_, package, _)) = fingerprint_location(path)
         {
             let fingerprint: Fingerprint =
                 serde_json::from_reader(fs::File::open(root.join(path))?)
                     .with_context(|| format!("invalid Cargo fingerprint: {}", path.display()))?;
             unit.fingerprint = true;
-            unit.package = path
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.rsplit_once('-'))
-                .map(|(package, _)| package.to_owned());
+            unit.package = Some(package);
             unit.dependencies
                 .extend(fingerprint.deps.into_iter().map(|dependency| dependency.3));
             if let Some(features) = fingerprint.features.filter(|features| !features.is_empty()) {

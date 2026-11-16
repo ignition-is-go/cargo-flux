@@ -90,7 +90,7 @@ impl Sources {
             .collect::<Vec<_>>();
         let mut visited = BTreeSet::new();
         while let Some((manifest, consuming_root)) = pending.pop() {
-            let manifest = manifest.canonicalize()?;
+            let manifest = dunce::canonicalize(manifest)?;
             if !visited.insert((manifest.clone(), consuming_root.clone())) {
                 continue;
             }
@@ -138,7 +138,7 @@ impl Sources {
             let consuming_root = consuming_root.unwrap_or(metadata.workspace_root.clone());
             sources.roots.insert(consuming_root.clone());
             for package in metadata.packages {
-                if !declared && package.manifest_path != manifest {
+                if !declared && dunce::canonicalize(&package.manifest_path)? != manifest {
                     continue;
                 }
                 pending.extend(
