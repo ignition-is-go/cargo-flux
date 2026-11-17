@@ -199,7 +199,7 @@ fn non_cargo_snapshot_policy_selects_files_without_changing_producer() -> Result
     std::fs::write(source.path().join("dist/obsolete"), "old")?;
     let policy = snapshot_policy_with(&plugins, "fixture", &[])?;
     crate::storage::save(
-        source.path(),
+        &source.path().canonicalize()?,
         &store,
         "selected",
         &["dist".into()],
@@ -209,7 +209,7 @@ fn non_cargo_snapshot_policy_selects_files_without_changing_producer() -> Result
     assert!(source.path().join("dist/obsolete").exists());
     assert!(source.path().join("dist/empty").exists());
     crate::storage::restore(
-        destination.path(),
+        &destination.path().canonicalize()?,
         &store,
         &["selected".into()],
         &["dist".into()],
@@ -234,7 +234,7 @@ fn snapshot_policy_cannot_add_undeclared_files() -> Result<()> {
     std::fs::write(source.path().join("outside.txt"), "private")?;
     let policy = snapshot_policy_with(&plugins, "fixture", &["escape".into()])?;
     let error = crate::storage::save(
-        source.path(),
+        &source.path().canonicalize()?,
         &Default::default(),
         "escape",
         &["dist".into()],
