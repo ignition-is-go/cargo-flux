@@ -1,16 +1,18 @@
 mod cache;
 mod channels;
 mod cli;
+mod execution;
 mod git;
 mod graph;
 mod manifest;
 mod plugins;
+mod snapshot;
 mod stamp;
 mod storage;
 mod tasks;
 mod version;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command, ReportCommand};
 use graph::WorkspaceGraph;
@@ -21,6 +23,7 @@ use std::io::{IsTerminal, Write};
 use tasks::{ResolvedRootTask, TaskCommand, TaskRegistry};
 
 fn main() -> Result<()> {
+    plugins::dispatch_entrypoint()?;
     let cli = Cli::parse_from(normalize_args(std::env::args_os()));
     if let Command::Report { command } = &cli.command {
         match command {
@@ -38,7 +41,17 @@ fn main() -> Result<()> {
                 scope,
                 selection,
                 affected,
+            }
+            | cli::StorageCommand::Key {
+                scope,
+                selection,
+                affected,
+                ..
             } => {
+                let plugin = match command {
+                    cli::StorageCommand::Key { plugin, .. } => plugin.as_str(),
+                    _ => "cargo", // Preserve the published cargo-key spelling.
+                };
                 let packages = if let Some(selection) = selection {
                     let graph = WorkspaceGraph::new(discover_workspace(&root)?.packages);
                     let selected = calculate_affected_scope(
@@ -60,7 +73,7 @@ fn main() -> Result<()> {
                 } else {
                     Vec::new()
                 };
-                println!("{}", storage::cargo_key(&root, scope, &packages)?);
+                println!("{}", plugins::cache_key(plugin, &root, scope, &packages)?);
             }
             cli::StorageCommand::Sources {
                 path,
@@ -71,13 +84,32 @@ fn main() -> Result<()> {
                 key,
                 paths,
                 artifact,
+                plugin,
+                plugin_options,
+                snapshot,
             } => {
-                let paths = artifact
+                let contract = snapshot
                     .as_deref()
-                    .map(|name| tasks.artifact_paths(name))
-                    .transpose()?
-                    .unwrap_or(paths);
-                storage::save(&root, tasks.cache_store(), key, paths)?;
+                    .map(|name| tasks.snapshot(name))
+                    .transpose()?;
+                let paths = if let Some(contract) = contract {
+                    &contract.paths
+                } else {
+                    artifact
+                        .as_deref()
+                        .map(|name| tasks.artifact_paths(name))
+                        .transpose()?
+                        .unwrap_or(paths)
+                };
+                let cli_options = snapshot::cli_options(plugin_options)?;
+                let (plugin, options) = match contract {
+                    Some(contract) => (contract.plugin.as_deref(), &contract.options),
+                    None => (plugin.as_deref(), &cli_options),
+                };
+                let policy = plugin
+                    .map(|name| plugins::snapshot_policy(name, options))
+                    .transpose()?;
+                storage::save(&root, tasks.cache_store(), key, paths, policy.as_deref())?;
             }
             cli::StorageCommand::Restore {
                 keys,
@@ -85,12 +117,18 @@ fn main() -> Result<()> {
                 artifact,
                 destination,
                 required,
+                reserve_bytes,
+                snapshot,
             } => {
-                let paths = artifact
-                    .as_deref()
-                    .map(|name| tasks.artifact_paths(name))
-                    .transpose()?
-                    .unwrap_or(paths);
+                let paths = if let Some(name) = snapshot {
+                    &tasks.snapshot(name)?.paths
+                } else {
+                    artifact
+                        .as_deref()
+                        .map(|name| tasks.artifact_paths(name))
+                        .transpose()?
+                        .unwrap_or(paths)
+                };
                 storage::restore_into(
                     &root,
                     tasks.cache_store(),
@@ -98,6 +136,7 @@ fn main() -> Result<()> {
                     paths,
                     *required,
                     destination,
+                    *reserve_bytes,
                 )?;
             }
         }
@@ -822,46 +861,7 @@ fn execute_task_with_output(
     variables: &std::collections::BTreeMap<String, String>,
     capture_stdout: bool,
 ) -> Result<Option<String>> {
-    let mut cmd = match command {
-        TaskCommand::Shell(command) => {
-            let mut cmd = std::process::Command::new("sh");
-            cmd.arg("-lc").arg(command);
-            cmd
-        }
-        TaskCommand::Argv(command) => {
-            let (program, args) = command
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("resolved task command was empty"))?;
-            let mut cmd = std::process::Command::new(program);
-            cmd.args(args);
-            cmd
-        }
-    };
-    cmd.current_dir(cwd).envs(variables);
-    if capture_stdout {
-        cmd.stderr(std::process::Stdio::inherit());
-        let output = cmd.output()?;
-        std::io::stdout().write_all(&output.stdout)?;
-        if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
-            writeln!(std::io::stdout())?;
-        }
-        anyhow::ensure!(
-            output.status.success(),
-            "task execution failed in {}",
-            cwd.display()
-        );
-        return String::from_utf8(output.stdout)
-            .map(Some)
-            .map_err(|error| anyhow::anyhow!("task stdout was not UTF-8: {error}"));
-    }
-
-    let status = cmd.status()?;
-    anyhow::ensure!(
-        status.success(),
-        "task execution failed in {}",
-        cwd.display()
-    );
-    Ok(None)
+    execution::execute(command, cwd, variables, capture_stdout)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -954,30 +954,12 @@ fn execute_unit(unit: &ExecutionUnit, _root: &std::path::Path) -> Result<()> {
             &resolved.variables,
         ),
         ExecutionUnit::Batch(batch) => {
-            let status = match &batch.command {
-                TaskCommand::Shell(command) => std::process::Command::new("sh")
-                    .arg("-lc")
-                    .arg(command)
-                    .current_dir(&batch.working_dir)
-                    .envs(&batch.variables)
-                    .status()?,
-                TaskCommand::Argv(command) => {
-                    let (program, args) = command
-                        .split_first()
-                        .ok_or_else(|| anyhow::anyhow!("batched task command was empty"))?;
-                    std::process::Command::new(program)
-                        .args(args)
-                        .current_dir(&batch.working_dir)
-                        .envs(&batch.variables)
-                        .status()?
-                }
-            };
-            anyhow::ensure!(
-                status.success(),
-                "batched task execution failed in {}",
-                batch.working_dir.display()
-            );
-            Ok(())
+            execute_task(&batch.command, &batch.working_dir, &batch.variables).with_context(|| {
+                format!(
+                    "batched task execution failed in {}",
+                    batch.working_dir.display()
+                )
+            })
         }
     }
 }

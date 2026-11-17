@@ -39,7 +39,12 @@ fn directories(root: &Path, path: &Path, output: &mut BTreeMap<PathBuf, u32>) ->
     Ok(())
 }
 
-pub(super) fn save(root: &Path, output: &mut fs::File, manifest: Manifest) -> Result<()> {
+pub(super) fn save(
+    root: &Path,
+    output: &mut fs::File,
+    manifest: Manifest,
+    include_empty_directories: bool,
+) -> Result<()> {
     let workers = hash_workers(manifest.files.len()).clamp(1, MAX_SHARDS);
     let mut groups = vec![BTreeSet::new(); workers];
     let mut weights = vec![0_u64; workers];
@@ -71,7 +76,15 @@ pub(super) fn save(root: &Path, output: &mut fs::File, manifest: Manifest) -> Re
     for path in &manifest.paths {
         directories(root, path, &mut dirs)?;
     }
-    output.write_all(MAGIC)?;
+    if !include_empty_directories {
+        let mut retained = manifest.paths.iter().cloned().collect::<BTreeSet<_>>();
+        for file in manifest.files.keys() {
+            retained.extend(file.ancestors().skip(1).map(Path::to_owned));
+        }
+        dirs.retain(|path, _| retained.contains(path));
+    }
+    let magic = MAGIC;
+    output.write_all(magic)?;
     eprintln!(
         "storage creating {} archive shards concurrently",
         groups.len()
@@ -127,7 +140,7 @@ pub(super) fn save(root: &Path, output: &mut fs::File, manifest: Manifest) -> Re
     ensure!(header.len() as u64 <= MAX_HEADER, "oversized storage index");
     output.write_all(&header)?;
     output.write_all(&(header.len() as u64).to_le_bytes())?;
-    output.write_all(MAGIC)?;
+    output.write_all(magic)?;
     Ok(())
 }
 
@@ -182,15 +195,26 @@ impl Read for ExtentReader<'_> {
     }
 }
 
-pub(super) fn unpack(path: &Path, stage: &Path, key: &str, paths: &[PathBuf]) -> Result<()> {
+pub(super) fn unpack(
+    path: &Path,
+    stage: &Path,
+    key: &str,
+    paths: &[PathBuf],
+    reserve: u64,
+) -> Result<()> {
     let started = std::time::Instant::now();
     let mut input = fs::File::open(path)?;
     let size = input.metadata()?.len();
     ensure!(size >= 24, "truncated storage snapshot");
+    let mut prefix = [0; 8];
+    input.read_exact(&mut prefix)?;
     input.seek(SeekFrom::End(-16))?;
     let mut footer = [0; 16];
     input.read_exact(&mut footer)?;
-    ensure!(&footer[8..] == MAGIC, "invalid storage footer");
+    ensure!(
+        &prefix == MAGIC && prefix == footer[8..],
+        "invalid storage footer"
+    );
     let length = u64::from_le_bytes(footer[..8].try_into()?);
     ensure!(
         length <= MAX_HEADER && length <= size - 24,
@@ -239,6 +263,7 @@ pub(super) fn unpack(path: &Path, stage: &Path, key: &str, paths: &[PathBuf]) ->
         ensure!(end <= index_start, "storage extent leaves payload");
     }
     ensure!(end == index_start, "storage extent length mismatch");
+    let canonical = seen.clone();
     ensure!(
         seen == index.manifest.files.keys().cloned().collect(),
         "storage file list mismatch"
@@ -258,6 +283,41 @@ pub(super) fn unpack(path: &Path, stage: &Path, key: &str, paths: &[PathBuf]) ->
             ensure!(!seen.contains(directory), "file ancestor collision");
             parent = directory.parent();
         }
+    }
+    let block = fs2::allocation_granularity(stage)?.max(1);
+    let footprints = canonical
+        .iter()
+        .map(|file| index.manifest.files[file].footprint.as_ref())
+        .collect::<Option<Vec<_>>>();
+    if let Some(footprints) = footprints {
+        let required = footprints.into_iter().try_fold(0_u64, |total, footprint| {
+            total
+                .checked_add(footprint.required(block)?)
+                .context("storage allocation overflow")
+        })?;
+        let directory_bytes = (index.directories.len() as u64)
+            .checked_mul(block)
+            .context("storage directory size overflow")?;
+        space::check(
+            stage,
+            required
+                .checked_add(directory_bytes)
+                .context("storage allocation overflow")?,
+            reserve,
+        )?;
+    } else {
+        let mut required = 0_u64;
+        for shard in &index.shards {
+            let mut archive = tar::Archive::new(zstd::stream::Decoder::new(ExtentReader {
+                input: fs::File::open(path)?,
+                extents: shard.extents.iter(),
+                remaining: 0,
+            })?);
+            required = required
+                .checked_add(space::archive_bytes(&mut archive, block)?)
+                .context("storage allocation overflow")?;
+        }
+        space::check(stage, required, reserve)?;
     }
     let mut directories = index.directories.keys().cloned().collect::<BTreeSet<_>>();
     directories.extend(
@@ -287,12 +347,19 @@ pub(super) fn unpack(path: &Path, stage: &Path, key: &str, paths: &[PathBuf]) ->
             let mut entry = entry?;
             let file = entry.path()?.into_owned();
             ensure!(shard.files.contains(&file), "undeclared shard entry");
-            ensure!(extracted.insert(file), "duplicate shard entry");
+            ensure!(extracted.insert(file.clone()), "duplicate shard entry");
             let kind = entry.header().entry_type();
             ensure!(
                 kind.is_file() || kind.is_gnu_sparse(),
                 "storage links and special files are forbidden"
             );
+            if let Some(footprint) = &index.manifest.files[&file].footprint {
+                ensure!(
+                    entry.size() == footprint.length
+                        && entry.header().entry_size()? <= footprint.data,
+                    "storage entry size mismatch"
+                );
+            }
             ensure!(entry.unpack_in(stage)?, "invalid storage entry");
         }
         ensure!(extracted == shard.files, "incomplete storage shard");
@@ -335,7 +402,7 @@ mod tests {
         }
         fs::create_dir(consumer.path().join("dist"))?;
         fs::write(consumer.path().join("dist/original"), "retained")?;
-        super::super::save(producer.path(), &store, "malformed", &["dist".into()])?;
+        super::super::save(producer.path(), &store, "malformed", &["dist".into()], None)?;
         let object = objects
             .path()
             .join(format!("{}.tar", object_key("malformed")?));
@@ -352,6 +419,8 @@ mod tests {
             "corruption",
             "checksum",
             "directory-collision",
+            "version",
+            "footprint",
         ] {
             let mut index: Index = serde_json::from_slice(&original[header_start..footer])?;
             match failure {
@@ -378,15 +447,28 @@ mod tests {
                 "directory-collision" => {
                     index.directories.insert("dist/0".into(), 0o755);
                 }
+                "version" => index.manifest.version = 3,
+                "footprint" => {
+                    index
+                        .manifest
+                        .files
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .footprint
+                        .as_mut()
+                        .unwrap()
+                        .length += 1
+                }
                 "corruption" => (),
                 _ => unreachable!(),
             }
             let header = serde_json::to_vec(&index)?;
-            let mut modified = MAGIC.to_vec();
+            let mut modified = original[..8].to_vec();
             modified.extend(payload);
             modified.extend(header);
             modified.extend((modified.len() as u64 - header_start as u64).to_le_bytes());
-            modified.extend(MAGIC);
+            modified.extend(&original[original.len() - 8..]);
             if failure == "corruption" {
                 modified[8] ^= 0xff;
             }
@@ -397,7 +479,8 @@ mod tests {
                     &store,
                     &["malformed".into()],
                     &["dist".into()],
-                    true
+                    true,
+                    0,
                 )
                 .is_err(),
                 "accepted {failure}"
@@ -451,11 +534,18 @@ mod tests {
             &Store::default(),
             &["shared".into()],
             &["dist".into()],
-            true
+            true,
+            0,
         )?);
         assert_eq!(fs::read(root.path().join("dist/output"))?, b"legacy");
         fs::write(root.path().join("dist/output"), "parallel")?;
-        super::super::save(root.path(), &Store::default(), "shared", &["dist".into()])?;
+        super::super::save(
+            root.path(),
+            &Store::default(),
+            "shared",
+            &["dist".into()],
+            None,
+        )?;
         assert_eq!(fs::read(&object)?, legacy_bytes);
         fs::remove_dir_all(root.path().join("dist"))?;
         restore(
@@ -464,6 +554,7 @@ mod tests {
             &["shared".into()],
             &["dist".into()],
             true,
+            0,
         )?;
         assert_eq!(fs::read(root.path().join("dist/output"))?, b"parallel");
         assert!(root.path().join("dist/empty").is_dir());

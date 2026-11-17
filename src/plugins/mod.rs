@@ -13,7 +13,36 @@ pub(crate) use cargo::CargoPlugin;
 pub(crate) use npm::PackageJsonPlugin;
 pub(crate) use uv::UvPlugin;
 
+/// Built-in ecosystem capabilities. Manifest-only plugins need not implement
+/// execution observation, runtime adapters or snapshot selection.
 pub(crate) trait ManifestPlugin {
+    fn name(&self) -> &'static str;
+
+    fn prepare_execution(
+        &self,
+        _invocation: &crate::execution::Invocation<'_>,
+    ) -> Option<crate::execution::PreparedInvocation> {
+        None
+    }
+
+    fn dispatch_entrypoint(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn snapshot_policy(
+        &self,
+        _options: &toml::Table,
+    ) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
+        anyhow::bail!(
+            "plugin `{}` does not support snapshot selection",
+            self.name()
+        )
+    }
+
+    fn cache_key(&self, _root: &Path, _scope: &str, _packages: &[String]) -> Result<String> {
+        anyhow::bail!("plugin `{}` does not support cache keys", self.name())
+    }
+
     fn discover_manifests(&self, root: &Path) -> Result<Vec<PathBuf>>;
     fn parse_manifest(&self, path: &Path) -> Result<RawPackage>;
 }
@@ -24,6 +53,55 @@ pub(crate) fn default_plugins() -> Vec<Box<dyn ManifestPlugin>> {
         Box::new(PackageJsonPlugin),
         Box::new(UvPlugin),
     ]
+}
+
+/// First capable provider owns the invocation. Shell commands never reach here.
+pub(crate) fn prepare_execution_with(
+    plugins: &[Box<dyn ManifestPlugin>],
+    invocation: &crate::execution::Invocation<'_>,
+) -> Option<crate::execution::PreparedInvocation> {
+    plugins
+        .iter()
+        .find_map(|plugin| plugin.prepare_execution(invocation))
+}
+
+pub(crate) fn dispatch_entrypoint() -> Result<()> {
+    for plugin in default_plugins() {
+        plugin.dispatch_entrypoint()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn snapshot_policy(
+    name: &str,
+    options: &toml::Table,
+) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
+    snapshot_policy_with(&default_plugins(), name, options)
+}
+
+fn snapshot_policy_with(
+    plugins: &[Box<dyn ManifestPlugin>],
+    name: &str,
+    options: &toml::Table,
+) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
+    plugins
+        .iter()
+        .find(|plugin| plugin.name() == name)
+        .with_context(|| format!("unknown ecosystem plugin `{name}`"))?
+        .snapshot_policy(options)
+}
+
+pub(crate) fn cache_key(
+    name: &str,
+    root: &Path,
+    scope: &str,
+    packages: &[String],
+) -> Result<String> {
+    default_plugins()
+        .iter()
+        .find(|plugin| plugin.name() == name)
+        .with_context(|| format!("unknown ecosystem plugin `{name}`"))?
+        .cache_key(root, scope, packages)
 }
 
 pub(crate) fn batch_execution_units(
@@ -229,3 +307,6 @@ fn is_ignored_path(path: &Path) -> bool {
         })
     })
 }
+
+#[cfg(test)]
+mod tests;

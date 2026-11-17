@@ -1244,16 +1244,11 @@ fn workspace_wide_change(path: &Path) -> bool {
         "rust-toolchain.toml",
     ];
 
-    if ROOT_FILES
+    ROOT_FILES
         .iter()
         .any(|candidate| path == Path::new(candidate))
         || path == Path::new(".cargo/config")
         || path == Path::new(".cargo/config.toml")
-    {
-        return true;
-    }
-
-    false
 }
 
 fn output_uses_color() -> bool {

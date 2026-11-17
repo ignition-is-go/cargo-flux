@@ -9,9 +9,43 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod cache;
+
 pub(crate) struct CargoPlugin;
 
 impl ManifestPlugin for CargoPlugin {
+    fn name(&self) -> &'static str {
+        "cargo"
+    }
+
+    fn prepare_execution(
+        &self,
+        invocation: &crate::execution::Invocation<'_>,
+    ) -> Option<crate::execution::PreparedInvocation> {
+        cache::record::prepare(
+            invocation.program,
+            invocation.args,
+            invocation.cwd,
+            invocation.variables,
+            invocation.capture_stdout,
+        )
+    }
+
+    fn dispatch_entrypoint(&self) -> Result<()> {
+        cache::record::compiler_entry()
+    }
+
+    fn snapshot_policy(
+        &self,
+        options: &toml::Table,
+    ) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
+        Ok(Box::new(cache::Policy::from_options(options)?))
+    }
+
+    fn cache_key(&self, root: &Path, scope: &str, packages: &[String]) -> Result<String> {
+        cache::compatibility_key(root, scope, packages)
+    }
+
     fn discover_manifests(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let manifest_path = root.join("Cargo.toml");
         if !manifest_path.exists() {

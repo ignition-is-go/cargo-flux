@@ -120,7 +120,18 @@ pub enum ReportCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum StorageCommand {
-    /// Print compiler/flags/scope compatibility without keying on source hashes.
+    /// Print an ecosystem plugin's build-cache compatibility key.
+    Key {
+        #[arg(long)]
+        plugin: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long, requires = "selection")]
+        affected: Option<String>,
+    },
+    /// Compatibility alias for `storage key --plugin cargo`.
     CargoKey {
         #[arg(long)]
         scope: String,
@@ -140,11 +151,20 @@ pub enum StorageCommand {
     },
     /// Save declared paths as a verified compressed archive.
     Save {
+        /// Named snapshot contract from flux.toml, including its plugin and options.
+        #[arg(long, conflicts_with_all = ["paths", "artifact", "plugin", "plugin_options"])]
+        snapshot: Option<String>,
+        /// Ecosystem plugin selecting reusable files for this snapshot.
+        #[arg(long)]
+        plugin: Option<String>,
+        /// Repeatable plugin-specific KEY=VALUE option.
+        #[arg(long = "plugin-option", requires = "plugin")]
+        plugin_options: Vec<String>,
         #[arg(long)]
         key: String,
         #[arg(
             long = "path",
-            required_unless_present = "artifact",
+            required_unless_present_any = ["artifact", "snapshot"],
             conflicts_with = "artifact"
         )]
         paths: Vec<PathBuf>,
@@ -153,11 +173,17 @@ pub enum StorageCommand {
     },
     /// Restore the first existing key; validation commands must still run.
     Restore {
+        /// Use the paths from a named snapshot contract in flux.toml.
+        #[arg(long, conflicts_with_all = ["paths", "artifact"])]
+        snapshot: Option<String>,
+        /// Leave this many free bytes after downloading and extracting the snapshot.
+        #[arg(long, default_value_t = 0)]
+        reserve_bytes: u64,
         #[arg(long = "key", required = true)]
         keys: Vec<String>,
         #[arg(
             long = "path",
-            required_unless_present = "artifact",
+            required_unless_present_any = ["artifact", "snapshot"],
             conflicts_with = "artifact"
         )]
         paths: Vec<PathBuf>,

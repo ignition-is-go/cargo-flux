@@ -1,1419 +1,455 @@
 # cargo-flux
 
-`cargo-flux` is a workspace topology and task-planning tool for mixed-language repositories.
+Plan and run tasks across Cargo, JavaScript and uv/Python workspaces from one
+`flux.toml`. Flux coordinates package order and cross-language dependencies;
+Cargo, your JavaScript package manager and uv still do the builds.
 
-It understands:
+- **Inspect:** discover packages and preview task order.
+- **Run:** execute package tasks and commands that run once at the repo root.
+- **Scope:** select a product or run only work affected by committed changes.
+- **Reuse:** restore intermediate files, save build snapshots and transfer artifacts.
+- **Release:** calculate versions and stamp Cargo and JavaScript manifests.
 
-- Cargo workspaces
-- JavaScript workspaces (`package.json`, `pnpm-workspace.yaml`)
-- uv/Python workspaces (`pyproject.toml`)
-
-It does not try to replace each ecosystem's native build system. Instead, it coordinates repo-wide tasks and cross-ecosystem handoffs.
-
-## Status
-
-The current implementation:
-
-- calculates next semantic version from git tags and conventional commits
-- stamps versions across all workspace manifests
-- discovers workspace packages
-- resolves native in-workspace dependencies
-- loads repo-defined logical tasks from `flux.toml`
-- runs explicit `root` task variants once from the workspace root
-- determines which packages participate in a task
-- follows cross-ecosystem bridge dependencies
-- prints task plans as Unicode trees
-- executes tasks in dependency order with `run`
-- can batch compatible Cargo tasks across native dependency layers into a single workspace invocation when a task is marked `workspace_batchable`
-
-Use `cargo flux plan <task>` to inspect the plan without executing anything.
+[Quick start](#quick-start) · [Task order](#control-task-order) ·
+[Changed packages](#run-only-changed-work) · [Caching](#reuse-intermediate-files) ·
+[Snapshots](#save-and-restore-build-snapshots) · [CI](#use-in-github-actions) ·
+[Full reference](docs/reference.md)
 
 ## Install
 
-Download a prebuilt binary with [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
-
-```bash
+```sh
 cargo binstall cargo-flux
+# Or compile from crates.io:
+cargo install cargo-flux --locked
 ```
 
-Or compile and install it from crates.io:
+To use the checked-out source, including features not yet released:
 
-```bash
-cargo install cargo-flux
+```sh
+cargo install --path . --locked --force
 ```
 
-### GitHub Action
+Both `cargo flux` and `cargo-flux` invoke the CLI. Run commands from the repo root,
+or add `--root /path/to/repo`.
 
-The repository also publishes a colocated composite action backed by verified
-native release binaries. It supports Linux x86-64, Windows x86-64, and Apple
-Silicon macOS runners, and can run a task directly:
+## Quick start
 
-```yaml
-permissions:
-  contents: read
+Start in an existing native workspace. Flux discovers members declared in
+`Cargo.toml`, `package.json` / `pnpm-workspace.yaml`, and `pyproject.toml`; it does
+not scan arbitrary directories for projects. Install each project's native tools
+and dependencies first.
 
-steps:
-  - uses: actions/checkout@v4
-    with:
-      fetch-depth: 0
+Create **`flux.toml`** at the workspace root:
 
-  - id: flux
-    uses: ignition-is-go/cargo-flux@v0.7.0
-    with:
-      task: test
-      affected: origin/${{ github.base_ref }}
+```toml
+[tasks.build]
+autoapply = "all"
+workspace_batchable = true
+cargo = ["cargo", "build"]
+npm = ["npm", "run", "build"]
+uv = ["uv", "build"]
 
-  - if: steps.flux.outputs.outcome == 'completed'
-    env:
-      TASK_OUTPUTS: ${{ steps.flux.outputs['task-outputs'] }}
-    run: echo "$TASK_OUTPUTS"
+[tasks.test]
+autoapply = "all"
+cargo = ["cargo", "test"]
+npm = ["npm", "test"]
+uv = ["uv", "run", "pytest"]
 ```
 
-Omit `task` to install Cargo Flux and add it to `PATH` for later steps. `version`
-defaults to the CLI version carried by the selected action release; it can be
-overridden explicitly. `root` defaults to `.`. A full checkout is required when
-using `affected` so Git can find the merge base.
+Keep the command variants your repo uses. JavaScript examples assume matching
+`build` and `test` scripts; the Python test example assumes pytest is installed
+in the project's uv environment. Add `pnpm`, `yarn` or `bun` variants when needed;
+Flux prefers the detected package manager's variant, then `npm`, then `default`.
 
-The action exports `CARGO_FLUX_BIN`, the absolute path to its verified executable.
-Use `"$CARGO_FLUX_BIN" run build` in later shell steps and pass this path to nested
-helpers. This preserves the selected version when another setup step changes
-`PATH`. Invoking `cargo flux` can select a different installed plugin because
-Cargo searches `$CARGO_HOME/bin` before `PATH`.
-
-The same action can configure a dedicated S3 cache client:
-
-```yaml
-- uses: ignition-is-go/cargo-flux@v0.11.0
-  with:
-    cache: s3
-    cache-endpoint: ${{ secrets.CARGO_FLUX_S3_ENDPOINT }}
-    cache-bucket: ${{ secrets.CARGO_FLUX_S3_BUCKET }}
-    cache-access-key-id: ${{ secrets.CARGO_FLUX_S3_ACCESS_KEY_ID }}
-    cache-secret-access-key: ${{ secrets.CARGO_FLUX_S3_SECRET_ACCESS_KEY }}
+```sh
+cargo flux graph               # Package relationships
+cargo flux topo                # Packages in dependency order
+cargo flux plan build          # Preview without executing
+cargo flux plan build --ordered
+cargo flux run build
+cargo flux run test
 ```
 
-This exports masked `CARGO_FLUX_S3_*` credentials and storage settings, leaving
-existing `AWS_*` compiler-cache credentials untouched. Flux uses the dedicated
-credentials only for its native S3 client. `cache-region` defaults to
-`us-east-1`; `cache-session-token` is optional. S3 transport is built into the
-Flux binary. The action configures the environment; `flux.toml`
-still owns task inputs, outputs, storage prefix and cache policy. With `task`,
-set `cache-required: 'true'` to fail on cache errors.
+`autoapply = "all"` starts with every compatible package **when none explicitly
+opts into that task**. Tasks normally run from each package directory. Compatible
+Cargo builds can be batched into one workspace invocation when
+`workspace_batchable = true`.
 
-When a task is supplied, the action exposes `outcome` (`completed` or `skipped`)
-and `task-outputs`, a compact JSON object keyed by root task and output name.
-GitHub expressions can read arbitrary values with
-`fromJSON(steps.flux.outputs['task-outputs'])`. Setup-only use leaves both execution
-outputs empty. Failed tasks remain failed action steps and do not promise a
-report.
+The examples below are independent. Merge fields into an existing TOML table
+rather than declaring the same table twice.
 
-The action contains no JavaScript wrapper. Its composite steps download the
-platform-native release archive, verify the published SHA-256 file, cache the
-verified archive, extract it fresh, and invoke Cargo Flux with arguments passed
-without shell expansion.
+## Choose which packages participate
 
-To install a local checkout instead, run `cargo install --path . --force`.
+For explicit entrypoints, replace the build definition with:
 
-Because the binary is named `cargo-flux`, Cargo exposes it as a subcommand:
-
-```bash
-cargo flux --help
+```toml
+# flux.toml
+[tasks.build]
+autoapply = "inherit"
+cargo = ["cargo", "build"]
+npm = ["npm", "run", "build"]
+uv = ["uv", "build"]
 ```
 
-You can also run it directly:
+Opt packages in using their native manifests:
 
-```bash
-cargo-flux --help
+```toml
+# Cargo.toml, inside a Rust package
+[package.metadata.flux]
+tasks = ["build"]
 ```
 
-## Commands
-
-```bash
-cargo flux graph --root /path/to/repo
-cargo flux topo --root /path/to/repo
-cargo flux affected --base origin/main --root /path/to/repo
-cargo flux plan build --affected origin/main --root /path/to/repo
-cargo flux plan publish --stamp-args
-cargo flux run build --affected origin/main --root /path/to/repo
-cargo flux version
-cargo flux stamp
-cargo flux stamp 1.2.3
+```json
+{
+  "name": "@demo/web",
+  "scripts": { "build": "vite build" },
+  "flux": { "tasks": ["build"] }
+}
 ```
 
-### `graph`
-
-Prints the discovered workspace packages as an ASCII tree of native internal dependencies.
-
-### `topo`
-
-Prints packages in topological order.
-
-### `plan <task>`
-
-Prints the planned task execution tree for the given logical task.
-
-The plan respects:
-
-- package opt-in
-- ecosystem-specific task variants
-- cross-ecosystem bridges
-- bridge traversal through native dependency chains
-
-Use `--ordered` to print the actual execution order instead of the tree view:
-
-```bash
-cargo flux plan build --ordered --root /path/to/repo
+```toml
+# pyproject.toml, inside a Python package
+[tool.flux]
+tasks = ["build"]
 ```
 
-Use `--stamp-args` to turn the unique Cargo and JavaScript packages in a task
-plan into repeatable `--package=NAME` arguments:
+`autoapply = "inherit"` lets dependencies reached by the plan receive the task.
+The default, `"none"`, requires an explicit opt-in on every participating package.
+A JavaScript script alone is not a Flux opt-in.
 
-```bash
-cargo flux plan publish --stamp-args
-cargo flux stamp "$VERSION" $(cargo flux plan publish --stamp-args)
+## Control task order
+
+**Run another task first on the same package:**
+
+```toml
+[tasks.build]
+autoapply = "all"
+depends_on = ["test"]
+cargo = ["cargo", "build"]
+
+[tasks.test]
+autoapply = "inherit"
+cargo = ["cargo", "test"]
 ```
 
-This uses the plan's existing native and cross-ecosystem closure, so a publish
-task can define exactly which manifests are release-stamped.
+**Run a dependency in another language first:** add a bridge to the package
+that consumes it. For example, a web package that needs Rust package `api`:
 
-### Affected package and task filtering
+```json
+{
+  "name": "@demo/web",
+  "scripts": { "build": "vite build" },
+  "flux": {
+    "tasks": ["build"],
+    "bridges": ["cargo:api"]
+  }
+}
+```
 
-Compare the current committed branch with the merge base of a target branch or
-commit:
+Use the `autoapply = "inherit"` build definition above. `cargo flux plan build`
+then schedules `api:build` before `@demo/web:build`. Bridges carry the same task
+name and use scoped package identities: `cargo:api`, `js:@demo/web`, `uv:codegen`.
 
-```bash
+Native dependencies are traversed to find bridges, but Flux normally lets the
+native build tool handle native dependency builds. To schedule the same task on
+native dependencies too—for example, publish dependencies before their consumers:
+
+```toml
+[tasks.publish]
+autoapply = "inherit"
+cascade = "all"
+include_dev_dependencies = true
+cargo = ["cargo", "publish", "--locked"]
+```
+
+Opt a release entrypoint into `publish`, then inspect `cargo flux plan publish`
+before running it. See the [planning rules](docs/reference.md#planning-semantics)
+for cascade behavior and [ecosystem-specific prerequisites](docs/reference.md#ecosystem_depends_on).
+
+## Run only changed work
+
+```sh
+git fetch origin main
 cargo flux affected --base origin/main
 cargo flux plan test --affected origin/main
 cargo flux run test --affected origin/main
 ```
 
-`affected` prints package IDs such as `cargo:core` in native dependency order.
-The `--affected BASE` option on `plan` and `run` limits execution to affected
-packages. `--affected-from` is an alias for the same option.
+Flux compares committed `HEAD` with the merge base of `origin/main`, then includes
+affected consumers. Staged, unstaged and untracked edits are not part of this
+comparison. The base and enough history to find a merge base must exist locally.
 
-Flux uses Git's three-dot merge-base semantics. New commits made only on the
-base branch do not count as pull-request changes. The comparison uses committed
-`HEAD` only; staged, unstaged, and untracked files are not included.
-
-A changed file first affects its owning package. Flux then walks reverse native
-and cross-ecosystem bridge dependencies, so changing a low-level package also
-affects every transitive consumer. The normal task plan is materialized from
-those affected entrypoints and then scoped to affected packages. Same-package
-task dependencies, ordering, and batching are preserved; an unchanged upstream
-package is not reintroduced merely because a task normally cascades to it.
-
-Workspace-wide inputs such as `flux.toml`, root workspace manifests, lockfiles,
-`.cargo/config.toml`, and Rust toolchain files affect every package. Files that
-cannot be assigned to a current package are also treated conservatively as
-workspace-wide changes. This handles shared inputs and deleted packages without
-silently skipping required CI work.
-
-Repositories can exclude committed paths that do not affect build or test
-behavior. Patterns are relative to the workspace root and use glob syntax:
+Root manifests, lockfiles and shared or unowned inputs conservatively affect the
+whole workspace. Exclude files that cannot change task behavior:
 
 ```toml
 [affected]
-ignore = ["AGENTS.md", "docs/**"]
+ignore = ["docs/**", "AGENTS.md"]
 ```
 
-Ignored paths are removed before Flux decides whether the diff is empty. If all
-changed paths are ignored, `affected` prints no packages and affected `plan` or
-`run` commands schedule no root or package tasks. Only list files whose changes
-cannot alter task behavior or package outputs.
+An empty affected scope succeeds without scheduling root or package tasks.
 
-The base ref must exist locally. CI should fetch the target branch with enough
-history for Git to find a merge base. A missing or shallow base is an error, not
-an empty affected set. An empty diff succeeds, and `run` reports that there is
-nothing to run.
-
-### Named package selections
-
-Define product boundaries separately from task participation:
+For a reusable product boundary, select packages independently of task opt-in:
 
 ```toml
 [selections.product]
-roots = ["cargo:server", "cargo:web"]
-cargo_publishable = true
+roots = ["cargo:api", "js:@demo/web"]
 dependencies = true
-bridges = false
-
-[selections.workspace]
-all = true
-
-[tasks.check]
-selection = "product"
-autoapply = "none"
-workspace_batchable = true
-cargo = ["cargo", "clippy", "--locked", "--all-targets"]
+bridges = true
 ```
 
-`roots` resolve package identities using the same scoped syntax as bridges;
-unknown or ambiguous roots fail. `cargo_publishable` adds Cargo packages whose
-`publish` policy allows publication, including inherited workspace policies and
-restricted registries. `dependencies` follows runtime/build dependencies;
-`bridges` additionally follows declared cross-language bridges. Neither option
-includes test-only dependencies in the product closure.
-
-Selection is intersected with affected consumers and normal task availability.
-Test-only dependencies, including renamed and target-specific dependencies,
-participate in affected analysis without introducing build-order cycles.
-Unshipped reverse dependents do not join the product merely because they depend
-on a changed library. Empty selected scopes skip root work too.
-
-```bash
+```sh
 cargo flux select product
-cargo flux select product --affected origin/main --stamp-args
-cargo flux plan check --affected origin/main
-cargo flux run check --selection workspace
+cargo flux plan build --selection product
+cargo flux run build --selection product --affected origin/main
 ```
 
-The task's `selection` is the default for both `plan` and `run`; CLI
-`--selection` overrides it. Selection does not itself opt a package into a task.
-`select` queries the package set without executing tasks or tool probes.
+A task can set `selection = "product"` as its default. Selection narrows the
+package set; it does not opt those packages into tasks.
 
-### Workspace-root tasks
+## Run commands once at the repo root
 
-A task can define a `root` command that runs once from the workspace root rather
-than once per package:
+Use `root` for setup or work that belongs to the whole repo:
 
 ```toml
 [tasks.prepare]
-root = ["bun", "install"]
+root = ["npm", "ci"]
 
-[tasks.check]
-root = ["./tools/check-workspace.sh"]
+[tasks.build]
 depends_on = ["prepare"]
 autoapply = "all"
-cargo = ["cargo", "check"]
+cargo = ["cargo", "build"]
+npm = ["npm", "run", "build"]
 ```
 
-`cargo flux run check` runs `prepare` once, the root `check` once, and then the
-participating package checks. Root variants appear as `workspace:check [root]`
-in plans and progress output. A package task may depend on a root-only task; the
-root dependency runs once before package work. A root variant can depend only on
-tasks that also define a root command, which keeps dependency scope explicit.
+`cargo flux run build` runs `prepare` once before package builds. A task can also
+define its own `root` command alongside package variants. Root commands depend
+only on other root commands.
 
-Root-only workflows can capture the final command's stdout, gate dependent
-tasks, and execute structured argv steps without a shell script:
+For multiple steps and a captured value:
 
 ```toml
 [tasks.calculate-version]
 root = ["cargo", "flux", "version"]
 outputs = { version = "stdout" }
 
-[tasks.publish-production]
+[tasks.prepare-release]
 depends_on = ["calculate-version"]
 when = { output = "calculate-version.version", nonempty = true }
 root_steps = [
   ["cargo", "flux", "stamp", "${calculate-version.version}"],
   ["cargo", "update", "--workspace"],
-  ["cargo", "fmt", "--all"],
-  ["git", "add", "-A"],
-  ["git", "commit", "-m", "chore(release): v${calculate-version.version}"],
 ]
 ```
 
-`root` and `root_steps` are mutually exclusive. Steps run sequentially and stop
-on the first real failure. Output substitution is supported only in argv
-commands, where the full substituted value remains one argument and cannot be
-reinterpreted as shell source. Empty stdout is a produced empty value, so the
-`nonempty` condition skips `publish-production` and its dependent chain
-successfully. A missing or failed producer is not treated as an empty output.
-Dynamic outputs and conditions are currently restricted to root-only tasks so a
-single value cannot be ambiguously assigned to many package executions.
-
-`cargo flux run TASK --report report.json` writes a stable JSON report containing
-the requested outcome (`completed` or `skipped`) and nested task outputs. Reports
-can be adapted without loading a workspace:
-
-```bash
-cargo flux report github-output --input report.json --output-file "$GITHUB_OUTPUT"
+```sh
+cargo flux run prepare-release --report release-report.json
 ```
 
-With `--affected`, reachable root variants run once when the committed diff is
-nonempty. An empty diff skips both root and package work. Root tasks are omitted
-from `plan --stamp-args` because they are not packages.
+Steps stop on failure. Substituted values remain individual arguments. Empty
+version output skips the dependent release task successfully. Dynamic outputs
+and conditions currently require root-only tasks. Here, `outputs` means captured
+stdout values; cached files are declared separately under `cache.paths`.
 
-### Intermediate-file caching
+## Reuse intermediate files
 
-Root-only tasks can opt into content-addressed caching of declared files and
-captured task outputs:
+A root-only task can cache files between runs. This example assumes a Node
+project with an `npm run build` script that writes `dist/`:
 
 ```toml
 [tasks.bundle]
-root = ["bun", "build", "src/main.ts", "--outfile", "dist/app.js"]
-cache = { inputs = ["src/**", "package.json", "bun.lock"], paths = ["dist"], env = ["NODE_ENV"], tools = [["bun", "--version"]] }
+root = ["npm", "run", "build"]
+
+[tasks.bundle.cache]
+inputs = ["src/**/*", "package.json", "package-lock.json"]
+paths = ["dist"]
+env = ["NODE_ENV"]
+tools = [["node", "--version"], ["npm", "--version"]]
 ```
 
-The default store is `.flux/cache` in the workspace. Add it to `.gitignore`, or
-set `[cache] directory = "/path/to/cache"`. To use S3-compatible storage:
-
-```toml
-[cache.s3]
-bucket = "build-cache"
-endpoint = "http://localhost:9000" # omit for AWS S3
-prefix = "cargo-flux/v1"
-timeout_seconds = 120
-```
-
-The native S3 adapter uses `CARGO_FLUX_S3_ACCESS_KEY_ID` and
-`CARGO_FLUX_S3_SECRET_ACCESS_KEY`, optional `CARGO_FLUX_S3_SESSION_TOKEN`, and
-`CARGO_FLUX_S3_REGION` (default `us-east-1`). It does not read ambient compiler
-credentials or cloud identity providers. Credentials are not placed in Flux
-configuration, argv, reports or cache manifests. Transfers stream with bounded
-memory, multipart uploads and complete-operation deadlines. Failed multipart
-uploads are aborted when their upload ID is known. No external storage CLI is
-needed; MinIO and other S3-compatible endpoints use the same native client.
-
-For action-provided settings, use `bucket_env = "CARGO_FLUX_S3_BUCKET"` and
-`endpoint_env = "CARGO_FLUX_S3_ENDPOINT"` instead of literal values. Each field
-accepts a literal or an environment reference, not both. Planning does not need
-the secret values.
-
-Keys include input content and executable modes, resolved commands, declared
-environment/tool probes, dependency task outputs, source location, OS, and
-architecture. Declare all inputs that influence the result. Missing input
-patterns disable reuse; inputs are checked again before saving so a concurrent
-edit cannot publish outputs under an obsolete key. Failed tasks never save.
-Use `optional_inputs` for configuration that may not exist yet; creating or
-removing those files changes the key. Environment declarations support patterns
-such as `CARGO_PROFILE_*` and `CARGO_TARGET_*`.
-
-A hit restores the declared intermediate files, then **always executes the task**.
-Cargo decides whether restored compiler outputs satisfy its freshness checks.
-Task stdout and output conditions come from the current execution, never a
-previous successful run. Archives are verified in staging before promotion;
-unexpected paths, links, checksums, and incomplete archives are rejected. Stale
-files in declared output trees are removed. Cache failures fall back to task
-execution. Plans label cached root tasks; run logs distinguish hits, misses,
-saves, and failures.
-
-```bash
+```sh
+cargo flux run bundle
 cargo flux run bundle --no-cache
 cargo flux run bundle --cache-required
 cargo flux run bundle --cache-hit-required
 ```
 
-`--cache-required` makes cache preparation, transfer, integrity and save errors
-fatal while still allowing a normal miss. `--cache-hit-required` additionally
-fails on misses before executing the task. A hit still runs the command. Both conflict with
-`--no-cache`; these execution policies do not change cache keys.
+A hit restores the files and **still runs the command**. Flux caches intermediates,
+not a previous validation result. Declare every input, environment value and tool
+version that affects the result. Use `optional_inputs` for files that may not exist.
 
-Cache restoration never substitutes for a validation or test result. Known root-task
-cache keys are prefetched with up to four concurrent downloads before execution. Downloads
-are staged, then their keys are rechecked at the task boundary before restoration.
-Keys depending on runtime outputs or unavailable inputs defer until they can be
-resolved. A prerequisite changing an input invalidates the prefetched entry.
+The default store is `.flux/cache`; add it to `.gitignore`. Cache errors normally
+fall back to execution. `--cache-required` makes errors fatal but permits misses;
+`--cache-hit-required` requires a hit before execution. Both conflict with
+`--no-cache`. See [cache details](docs/reference.md#intermediate-file-caching).
 
-For compiler snapshots and cross-job artifacts, explicit storage operations use
-the same configured store, compressed archives and native S3 transport:
+## Save and restore build snapshots
 
-```bash
-cargo flux storage save --key compiler-compatible-scope --path target
-cargo flux storage restore --key compiler-compatible-scope --path target
-cargo flux storage save --key artifacts/run-123/linux --path dist --path target/release/server
-cargo flux storage restore --key artifacts/run-123/linux --path dist --path target/release/server --required
-```
-
-Restore accepts repeated `--key` arguments, tried in order. A missing optional
-snapshot is a normal miss; `--required` makes missing release artifacts fatal.
-Explicit keys are scoped by the caller: compiler snapshots need compiler,
-platform, flags and scope compatibility; cross-job artifacts need immutable run
-and source identities. Storage operations never skip build/check/test commands.
-Archives preserve executable modes, sparse holes and exact file timestamps;
-contents are verified in staging before existing outputs are replaced.
-
-Storage hashes and verifies files with up to eight workers. Snapshot creation
-and extraction use up to eight independent zstd-compressed tar shards, bounded
-by available CPU parallelism. Files are balanced by allocated size on Unix to
-account for sparse linker outputs. Workers write buffered compressed extents
-directly into one temporary snapshot; an index supports parallel extraction
-without temporary shard copies. Restored files are verified before promotion.
-All temporary archives and staging are removed on success or failure.
-
-New snapshots use the versioned `objects/v2/` object path. Restore tries that
-format first, then reads legacy `objects/` snapshots, so existing caches can
-seed the new format without overwriting objects used by older Flux versions.
-This format versioning is internal; explicit compatibility and artifact keys
-remain unchanged. The first run using legacy data still extracts that legacy
-archive serially; subsequent runs can restore the new parallel format.
-
-Native S3 transfers use up to four concurrent 8 MiB upload parts or download
-ranges; large downloads pin ranges to one ETag and buffer disk writes. Storage
-reports hash, compression, verification, transfer and extraction times to stderr,
-including compressed byte counts and download throughput, so CPU and disk work
-can be distinguished from transfer costs.
-
-Named artifact contracts keep shared file lists in `flux.toml`:
+A snapshot is an explicit file-transfer contract. Declare it in **`flux.toml`**:
 
 ```toml
-[artifacts]
-linux = ["target/release/server", "dist"]
+[snapshots.rust-build]
+plugin = "cargo"
+paths = ["target"]
+
+[snapshots.rust-build.options]
+manifest_paths = ["Cargo.toml"]
 ```
 
-Use `storage save --key run-123 --artifact linux` and
-`storage restore --key run-123 --artifact linux --destination prebuilt --required`
-to transfer that contract between jobs.
+In a Cargo workspace with the build task from the quick start:
 
-`storage cargo-key --scope validation --selection product` prints a key based on
-compiler identity, platform, flags, source location and selected packages. Add
-`--affected BASE` for a narrower package pool; an empty selection prints no key.
-Source/manifest/lockfile content changes deliberately do not orphan compiler
-snapshots. Cargo makes the final freshness decision. `storage sources` records
-tracked source timestamps alongside the snapshot; `storage sources --restore`
-restores timestamps only for byte-identical files and touches changed content.
-Use repeated `--include PATH` for watched, ignored inputs.
-
-The setup action also accepts optional `toolchain`, `components`, `targets`,
-`compiler-cache: 'true'`, `compiler-cache-read-only` and `compiler-cache-prefix`.
-Compiler caching uses the dedicated Flux S3 client. Credential aliases needed
-by sccache are passed only to its isolated daemon, leaving the job's existing
-credential environment unchanged.
-
-The repository includes an explicit MinIO integration test:
-
-```bash
-# Supply CARGO_FLUX_S3_ACCESS_KEY_ID / SECRET_ACCESS_KEY for a dedicated test bucket.
-FLUX_TEST_S3_ENDPOINT=http://localhost:9000 \
-FLUX_TEST_S3_BUCKET=cargo-flux-canary \
-cargo test --test task_cache minio -- --ignored --nocapture
+```sh
+KEY=$(cargo flux storage key --plugin cargo --scope build)
+cargo flux storage restore --snapshot rust-build --key "$KEY"
+cargo flux storage sources --restore
+cargo flux run build
+cargo flux storage sources
+cargo flux storage save --snapshot rust-build --key "$KEY"
 ```
 
-It restores artifacts, verifies bytes and executable permissions, rejects a
-truncated remote archive, and verifies repair. Owned test prefixes are normally
-removed afterward; `FLUX_TEST_S3_KEEP=1` leaves them for inspection.
-`FLUX_TEST_CANARY_INPUT=/path/to/binary` uses an actual build artifact as input.
+The Cargo plugin excludes obsolete compiler units and incremental sessions while
+preserving reusable dependencies and feature variants. Source timestamp recording
+preserves unchanged tracked inputs across checkouts; the repo must be in Git.
+Cargo always decides freshness when the build runs.
 
-### `run <task>`
+Paths are relative to the workspace root. For shared targets, list every
+contributing workspace in `manifest_paths`. Saving selects archive contents and
+leaves local files in place; it is not a cleanup step. Unknown compiler units are
+retained conservatively, so selection does not impose a total size limit.
 
-Executes the planned tasks in dependency order.
+Restore needs only the declared paths and archive, without loading the plugin's
+build metadata. Set `FALLBACK_KEY` to another compatible snapshot key to try a
+fallback while preserving spare disk capacity:
 
-Flux prints a `[m/n]` progress prefix as tasks start. When an ecosystem plugin batches multiple ready tasks into one execution unit, Flux shows a range like `[3-7/20]`.
-
-By default, each task runs from its package directory. Ecosystem plugins may override that execution strategy for specific tasks when it is safe to do so. Today the Cargo plugin uses this hook for `workspace_batchable` tasks.
-
-### `version`
-
-Prints the next semantic version to stdout. Pure query, no side effects.
-
-Flux determines the version by:
-
-1. Finding the latest production git tag (`vX.Y.Z`, no prerelease suffix)
-2. Collecting all commit subjects since that tag
-3. Parsing conventional commits to determine the bump level, following
-   [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
-   - `fix:` commits produce a patch bump
-   - `feat:` commits produce a minor bump
-   - a `!` after the type/scope (`feat!:`, `refactor!:`, …) or a `BREAKING CHANGE`
-     footer on **any** type produces a major bump
-   - **all other types** (`docs`, `chore`, `style`, `refactor`, `perf`, `test`,
-     `build`, `ci`, and non-conventional subjects) have no implicit SemVer effect
-     and produce **no release**
-4. Resolving the current branch to a release channel via `[channels]` in `flux.toml`
-5. For prerelease channels, appending `-channel.N` where N is one more than the highest existing tag
-
-When step 3 finds no release-worthy commit, `cargo flux version` prints nothing
-to stdout and exits 0. Capturing it as a root task output and using a `nonempty`
-condition, as shown above, turns that result into a successful skipped release
-chain without hiding genuine calculation or publishing failures.
-
-```bash
-cargo flux version              # auto-detect channel from current branch
-cargo flux version --channel beta  # override channel
+```sh
+cargo flux storage restore --snapshot rust-build \
+  --key "$KEY" --key "$FALLBACK_KEY" --reserve-bytes 1073741824
 ```
 
-### `stamp [version]`
+Optional misses or capacity rejections allow the build to continue; `--required` makes the restore mandatory.
+Capacity checks cannot reserve space against other writers.
 
-Writes a version string into selected Cargo and JavaScript workspace manifests.
+For one-off saves, use inline flags instead of a named snapshot:
 
-- If a version argument is provided, stamps that literal string.
-- If omitted, calculates the next version the same way as `version`.
-- `--exclude-version VERSION` skips packages currently at that version.
-- Repeated `--package/-p NAME` arguments select an explicit subset.
-- Repeated `--exclude NAME` arguments remove packages from the selection.
-
-Flux updates dependency requirements only when the dependency target is also
-selected. In particular, an app may be stamped while a path/workspace dependency
-on an intentionally unversioned `0.0.0` package remains unchanged.
-
-Prints each modified file path to stderr and the stamped version to stdout.
-
-```bash
-cargo flux stamp                         # calculate and stamp
-cargo flux stamp 2.0.0                   # stamp an explicit version
-cargo flux stamp 2.0.0 --exclude-version 0.0.0
-cargo flux stamp 2.0.0 -p public-sdk -p release-app
-cargo flux stamp 2.0.0 --exclude some-private-crate
+```sh
+cargo flux storage save --key "$KEY" --path target --plugin cargo \
+  --plugin-option manifest-path=Cargo.toml
 ```
 
-A repository can make version exclusions the default in `flux.toml`; command-line
-exclusions are additive:
+`--snapshot` cannot be combined with inline path, artifact or plugin flags.
+The generic storage layer owns validation, archives and transport; the Cargo
+plugin owns compiler identities and selection. [Snapshot details](docs/reference.md#intermediate-file-caching).
+
+## Transfer finished artifacts
+
+Declare a generic snapshot without a plugin to preserve all declared files and
+empty directories:
 
 ```toml
-[stamp]
-exclude_versions = ["0.0.0"]
+[snapshots.assets]
+paths = ["dist"]
 ```
 
-## Release Channels
+After your build has created `dist/`, transfer it between jobs or machines using
+the same configured store:
 
-Release channels map git branches to version strategies. They are configured in `flux.toml`:
+```sh
+# Producer: use an immutable identity for this build and platform.
+KEY="artifacts/$(git rev-parse HEAD)/linux"
+cargo flux storage save --snapshot assets --key "$KEY"
+
+# Consumer: use that same key and snapshot paths.
+cargo flux storage restore --snapshot assets --key "$KEY" \
+  --destination prebuilt --required
+```
+
+The consumer receives `prebuilt/dist/`. Existing `[artifacts]` lists also work
+with `--artifact NAME`; explicit paths work with repeated `--path` flags.
+
+For shared S3-compatible storage, add:
+
+```toml
+[cache.s3]
+bucket = "build-cache"
+endpoint = "http://localhost:9000" # Omit for AWS S3.
+prefix = "flux"
+timeout_seconds = 120
+```
+
+Provide `CARGO_FLUX_S3_ACCESS_KEY_ID` and `CARGO_FLUX_S3_SECRET_ACCESS_KEY` through
+the environment. Optional settings are `CARGO_FLUX_S3_SESSION_TOKEN` and
+`CARGO_FLUX_S3_REGION` (default `us-east-1`). For a shared local filesystem instead:
+
+```toml
+[cache]
+directory = "/shared/flux-cache"
+```
+
+The same store serves task caches, snapshots and artifacts.
+
+## Use in GitHub Actions
+
+A complete pull-request workflow for the build/test task definitions above:
+
+```yaml
+name: Test
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Set up your language toolchains and install project dependencies here.
+      - id: flux
+        uses: ignition-is-go/cargo-flux@v0.11.8
+        with:
+          task: test
+          affected: origin/${{ github.base_ref }}
+```
+
+Use an action release that supports the configuration in your repo. To try
+unreleased manifest features, build the CLI from the checkout instead.
+
+Omit `task` for setup-only use. Later shell steps should invoke
+`"$CARGO_FLUX_BIN" run build` to retain the exact installed version. The action
+exposes `outcome` (`completed` or `skipped`) and JSON `task-outputs`; it can also
+configure S3 and sccache. [Action inputs and behavior](docs/reference.md#github-action).
+
+## Calculate and stamp versions
 
 ```toml
 [channels]
 main = "production"
-dev = "canary"
-
-[channels."release/beta"]
-channel = "beta"
-prerelease = true
 
 [channels."release/*"]
 channel = "rc"
 prerelease = true
 ```
 
-Shorthand `branch = "channel-name"` implies `prerelease = false` and produces stable versions like `1.2.0`.
-
-Table form `{ channel = "...", prerelease = true }` produces prerelease versions like `1.2.0-beta.3`.
-
-Branch names support trailing `*` for glob matching. Exact matches take priority over globs.
-
-### Self-publishing example
-
-A single-package workspace can compose versioning, stamping, Git, and publishing
-as structured commands. No task name is special and no shell guard is required:
-
-```toml
-[channels]
-main = "production"
-
-[tasks.calculate-version]
-root = ["cargo", "flux", "version"]
-outputs = { version = "stdout" }
-
-[tasks.publish-production]
-depends_on = ["calculate-version"]
-when = { output = "calculate-version.version", nonempty = true }
-root_steps = [
-  ["cargo", "flux", "stamp", "${calculate-version.version}"],
-  ["cargo", "update", "--workspace"],
-  ["cargo", "fmt", "--all"],
-  ["git", "add", "-A"],
-  ["git", "commit", "-m", "chore(release): v${calculate-version.version}"],
-  ["git", "tag", "v${calculate-version.version}", "-m", "Release ${calculate-version.version}"],
-  ["git", "push", "origin", "HEAD", "v${calculate-version.version}"],
-  ["cargo", "publish"],
-]
+```sh
+cargo flux version                 # Calculate without changing files
+cargo flux version --channel rc
+cargo flux stamp 1.2.3              # Write Cargo and JavaScript versions
+cargo flux stamp 1.2.3 --package api
 ```
 
-Then run:
-
-```bash
-cargo flux run publish-production --report release-report.json
-```
-
-A docs-only or chore-only commit makes `calculate-version.version` empty, so the
-publish task is reported as `skipped` and the command exits successfully. A real
-versioning, stamping, Git, or publishing error still fails the run.
-
-## Core Model
-
-`cargo-flux` has four separate concepts:
-
-1. Workspaces
-2. Logical tasks
-3. Bridges
-4. Task dependencies
-
-### Workspaces
-
-Each ecosystem plugin discovers the packages that belong to that ecosystem's workspace.
-
-### Logical tasks
-
-Logical tasks are repo-level names like `build`, `test`, `lint`, or `generate`.
-
-They are defined once in `flux.toml`, with different command variants per
-ecosystem. A `root` variant runs once at the workspace root and can coexist with
-package variants for the same logical task.
-
-### Bridges
-
-Bridges are package-level declarations that tell Flux when work needs to cross ecosystem boundaries.
-
-Example:
-
-- a TypeScript package may need a Rust crate to run `build` first
-- a Rust crate may need a Python package to run `generate` first
-
-Bridges are package relationships, not task-specific edges. Flux carries the current task name across the bridge.
-
-### Task dependencies
-
-Task dependencies are repo-level relationships between logical tasks.
-
-Example:
-
-- `build` may depend on `test`
-- `publish` may depend on `build`
-
-Package dependencies apply per package: Flux runs the dependency task on the
-same package before the dependent task. Root variants follow root variants with
-the same names and run once before package execution.
-
-## How Workspace Discovery Works
-
-Flux does not recursively crawl every manifest it can find. It respects the native workspace declarations for each ecosystem.
-
-### Cargo
-
-Flux reads the root `Cargo.toml` and uses:
-
-- `[workspace].members`
-- `[workspace].exclude`
-
-Only listed workspace members are discovered.
-
-### JavaScript
-
-Flux reads:
-
-- root `package.json` `workspaces`
-- root `pnpm-workspace.yaml`
-
-Only listed workspace packages are discovered.
-
-### uv / Python
-
-Flux reads the root `pyproject.toml` and uses:
-
-- `[tool.uv.workspace].members`
-- `[tool.uv.workspace].exclude`
-
-Only listed workspace members are discovered.
-
-### Ignored directories during expansion
-
-When expanding workspace globs, Flux ignores common generated and vendored directories:
-
-- `node_modules`
-- `.git`
-- `target`
-- `.venv`
-- `dist`
-
-This prevents false package discovery from installed dependencies or build artifacts.
-
-## How Native Dependencies Work
-
-Flux tracks native internal dependencies so it can understand topology and walk toward bridge declarations.
-
-It only treats explicitly local/workspace references as internal workspace dependencies.
-
-### Cargo internal dependency detection
-
-Cargo dependencies are considered internal only if they use:
-
-- `path = "..."`
-- `workspace = true`
-
-Flux ignores external crates, even if their names match workspace packages.
-
-### JavaScript internal dependency detection
-
-JavaScript dependencies are considered internal only if their version specifier uses:
-
-- `workspace:`
-- `file:`
-- `link:`
-- `portal:`
-
-Flux ignores registry dependencies like `react`, `typescript`, or published internal package names.
-
-### uv internal dependency detection
-
-uv dependencies are considered internal only if the dependency is backed by a local/workspace source in:
-
-- `[tool.uv.sources]`
-
-Flux ignores normal published Python dependencies.
-
-## Dev Dependency Policy
-
-Dev-only dependency edges are ignored when building topology by default.
-A task can set `include_dev_dependencies = true` to include them in its native
-cascade and prerequisite ordering. Use this with `cascade = "all"` for Cargo
-publication: Cargo resolves dev dependencies when packaging, so their workspace
-crates must already be published. Self dev dependencies are ignored; real cycles
-between different packages are reported before execution. Ordinary build tasks
-keep the default and do not inherit publication-only ordering.
-
-```toml
-[tasks.publish]
-include_dev_dependencies = true
-cascade = "all"
-autoapply = "inherit"
-cargo = ["cargo", "publish", "--locked"]
-```
-
-Ignored dependency types:
-
-- Cargo `dev-dependencies`
-- npm `devDependencies`
-- uv dev groups / dev dependencies
-
-Flux currently still considers certain non-dev dependency types where they are part of normal package relationships, such as Cargo `build-dependencies`, npm `peerDependencies`, and uv optional dependencies, but only when they are explicitly local/workspace references.
-
-Flux also prints warnings to stderr when a workspace package references another workspace package from a special dependency section such as Cargo `dev-dependencies`, Cargo `build-dependencies`, npm `devDependencies`, or uv dev dependency groups. These warnings do not change planning; they are just a signal that the repo is depending on workspace packages through non-runtime sections.
-
-## Task Definitions
-
-Logical tasks are defined in a repo-level `flux.toml`.
-
-Example:
-
-```toml
-[tasks.build]
-depends_on = ["test"]
-workspace_batchable = true
-variables = ["mode"]
-cargo = ["cargo", "build"]
-npm = ["npm", "run", "build"]
-pnpm = ["pnpm", "build"]
-yarn = ["yarn", "build"]
-bun = ["bun", "run", "build"]
-uv = ["uv", "run", "python", "-m", "build"]
-
-[tasks.test]
-autoapply = "inherit"
-cargo = ["cargo", "test"]
-npm = ["npm", "run", "test"]
-uv = ["uv", "run", "pytest"]
-
-[tasks.publish]
-cascade = "all"
-cargo = ["cargo", "publish"]
-
-[tasks.docker]
-default = ["docker", "build", "."]
-```
-
-### Supported task variants
-
-Each task can define commands for:
-
-- `root` (runs once from the workspace root)
-- `default`
-- `cargo`
-- `npm`
-- `pnpm`
-- `yarn`
-- `bun`
-- `uv`
-
-`default` is a shared fallback command for tasks that are the same across ecosystems.
-
-Example:
-
-```toml
-[tasks.docker]
-default = ["docker", "build", "."]
-```
-
-For JavaScript packages, Flux prefers the detected package-manager-specific variant, then falls back to `npm`, then to `default` when present.
-
-### `depends_on`
-
-Tasks can depend on other logical tasks:
-
-```toml
-[tasks.build]
-depends_on = ["test"]
-cargo = ["cargo", "build"]
-
-[tasks.test]
-cargo = ["cargo", "test"]
-```
-
-For package variants, Flux schedules the dependency task on the same package
-before the dependent task. A package task can also depend on a root-only task;
-that root command runs once before package execution. Root variants resolve
-`depends_on` only through other root variants.
-
-This composes with cascades and bridges. If `build` appears on a package because it was an entrypoint, a cascaded dependency, or a bridged package, `build`'s task dependencies are applied there too, subject to the dependency task's own `autoapply` and `cascade` settings.
-
-### `workspace_batchable`
-
-Tasks can opt into workspace-native batching:
-
-```toml
-[tasks.check]
-workspace_batchable = true
-cargo = ["cargo", "check"]
-```
-
-This does not change planning semantics. Flux still plans package-task nodes first and respects dependency ordering.
-
-Batching only happens at execution time. Compatible Cargo tasks may be combined across native dependency layers because Cargo itself understands the workspace dependency graph. Flux does not batch across task dependencies, ecosystem bridges, non-Cargo tasks, different commands or arguments, or different variable environments.
-
-Today this is implemented for Cargo commands. When multiple Cargo packages have the same logical task and that task is marked `workspace_batchable`, Flux can collapse them into a single workspace Cargo invocation such as `cargo check -p a -p b -p c`.
-
-This is an execution optimization only. The dependency graph, task availability rules, failure policy, and plan output still operate on package-task nodes. Batched Cargo commands run from the workspace root; unbatched commands retain their package working directory.
-
-### `ecosystem_depends_on`
-
-Tasks can also declare ecosystem-scoped dependency searches.
-
-Example:
-
-```toml
-[tasks.build]
-npm = ["npm", "run", "build"]
-
-[tasks.build.ecosystem_depends_on]
-js = ["cargo:gen"]
-```
-
-This means:
-
-- when Flux runs `build` on a JS package
-- it searches the reachable dependency tree from that package
-- any reachable Cargo package is asked to run `gen` before the JS `build` continues
-
-This is different from `depends_on`:
-
-- `depends_on` adds same-package task dependencies like `pkg:build -> pkg:test`
-- `ecosystem_depends_on` searches the reachable package graph for another ecosystem and schedules a different task there
-
-### `autoapply`
-
-`autoapply` controls whether a task is available on a package without that package explicitly opting into it.
-
-Default:
-
-- `"none"`
-
-Supported values:
-
-- `"none"`
-- `"inherit"`
-- `"all"`
-
-Example:
-
-```toml
-[tasks.test]
-autoapply = "inherit"
-cargo = ["cargo", "test"]
-```
-
-Behavior:
-
-- `none`: only explicit opt-ins can receive the task
-- `inherit`: the task can be inherited through bridges, task dependencies, or native cascade rules
-- `all`: same as `inherit`, and if no package explicitly opts into the task, Flux seeds the task on every compatible package
-
-### `cascade`
-
-`cascade` controls how far a task can spread across packages.
-
-Supported values:
-
-- `"none"`
-- `"bridge-only"`
-- `"all"`
-
-Default:
-
-- `"bridge-only"`
-
-Behavior:
-
-- `none`: the task only runs on packages that explicitly opt into it
-- `bridge-only`: the task can cross bridges, but it does not run on same-ecosystem dependency chains
-- `all`: the task also runs on same-ecosystem dependencies and their dependencies
-
-Examples:
-
-```toml
-[tasks.publish]
-cascade = "all"
-cargo = ["cargo", "publish"]
-```
-
-```toml
-[tasks.publish-docker]
-cascade = "none"
-default = ["docker", "push", "${image}"]
-```
-
-### `variables`
-
-Tasks can declare required variables:
-
-```toml
-[tasks.build]
-variables = ["mode"]
-npm = ["npm", "run", "build:${mode}"]
-```
-
-If a package opts into `build`, it must provide every variable named in `variables`.
-
-This lets Flux fail early with a clear configuration error even if the command shape itself would not have surfaced the missing value until later.
-
-The contract is:
-
-- task definition in `flux.toml` declares which variables are required
-- package opt-in in the native manifest provides the values
-- task command may interpolate those values with `${name}`
-
-Example:
-
-```toml
-[tasks.build]
-variables = ["mode"]
-npm = ["npm", "run", "build:${mode}"]
-```
-
-```json
-{
-  "name": "@repo/web",
-  "flux": {
-    "tasks": {
-      "build": {
-        "variables": {
-          "mode": "production"
-        }
-      }
-    }
-  }
-}
-```
-
-If `@repo/web` opted into `build` but did not supply `mode`, Flux would fail during task resolution with a configuration error instead of silently planning an invalid command.
-
-`cascade = "all"` is useful for tasks that should deliberately run across same-ecosystem dependency chains, such as repo-specific release or publish flows.
-
-## JavaScript Package Manager Detection
-
-For JavaScript packages, Flux determines the package manager in this order:
-
-1. `package.json` `packageManager`
-2. lockfiles in the package directory or its ancestors
-3. fallback to `npm`
-
-Recognized lockfiles:
-
-- `pnpm-lock.yaml`
-- `yarn.lock`
-- `bun.lock`
-- `bun.lockb`
-- `package-lock.json`
-
-This affects task resolution and display labels.
-
-Examples:
-
-- JS package with pnpm uses the `pnpm` variant if present
-- JS package with Yarn uses the `yarn` variant if present
-- output labels show `[pnpm]`, `[yarn]`, `[bun]`, or `[npm]`
-
-## Package Opt-In
-
-Packages decide which logical tasks they participate in through native manifest metadata.
-
-Simple opt-in still works:
-
-- `tasks = ["build", "test"]`
-
-But tasks can also be declared in a richer form with per-task variables.
-
-### Cargo opt-in
-
-```toml
-[package.metadata.flux]
-tasks = ["build", "test"]
-```
-
-With task variables:
-
-```toml
-[package.metadata.flux.tasks.build.variables]
-profile = "release"
-target = "wasm32-unknown-unknown"
-```
-
-### `package.json` opt-in
-
-```json
-{
-  "name": "@repo/web",
-  "flux": {
-    "tasks": ["build", "lint"]
-  }
-}
-```
-
-With task variables:
-
-```json
-{
-  "name": "@repo/web",
-  "flux": {
-    "tasks": {
-      "build": {
-        "variables": {
-          "mode": "production"
-        }
-      }
-    }
-  }
-}
-```
-
-### `pyproject.toml` opt-in
-
-```toml
-[tool.flux]
-tasks = ["test"]
-```
-
-With task variables:
-
-```toml
-[tool.flux.tasks.build.variables]
-mode = "release"
-```
-
-### Task variables
-
-Package-level task opt-in can provide task-specific variables. Flux interpolates those variables into the task command from `flux.toml`.
-
-Use `${name}` in task command parts:
-
-```toml
-[tasks.build]
-npm = ["npm", "run", "build:${mode}"]
-```
-
-If a package opts into `build` with:
-
-```json
-{
-  "flux": {
-    "tasks": {
-      "build": {
-        "variables": {
-          "mode": "production"
-        }
-      }
-    }
-  }
-}
-```
-
-then Flux resolves:
-
-```text
-npm run build:production
-```
-
-There are two ways missing variables are caught:
-
-- if the task declares `variables = ["mode"]`, Flux errors as soon as a package opts into that task without providing `mode`
-- if a command references `${mode}`, Flux also errors during interpolation if `mode` is missing
-
-Simple task-list opt-in is still fine when no task variables are needed. Use the richer task-map form only for packages that need per-task overrides.
-
-### JavaScript task participation
-
-Flux does not treat `package.json` scripts as explicit task opt-ins.
-
-JavaScript packages participate in Flux tasks only when:
-
-- they opt in through `flux.tasks`
-- the task becomes available through `autoapply`
-- the package is reached through bridge or cascade rules that allow that task
-
-The `scripts` section still matters for your package manager's own behavior, but it does not make a package a Flux entrypoint by itself.
-
-## Bridge Definitions
-
-Bridges are declared at the package level in native manifests.
-
-They represent cross-ecosystem dependencies that Flux must orchestrate manually.
-
-### Cargo bridges
-
-```toml
-[package.metadata.flux]
-bridges = ["js:@repo/ui", "uv:codegen"]
-```
-
-### `package.json` bridges
-
-```json
-{
-  "name": "@repo/web",
-  "flux": {
-    "bridges": ["cargo:myko-rs"]
-  }
-}
-```
-
-### `pyproject.toml` bridges
-
-```toml
-[tool.flux]
-bridges = ["cargo:core-types"]
-```
-
-## Scoped Bridge Syntax
-
-Bridge targets can be written as:
-
-- `cargo:<name>`
-- `js:<name>`
-- `uv:<name>`
-
-Examples:
-
-- `cargo:myko-rs`
-- `js:@rship/ui`
-- `uv:shared-lib`
-
-Unscoped bridge names still work:
-
-```toml
-bridges = ["codegen"]
-```
-
-But unscoped names are only safe when that package name is unique across the whole repo. If the same name exists in multiple ecosystems, Flux raises an ambiguity error.
-
-Scoped bridges are recommended.
-
-## Planning Semantics
-
-This is the most important rule set in Flux.
-
-### 1. Entry points are opt-in
-
-Only packages that opt into a task are chosen as task entrypoints.
-
-Flux does not run a task on every package in the workspace.
-
-### 2. Native dependencies do not imply same-task execution
-
-If Cargo, npm, or uv already know how to build their own native dependency graph, Flux does not manually schedule the same task on every native dependency.
-
-Example:
-
-- Rust crate `a` depends on crate `b`
-- crate `b` depends on crate `c`
-- `a` opts into `build`
-
-Flux schedules `a:build`, not `b:build` and `c:build`.
-
-Cargo itself is expected to handle those native build relationships.
-
-### 2a. Tasks can choose how far they cascade
-
-If a task sets `cascade = "all"` in `flux.toml`, Flux may schedule that same task on native internal dependencies, but only when the task is also allowed to inherit there by `autoapply`.
-
-Example:
-
-- crate `a` depends on `b`
-- `b` depends on `c`
-- task `publish` sets `autoapply = "inherit"`
-- task `publish` has `cascade = "all"`
-- `a` opts into `publish`
-
-Flux schedules:
-
-- `c:publish`
-- `b:publish`
-- `a:publish`
-
-### 3. Native dependencies are still traversed to find bridges
-
-Flux walks native dependency chains while looking for bridge declarations.
-
-Example:
-
-- `a -> b -> c` are Cargo dependencies
-- crate `c` has `bridges = ["js:d"]`
-- `a` opts into `build`
-
-Flux finds the bridge through `c` and schedules `d:build` before `a:build`.
-
-### 4. Bridges carry the same task name
-
-Bridges are not task-specific.
-
-If Flux is planning `build`, a bridge means "run `build` on that bridged package too."
-
-If Flux is planning `test`, the same bridge means "run `test` on that bridged package too."
-
-### 5. Task dependencies run on the same package first
-
-If a task declares `depends_on = ["test"]`, then every `pkg:build` node depends on `pkg:test`.
-
-That applies anywhere the task appears:
-
-- direct task entrypoints
-- native cascaded packages
-- bridged packages
-
-If the dependency task sets `cascade = "none"`, Flux does not inherit that task onto other packages at all. It only runs on packages that explicitly opt into that task themselves.
-
-### 6. Bridge targets follow `autoapply` and `cascade`
-
-Bridges do not bypass task availability rules.
-
-A bridged package gets task `X` when either:
-
-- the package explicitly opts into `X`
-- `X` sets `autoapply = "inherit"` or `autoapply = "all"`, and `cascade` is not `"none"`
-
-This keeps bridge behavior predictable:
-
-- `autoapply = "none"` means only explicit opt-ins can receive the task
-- `cascade = "none"` means the task never spreads to other packages, even across bridges
-- `cascade = "bridge-only"` means the task may cross bridges, but not same-ecosystem dependency chains
-- `cascade = "all"` means the task may cross bridges and also run on same-ecosystem dependencies when `autoapply` allows inheritance
-
-## Examples
-
-### Example 1: simple mixed repo
-
-`flux.toml`:
-
-```toml
-[tasks.build]
-cargo = ["cargo", "build"]
-pnpm = ["pnpm", "build"]
-uv = ["uv", "run", "python", "-m", "build"]
-```
-
-Rust crate:
-
-```toml
-[package]
-name = "myko-rs"
-version = "0.1.0"
-```
-
-JavaScript package:
-
-```json
-{
-  "name": "@rship/ui",
-  "scripts": {
-    "build": "vite build"
-  },
-  "flux": {
-    "bridges": ["cargo:myko-rs"]
-  }
-}
-```
-
-If `@rship/ui` is an entrypoint for `build`, Flux will plan:
-
-```text
-@rship/ui:build [pnpm]
-`-- myko-rs:build [cargo]
-```
-
-### Example 2: bridge discovered through native deps
-
-Imagine:
-
-- Cargo crate `a` depends on `b`
-- `b` depends on `c`
-- `c` bridges to JS package `d`
-- `a` opts into `build`
-
-Flux will plan:
-
-```text
-a:build [cargo]
-`-- d:build [npm]
-```
-
-It will not separately schedule `b:build` or `c:build`.
-
-## Output
-
-### `graph`
-
-`graph` shows package relationships at the workspace topology level.
-
-Example shape:
-
-```text
-service [cargo] service/Cargo.toml
-`-- shared [cargo] shared/Cargo.toml
-```
-
-### `plan build`
-
-`plan build` shows the task plan.
-
-Example shape:
-
-```text
-app:build [cargo]
-`-- @repo/ui:build [pnpm] {mode=production}
-```
-
-For JS packages, the label uses the detected package manager instead of the generic `js` ecosystem.
-
-## Plugin Architecture
-
-Workspace support is implemented as ecosystem plugins.
-
-Current built-in plugins:
-
-- Cargo plugin
-- JS plugin
-- uv plugin
-
-The shared core handles:
-
-- package normalization
-- common package metadata
-- internal dependency linking
-- graph building
-- task planning
-
-Each plugin owns:
-
-- workspace discovery
-- native manifest parsing
-- task opt-in extraction
-- bridge extraction
-- native dependency extraction
-- ecosystem-specific metadata like JS package-manager detection
-- ecosystem-specific execution shaping such as workspace batching
-
-## Current Limitations
-
-Current known boundaries:
-
-- `run` executes one execution unit at a time; parallel execution is not implemented yet
-- workspace batching is currently implemented only for Cargo task commands
-- bridge targets resolve by package identity, not by filesystem path
-- bridge syntax supports ecosystem scoping, but not more advanced selectors
-- inherited task availability is controlled by `autoapply` and `cascade`, so repo config needs to describe which tasks may spread
-- uv does not have a native task system, so Python task participation is driven by Flux metadata and `flux.toml`
-
-## Suggested Repo Setup
-
-For a mixed repo, a good starting pattern is:
-
-1. Define logical tasks once in `flux.toml`
-2. Opt in only true task entrypoints in native manifests
-3. Add bridges only where work must cross ecosystems
-4. Prefer scoped bridges like `cargo:myko-rs`
-
-That keeps Flux focused on orchestration rather than replacing each ecosystem's native build behavior.
+Since the latest production tag, `fix:` produces a patch, `feat:` a minor, and a
+breaking change a major bump. Without a release-worthy change, `version` prints
+nothing and succeeds. `stamp` without a version calculates it first. Stamping
+updates dependency requirements only when their targets are also selected.
+See [release rules](docs/reference.md#version) and the
+[release-task example](docs/reference.md#self-publishing-example).
+
+## Reference and limits
+
+Use `cargo flux --help` or `cargo flux COMMAND --help` for flags. The
+[full reference](docs/reference.md) covers task variables, package discovery,
+bridge syntax, release channels, storage compatibility and plugin boundaries.
+
+Execution is sequential; Cargo workspace batching is currently the only batching
+implementation. Cross-language ordering needs explicit bridges. Files restored
+from any cache remain subject to the native tool's freshness and validation rules.
