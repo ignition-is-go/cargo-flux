@@ -13,7 +13,7 @@ Cargo, your JavaScript package manager and uv still do the builds.
 [Quick start](#quick-start) · [Task order](#control-task-order) ·
 [Changed packages](#run-only-changed-work) · [Caching](#reuse-intermediate-files) ·
 [Snapshots](#save-and-restore-build-snapshots) · [CI](#use-in-github-actions) ·
-[Full reference](docs/reference.md)
+[Full reference](docs/reference.md) · [Contributing](CONTRIBUTING.md)
 
 ## Install
 
