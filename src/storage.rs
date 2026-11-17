@@ -1,4 +1,4 @@
-//! Explicit cross-job artifacts and reusable compiler snapshots. Restoring these
+//! Explicit cross-job artifacts and reusable build snapshots. Restoring these
 //! files never records a task as passed; callers still execute their validation.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -10,8 +10,6 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::cache::Store;
 
-mod compiler;
-pub(crate) use compiler::record::compiler_entry;
 mod parallel;
 pub(crate) mod space;
 
@@ -54,7 +52,7 @@ fn hash_workers(files: usize) -> usize {
         .min(files)
 }
 
-/// Bound archive and filesystem work independently of Cargo's compiler jobs.
+/// Bound archive and filesystem work independently of build jobs.
 fn parallel_map<T: Sync, U: Send>(
     items: &[T],
     operation: impl Fn(&T) -> Result<U> + Sync,
@@ -103,7 +101,7 @@ fn phase(name: &str, started: std::time::Instant) {
     eprintln!("storage {name}: {:.2}s", started.elapsed().as_secs_f64());
 }
 
-fn relative(path: &Path) -> Result<()> {
+pub(crate) fn relative(path: &Path) -> Result<()> {
     ensure!(!path.as_os_str().is_empty(), "empty storage path");
     ensure!(
         path.components()
@@ -146,7 +144,7 @@ fn digest(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn collect(root: &Path, path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
+pub(crate) fn collect(root: &Path, path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
     relative(path)?;
     let metadata = fs::symlink_metadata(root.join(path))?;
     ensure!(
@@ -167,7 +165,7 @@ fn collect(root: &Path, path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn validate_paths(paths: &[PathBuf]) -> Result<()> {
+pub(crate) fn validate_paths(paths: &[PathBuf]) -> Result<()> {
     ensure!(!paths.is_empty(), "declare at least one storage path");
     for (index, path) in paths.iter().enumerate() {
         relative(path)?;
@@ -240,33 +238,17 @@ fn transfer(
     }
 }
 
-pub fn prepare_cargo(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    variables: &BTreeMap<String, String>,
-    capture_stdout: bool,
-) -> Option<compiler::record::Recording> {
-    compiler::record::prepare(program, args, cwd, variables, capture_stdout)
-}
-
 pub fn save(
     root: &Path,
     store: &Store,
     key: &str,
     paths: &[PathBuf],
-    compiler: bool,
-    manifests: &[PathBuf],
+    policy: Option<&dyn crate::snapshot::SnapshotPolicy>,
 ) -> Result<()> {
     validate_paths(paths)?;
-    let _cache_locks = if compiler {
-        for path in paths {
-            ensure!(root.join(path).exists(), "storage input does not exist");
-        }
-        compiler::record::lock(root, paths)?
-    } else {
-        Vec::new()
-    };
+    let mut selection = policy
+        .map(|policy| policy.prepare(root, paths))
+        .transpose()?;
     let mut files = BTreeSet::new();
     for path in paths {
         ensure!(
@@ -276,11 +258,16 @@ pub fn save(
         collect(root, path, &mut files)?;
     }
     let original_files = files.clone();
-    let _locks = if compiler {
-        compiler::select(root, &mut files, paths, manifests)?
-    } else {
-        Vec::new()
-    };
+    let mut include_empty_directories = true;
+    if let Some(selection) = selection.as_mut() {
+        let plan = selection.select(&files)?;
+        ensure!(
+            plan.files.is_subset(&files),
+            "snapshot policy selected undeclared files"
+        );
+        files = plan.files;
+        include_empty_directories = plan.include_empty_directories;
+    }
     let started = std::time::Instant::now();
     eprintln!(
         "storage hashing {} files ({} workers)",
@@ -298,12 +285,17 @@ pub fn save(
     let mut temporary = tempfile::NamedTempFile::new()?;
     let started = std::time::Instant::now();
     eprintln!("storage compressing archive");
-    parallel::save(root, temporary.as_file_mut(), manifest, compiler)?;
+    parallel::save(
+        root,
+        temporary.as_file_mut(),
+        manifest,
+        include_empty_directories,
+    )?;
     temporary.flush()?;
     phase("compress", started);
     let started = std::time::Instant::now();
     eprintln!("storage verifying snapshot stability");
-    // Recheck producer inputs without expanding a second target tree: a Cargo
+    // Recheck producer inputs without expanding a second target tree: a build
     // snapshot can be hundreds of gigabytes of sparse files.
     let mut current = BTreeSet::new();
     for path in paths {
@@ -523,14 +515,7 @@ mod tests {
         fs::create_dir(producer.path().join("dist"))?;
         fs::write(producer.path().join("dist/binary"), "compiled")?;
         let paths = vec![PathBuf::from("dist")];
-        save(
-            producer.path(),
-            &store,
-            "artifact/run/one",
-            &paths,
-            false,
-            &[],
-        )?;
+        save(producer.path(), &store, "artifact/run/one", &paths, None)?;
         fs::create_dir(consumer.path().join("dist"))?;
         fs::write(consumer.path().join("dist/stale"), "stale")?;
         assert!(restore(
@@ -573,7 +558,7 @@ mod tests {
         let store = Store::default();
         fs::create_dir(root.path().join("dist"))?;
         fs::write(root.path().join("dist/binary"), "original")?;
-        save(root.path(), &store, "one", &["dist".into()], false, &[])?;
+        save(root.path(), &store, "one", &["dist".into()], None)?;
         let object = root
             .path()
             .join(format!(".flux/cache/{}.tar", object_key("one")?));
@@ -591,25 +576,14 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(root.path().join("dist/binary"))?, b"original");
-        assert!(
-            save(
-                root.path(),
-                &store,
-                "bad",
-                &["../outside".into()],
-                false,
-                &[]
-            )
-            .is_err()
-        );
+        assert!(save(root.path(), &store, "bad", &["../outside".into()], None,).is_err());
         assert!(
             save(
                 root.path(),
                 &store,
                 "bad",
                 &["dist".into(), "dist/binary".into()],
-                false,
-                &[],
+                None,
             )
             .is_err()
         );
@@ -632,8 +606,7 @@ mod tests {
             &Store::default(),
             "expanded",
             &["dist".into()],
-            false,
-            &[],
+            None,
         )?;
         fs::remove_dir_all(root.path().join("dist"))?;
         fs::create_dir(root.path().join("dist"))?;
@@ -671,14 +644,7 @@ mod tests {
         drop(file);
         let before = fs::metadata(&path)?;
         let store = Store::default();
-        save(
-            root.path(),
-            &store,
-            "snapshot",
-            &["target".into()],
-            false,
-            &[],
-        )?;
+        save(root.path(), &store, "snapshot", &["target".into()], None)?;
         fs::remove_dir_all(root.path().join("target"))?;
         restore(
             root.path(),
@@ -706,48 +672,6 @@ mod tests {
         );
         Ok(())
     }
-}
-
-/// Source contents deliberately do not enter compiler compatibility. Cargo's
-/// fingerprints own source freshness, including manifests and dependency locks.
-pub fn cargo_key(root: &Path, scope: &str, packages: &[String]) -> Result<String> {
-    ensure!(
-        !scope.is_empty() && !scope.contains(['\n', '\r']),
-        "invalid Cargo cache scope"
-    );
-    let output = std::process::Command::new("rustc")
-        .args(["--version", "--verbose"])
-        .output()?;
-    ensure!(output.status.success(), "rustc version probe failed");
-    let flags = std::env::vars()
-        .filter(|(name, _)| {
-            matches!(
-                name.as_str(),
-                "RUSTFLAGS"
-                    | "RUSTDOCFLAGS"
-                    | "CARGO_ENCODED_RUSTFLAGS"
-                    | "CARGO_BUILD_TARGET"
-                    | "CC"
-                    | "CXX"
-                    | "CFLAGS"
-                    | "CXXFLAGS"
-                    | "RUSTC"
-                    | "RUSTC_WRAPPER"
-                    | "RUSTC_WORKSPACE_WRAPPER"
-            ) || name.starts_with("CARGO_PROFILE_")
-                || name.starts_with("CARGO_TARGET_")
-        })
-        .collect::<BTreeMap<_, _>>();
-    let identity = serde_json::to_vec(&(
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        root,
-        scope,
-        packages,
-        output.stdout,
-        flags,
-    ))?;
-    Ok(format!("cargo/{:x}", Sha256::digest(identity)))
 }
 
 pub fn restore_into(

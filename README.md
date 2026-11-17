@@ -410,7 +410,7 @@ the same configured store, compressed archives and native S3 transport:
 
 ```bash
 cargo flux run build
-cargo flux storage save --compiler --key compiler-compatible-scope --path target
+cargo flux storage save --plugin cargo --key compiler-compatible-scope --path target
 cargo flux storage restore --key compiler-compatible-scope --path target
 cargo flux storage save --key artifacts/run-123/linux --path dist --path target/release/server
 cargo flux storage restore --key artifacts/run-123/linux --path dist --path target/release/server --required
@@ -432,15 +432,24 @@ directly into one temporary snapshot; an index supports parallel extraction
 without temporary shard copies. Restored files are verified before promotion.
 All temporary archives and staging are removed on success or failure.
 
-Flux's existing task executor records optional package provenance for structured,
+Snapshot selection is an optional ecosystem-plugin capability. `storage save`
+without `--plugin` archives all declared inputs, including empty directories.
+With `--plugin NAME`, that plugin selects from the declared files and controls
+whether empty directories are included. Storage validates the selection, owns
+archive integrity and transport, and holds the plugin's preparation guards through
+verification and upload. Repeated `--plugin-option KEY=VALUE` arguments belong to
+the selected plugin; unsupported providers and options fail explicitly. Restore
+uses the archive alone and does not require a language plugin.
+
+The Cargo plugin records optional package provenance for structured,
 non-interactive Cargo compilation commands. Root tasks, package tasks and batched
 Cargo tasks use the same execution path. Standard output and task-output capture
 retain their existing behavior. Interactive execution and opaque shell commands
 continue through their existing paths.
 
-An internal compiler adapter captures Cargo's manifest, package version and
-unit hash at compilation time. The executor checks these against Cargo's package
-reports and compiler fingerprints before writing `.flux-compiler-units.json`
+The Cargo plugin's internal compiler adapter captures Cargo's manifest, package
+version and unit hash at compilation time. The plugin checks these against Cargo's
+package reports and compiler fingerprints before writing `.flux-compiler-units.json`
 inside each compiler cache directory. Mutable output aliases provide no ownership
 proof. Earlier alias-based records remain unknown. Environment compiler wrappers
 are forwarded. Configured wrappers, workspace wrappers, custom compilers, explicit
@@ -450,7 +459,7 @@ provenance leaves successful builds successful. Missing or invalid records leave
 unit identities unknown during snapshot selection. No new build command is
 required.
 
-Compiler snapshots saved with `--compiler` select Cargo units using declared
+Compiler snapshots saved with `--plugin cargo` select Cargo units using declared
 package sources, enabled features and fingerprint dependency relationships.
 Recorded local units from obsolete package versions and incremental sessions
 are excluded from the archive. Existing cached units with unknown provenance
@@ -459,7 +468,7 @@ Files in the producer's target directory remain available after saving. The
 caller can remove that directory after a successful upload.
 
 Declare each independent workspace sharing a target directory with repeated
-`--manifest-path PATH` on `storage save --compiler`.
+`--plugin-option manifest-path=PATH` on `storage save --plugin cargo`.
 The default manifest is `Cargo.toml`. Selection uses offline Cargo metadata and
 the declared workspaces' lockfiles. Existing Cargo profile locks are held while
 the snapshot is prepared. Complete builds before saving.
@@ -493,12 +502,13 @@ Use `storage save --key run-123 --artifact linux` and
 `storage restore --key run-123 --artifact linux --destination prebuilt --required`
 to transfer that contract between jobs.
 
-`storage cargo-key --scope validation --selection product` prints a key based on
-compiler identity, platform, flags, source location and selected packages. Add
+`storage key --plugin cargo --scope validation --selection product` prints a key
+based on compiler identity, platform, flags, source location and selected packages. Add
 `--affected BASE` for a narrower package pool; an empty selection prints no key.
 Source/manifest/lockfile content changes deliberately do not orphan compiler
-snapshots. Cargo makes the final freshness decision. `storage sources` records
-tracked source timestamps alongside the snapshot; `storage sources --restore`
+snapshots. The published `storage cargo-key` spelling remains a compatibility
+alias for the Cargo plugin. Cargo makes the final freshness decision.
+`storage sources` records tracked source timestamps alongside the snapshot; `storage sources --restore`
 restores timestamps only for byte-identical files and touches changed content.
 Use repeated `--include PATH` for watched, ignored inputs.
 
@@ -1423,6 +1433,8 @@ The shared core handles:
 - internal dependency linking
 - graph building
 - task planning
+- process lifecycle, exit status and stdout capture
+- snapshot path validation, archive integrity, transport and disk-space admission
 
 Each plugin owns:
 
@@ -1433,6 +1445,23 @@ Each plugin owns:
 - native dependency extraction
 - ecosystem-specific metadata like JS package-manager detection
 - ecosystem-specific execution shaping such as workspace batching
+- optional invocation preparation and stdout protocol observation
+- optional runtime adapters, build-cache compatibility keys and snapshot selection
+
+`ManifestPlugin` exposes optional execution and cache capabilities alongside its
+manifest discovery/parsing contract. The shared runner passes structured
+invocations to providers; a provider can decline unsupported commands. A prepared
+invocation supplies a command and an observer, while the runner owns spawning,
+waiting, user output and capture. Observer finalization runs only after success;
+metadata failures are diagnostic and do not fail successful tasks. Shell commands
+bypass observation.
+
+Snapshot policies prepare before file enumeration so providers can acquire
+coordination guards. Their selection is bounded to enumerated files, and the
+selection object stays alive until upload completes. Cargo fingerprints, package
+identities, compiler receipts and profile locks live under the Cargo plugin;
+archive storage has no knowledge of those formats. Adding another provider does
+not require language checks in the runner or storage.
 
 ## Current Limitations
 

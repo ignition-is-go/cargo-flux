@@ -1,22 +1,13 @@
 //! Compiler-unit provenance reported by a successful Cargo invocation.
 use super::*;
-use std::io::{BufRead, BufReader, IsTerminal};
-use std::process::Stdio;
+use crate::execution::{ExecutionObserver, PreparedInvocation};
+use std::io::IsTerminal;
 
 mod capture;
 
 pub(crate) use capture::compiler_entry;
 
 const FILE: &str = ".flux-compiler-units.json";
-
-struct CargoChild(std::process::Child);
-
-impl Drop for CargoChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Record {
@@ -29,7 +20,7 @@ pub(super) struct Record {
 
 pub(super) const LOCK: &str = ".flux-compiler.lock";
 
-pub(in crate::storage) fn lock(root: &Path, paths: &[PathBuf]) -> Result<Vec<fs::File>> {
+pub(in crate::plugins::cargo) fn lock(root: &Path, paths: &[PathBuf]) -> Result<Vec<fs::File>> {
     let mut locks = Vec::new();
     for path in paths.iter().collect::<BTreeSet<_>>() {
         let directory = root.join(path);
@@ -102,8 +93,9 @@ struct CargoMetadata {
 }
 
 pub(crate) struct Recording {
-    command: Command,
-    cwd: PathBuf,
+    artifacts: Vec<Artifact>,
+    artifact_error: Option<serde_json::Error>,
+    compilation_finished: bool,
     root: PathBuf,
     paths: Vec<PathBuf>,
     forward_json: bool,
@@ -130,13 +122,13 @@ fn future_canonical(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-pub(in crate::storage) fn prepare(
+pub(in crate::plugins::cargo) fn prepare(
     program: &str,
     args: &[String],
     cwd: &Path,
     variables: &BTreeMap<String, String>,
     capture_stdout: bool,
-) -> Option<Recording> {
+) -> Option<PreparedInvocation> {
     if !capture_stdout && std::io::stdout().is_terminal() {
         return None;
     }
@@ -237,98 +229,76 @@ pub(in crate::storage) fn prepare(
     let mut command = Command::new(program);
     command.current_dir(cwd).envs(variables).args(arguments);
     let capture = capture::Capture::prepare(&mut command, cwd, variables, &args[..position])?;
-    Some(Recording {
+    Some(PreparedInvocation {
         command,
-        cwd: cwd.to_owned(),
-        root,
-        paths,
-        forward_json: format.is_some(),
-        capture,
-        _locks: locks,
+        observer: Box::new(Recording {
+            artifacts: Vec::new(),
+            artifact_error: None,
+            compilation_finished: false,
+            root,
+            paths,
+            forward_json: format.is_some(),
+            capture,
+            _locks: locks,
+        }),
     })
 }
 
-impl Recording {
-    pub(crate) fn execute(mut self, capture_stdout: bool) -> Result<Option<String>> {
-        let mut child = CargoChild(
-            self.command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()?,
-        );
-        let mut captured = Vec::new();
-        let mut artifact_error = None;
-        let mut compilation_finished = false;
-        let mut output = BufReader::new(child.0.stdout.take().context("Cargo stdout")?);
-        let mut artifacts = Vec::new();
-        let mut line = Vec::new();
-        while output.read_until(b'\n', &mut line)? != 0 {
-            let message = if compilation_finished {
-                None
-            } else {
-                serde_json::from_slice::<serde_json::Value>(&line).ok()
-            };
-            if message
-                .as_ref()
-                .is_some_and(|message| message["reason"] == "build-finished")
-            {
-                compilation_finished = true;
-            }
-            let cargo_message = message
-                .as_ref()
-                .and_then(|message| message["reason"].as_str())
-                .is_some_and(|reason| {
-                    matches!(
-                        reason,
-                        "compiler-artifact"
-                            | "build-script-executed"
-                            | "build-finished"
-                            | "compiler-message"
-                    )
-                });
-            if self.forward_json || !cargo_message {
-                std::io::stdout().write_all(&line)?;
-                if capture_stdout {
-                    captured.extend_from_slice(&line);
-                }
-            }
-            if let Some(message) = message
-                && message["reason"] == "compiler-artifact"
-            {
-                match serde_json::from_value::<Artifact>(message) {
-                    Ok(artifact) if artifact.package_id.starts_with("path+") => {
-                        artifacts.push(artifact)
-                    }
-                    Ok(_) => (),
-                    Err(error) => artifact_error = Some(error),
-                }
-            }
-            line.clear();
-        }
-        ensure!(
-            child.0.wait()?.success(),
-            "task execution failed in {}",
-            self.cwd.display()
-        );
-        let captured = if capture_stdout {
-            if !captured.is_empty() && !captured.ends_with(b"\n") {
-                writeln!(std::io::stdout())?;
-            }
-            Some(String::from_utf8(captured).context("task stdout was not UTF-8")?)
-        } else {
+impl ExecutionObserver for Recording {
+    fn stdout(&mut self, line: &[u8]) -> bool {
+        let message = if self.compilation_finished {
             None
+        } else {
+            serde_json::from_slice::<serde_json::Value>(line).ok()
         };
-        if let Some(error) = artifact_error {
-            eprintln!("compiler provenance unavailable: {error}");
-        } else if !artifacts.is_empty()
-            && let Err(error) = self
-                .capture
-                .receipts()
-                .and_then(|receipts| record(&self.root, &self.paths, artifacts, receipts))
+        if message
+            .as_ref()
+            .is_some_and(|message| message["reason"] == "build-finished")
         {
-            eprintln!("compiler provenance unavailable: {error}");
+            self.compilation_finished = true;
         }
-        Ok(captured)
+        let cargo_message = message
+            .as_ref()
+            .and_then(|message| message["reason"].as_str())
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "compiler-artifact"
+                        | "build-script-executed"
+                        | "build-finished"
+                        | "compiler-message"
+                )
+            });
+        if let Some(message) = message
+            && message["reason"] == "compiler-artifact"
+        {
+            match serde_json::from_value::<Artifact>(message) {
+                Ok(artifact) if artifact.package_id.starts_with("path+") => {
+                    self.artifacts.push(artifact)
+                }
+                Ok(_) => (),
+                Err(error) => self.artifact_error = Some(error),
+            }
+        }
+        self.forward_json || !cargo_message
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let result = if let Some(error) = self.artifact_error.take() {
+            Err(error.into())
+        } else if !self.artifacts.is_empty() {
+            self.capture.receipts().and_then(|receipts| {
+                record(
+                    &self.root,
+                    &self.paths,
+                    std::mem::take(&mut self.artifacts),
+                    receipts,
+                )
+            })
+        } else {
+            Ok(())
+        };
+        result.context("compiler provenance unavailable")
     }
 }
 

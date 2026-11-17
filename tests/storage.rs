@@ -311,3 +311,55 @@ fn compiler_compatibility_ignores_source_changes_but_partitions_flags_and_purpos
     assert_ne!(before, key("release", ""));
     assert_ne!(before, key("validation", "-C opt-level=1"));
 }
+
+#[test]
+fn generic_plugin_key_command_preserves_published_cargo_key() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("flux.toml"), "").unwrap();
+    let key = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-flux"))
+            .arg("--root")
+            .arg(root.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    assert_eq!(
+        key(&["storage", "key", "--plugin", "cargo", "--scope", "fixture"]),
+        key(&["storage", "cargo-key", "--scope", "fixture"]),
+    );
+}
+
+#[test]
+fn invalid_snapshot_provider_is_rejected_before_storage_changes() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("flux.toml"), "").unwrap();
+    fs::create_dir(root.path().join("dist")).unwrap();
+    fs::write(root.path().join("dist/input"), "retained").unwrap();
+    for options in [
+        vec!["--plugin", "missing"],
+        vec!["--plugin", "npm"],
+        vec!["--plugin-option", "manifest-path=Cargo.toml"],
+        vec!["--plugin", "cargo", "--plugin-option", "unknown=value"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-flux"))
+            .arg("--root")
+            .arg(root.path())
+            .args(["storage", "save", "--key", "invalid", "--path", "dist"])
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!root.path().join(".flux/cache").exists());
+        assert_eq!(
+            fs::read(root.path().join("dist/input")).unwrap(),
+            b"retained"
+        );
+    }
+}

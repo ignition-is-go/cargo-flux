@@ -1,10 +1,12 @@
 mod cache;
 mod channels;
 mod cli;
+mod execution;
 mod git;
 mod graph;
 mod manifest;
 mod plugins;
+mod snapshot;
 mod stamp;
 mod storage;
 mod tasks;
@@ -21,7 +23,7 @@ use std::io::{IsTerminal, Write};
 use tasks::{ResolvedRootTask, TaskCommand, TaskRegistry};
 
 fn main() -> Result<()> {
-    storage::compiler_entry()?;
+    plugins::dispatch_entrypoint()?;
     let cli = Cli::parse_from(normalize_args(std::env::args_os()));
     if let Command::Report { command } = &cli.command {
         match command {
@@ -39,7 +41,17 @@ fn main() -> Result<()> {
                 scope,
                 selection,
                 affected,
+            }
+            | cli::StorageCommand::Key {
+                scope,
+                selection,
+                affected,
+                ..
             } => {
+                let plugin = match command {
+                    cli::StorageCommand::Key { plugin, .. } => plugin.as_str(),
+                    _ => "cargo", // Preserve the published cargo-key spelling.
+                };
                 let packages = if let Some(selection) = selection {
                     let graph = WorkspaceGraph::new(discover_workspace(&root)?.packages);
                     let selected = calculate_affected_scope(
@@ -61,7 +73,7 @@ fn main() -> Result<()> {
                 } else {
                     Vec::new()
                 };
-                println!("{}", storage::cargo_key(&root, scope, &packages)?);
+                println!("{}", plugins::cache_key(plugin, &root, scope, &packages)?);
             }
             cli::StorageCommand::Sources {
                 path,
@@ -72,15 +84,19 @@ fn main() -> Result<()> {
                 key,
                 paths,
                 artifact,
-                compiler,
-                manifests,
+                plugin,
+                plugin_options,
             } => {
                 let paths = artifact
                     .as_deref()
                     .map(|name| tasks.artifact_paths(name))
                     .transpose()?
                     .unwrap_or(paths);
-                storage::save(&root, tasks.cache_store(), key, paths, *compiler, manifests)?;
+                let policy = plugin
+                    .as_deref()
+                    .map(|name| plugins::snapshot_policy(name, plugin_options))
+                    .transpose()?;
+                storage::save(&root, tasks.cache_store(), key, paths, policy.as_deref())?;
             }
             cli::StorageCommand::Restore {
                 keys,
@@ -827,51 +843,7 @@ fn execute_task_with_output(
     variables: &std::collections::BTreeMap<String, String>,
     capture_stdout: bool,
 ) -> Result<Option<String>> {
-    let mut cmd = match command {
-        TaskCommand::Shell(command) => {
-            let mut cmd = std::process::Command::new("sh");
-            cmd.arg("-lc").arg(command);
-            cmd
-        }
-        TaskCommand::Argv(command) => {
-            let (program, args) = command
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("resolved task command was empty"))?;
-            if let Some(recording) =
-                storage::prepare_cargo(program, args, cwd, variables, capture_stdout)
-            {
-                return recording.execute(capture_stdout);
-            }
-            let mut cmd = std::process::Command::new(program);
-            cmd.args(args);
-            cmd
-        }
-    };
-    cmd.current_dir(cwd).envs(variables);
-    if capture_stdout {
-        cmd.stderr(std::process::Stdio::inherit());
-        let output = cmd.output()?;
-        std::io::stdout().write_all(&output.stdout)?;
-        if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
-            writeln!(std::io::stdout())?;
-        }
-        anyhow::ensure!(
-            output.status.success(),
-            "task execution failed in {}",
-            cwd.display()
-        );
-        return String::from_utf8(output.stdout)
-            .map(Some)
-            .map_err(|error| anyhow::anyhow!("task stdout was not UTF-8: {error}"));
-    }
-
-    let status = cmd.status()?;
-    anyhow::ensure!(
-        status.success(),
-        "task execution failed in {}",
-        cwd.display()
-    );
-    Ok(None)
+    execution::execute(command, cwd, variables, capture_stdout)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

@@ -1,5 +1,11 @@
 //! Select reusable Cargo outputs using package sources and fingerprint dependencies.
-use super::*;
+use crate::storage::{collect, relative, validate_paths};
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(super) mod record;
@@ -311,4 +317,113 @@ pub(super) fn select(
         obsolete.len()
     );
     Ok(locks)
+}
+
+/// Cargo owns option interpretation and all build-system coordination.
+pub(super) struct Policy {
+    manifests: Vec<PathBuf>,
+}
+
+impl Policy {
+    pub(super) fn from_options(options: &[String]) -> Result<Self> {
+        let mut manifests = Vec::new();
+        for option in options {
+            let (key, value) = option
+                .split_once('=')
+                .context("Cargo snapshot options must be KEY=VALUE")?;
+            ensure!(
+                key == "manifest-path",
+                "unknown Cargo snapshot option `{key}`"
+            );
+            ensure!(!value.is_empty(), "Cargo manifest-path must not be empty");
+            manifests.push(PathBuf::from(value));
+        }
+        Ok(Self { manifests })
+    }
+}
+
+struct Selection {
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+    manifests: Vec<PathBuf>,
+    _cache_locks: Vec<fs::File>,
+    profile_locks: Vec<fs::File>,
+}
+
+impl crate::snapshot::SnapshotPolicy for Policy {
+    fn prepare(
+        &self,
+        root: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Box<dyn crate::snapshot::SnapshotSelection>> {
+        validate_paths(paths)?;
+        for path in paths {
+            ensure!(root.join(path).exists(), "storage input does not exist");
+        }
+        let locks = record::lock(root, paths)?;
+        Ok(Box::new(Selection {
+            root: root.to_owned(),
+            paths: paths.to_vec(),
+            manifests: self.manifests.clone(),
+            _cache_locks: locks,
+            profile_locks: Vec::new(),
+        }))
+    }
+}
+
+impl crate::snapshot::SnapshotSelection for Selection {
+    fn select(&mut self, candidates: &BTreeSet<PathBuf>) -> Result<crate::snapshot::SnapshotPlan> {
+        let mut files = candidates.clone();
+        self.profile_locks = select(&self.root, &mut files, &self.paths, &self.manifests)?;
+        Ok(crate::snapshot::SnapshotPlan {
+            files,
+            include_empty_directories: false,
+        })
+    }
+}
+
+/// Source contents deliberately do not enter compiler compatibility. Cargo's
+/// fingerprints own source freshness, including manifests and dependency locks.
+pub(in crate::plugins::cargo) fn compatibility_key(
+    root: &Path,
+    scope: &str,
+    packages: &[String],
+) -> Result<String> {
+    ensure!(
+        !scope.is_empty() && !scope.contains(['\n', '\r']),
+        "invalid Cargo cache scope"
+    );
+    let output = std::process::Command::new("rustc")
+        .args(["--version", "--verbose"])
+        .output()?;
+    ensure!(output.status.success(), "rustc version probe failed");
+    let flags = std::env::vars()
+        .filter(|(name, _)| {
+            matches!(
+                name.as_str(),
+                "RUSTFLAGS"
+                    | "RUSTDOCFLAGS"
+                    | "CARGO_ENCODED_RUSTFLAGS"
+                    | "CARGO_BUILD_TARGET"
+                    | "CC"
+                    | "CXX"
+                    | "CFLAGS"
+                    | "CXXFLAGS"
+                    | "RUSTC"
+                    | "RUSTC_WRAPPER"
+                    | "RUSTC_WORKSPACE_WRAPPER"
+            ) || name.starts_with("CARGO_PROFILE_")
+                || name.starts_with("CARGO_TARGET_")
+        })
+        .collect::<BTreeMap<_, _>>();
+    let identity = serde_json::to_vec(&(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        root,
+        scope,
+        packages,
+        output.stdout,
+        flags,
+    ))?;
+    Ok(format!("cargo/{:x}", Sha256::digest(identity)))
 }

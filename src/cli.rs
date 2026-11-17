@@ -120,7 +120,18 @@ pub enum ReportCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum StorageCommand {
-    /// Print compiler/flags/scope compatibility without keying on source hashes.
+    /// Print an ecosystem plugin's build-cache compatibility key.
+    Key {
+        #[arg(long)]
+        plugin: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long, requires = "selection")]
+        affected: Option<String>,
+    },
+    /// Compatibility alias for `storage key --plugin cargo`.
     CargoKey {
         #[arg(long)]
         scope: String,
@@ -140,12 +151,12 @@ pub enum StorageCommand {
     },
     /// Save declared paths as a verified compressed archive.
     Save {
-        /// Retain current Cargo units and exclude incremental sessions from the snapshot.
+        /// Ecosystem plugin selecting reusable files for this snapshot.
         #[arg(long)]
-        compiler: bool,
-        /// Workspace manifests contributing compiler outputs, repeatable for shared targets.
-        #[arg(long = "manifest-path", requires = "compiler")]
-        manifests: Vec<PathBuf>,
+        plugin: Option<String>,
+        /// Repeatable plugin-specific KEY=VALUE option.
+        #[arg(long = "plugin-option", requires = "plugin")]
+        plugin_options: Vec<String>,
         #[arg(long)]
         key: String,
         #[arg(

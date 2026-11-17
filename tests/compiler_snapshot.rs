@@ -226,7 +226,10 @@ fn compiler_snapshots_discard_obsolete_graphs_and_keep_both_feature_variants_war
             }
             _ => {
                 let mut command = flux(&root, &[]);
-                command.arg("storage").arg("save").arg("--compiler");
+                command
+                    .arg("storage")
+                    .arg("save")
+                    .args(["--plugin", "cargo"]);
                 command
             }
         };
@@ -383,15 +386,16 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
             &[
                 "storage",
                 "save",
-                "--compiler",
+                "--plugin",
+                "cargo",
                 "--key",
                 "shared",
                 "--path",
                 "target",
-                "--manifest-path",
-                "first/Cargo.toml",
-                "--manifest-path",
-                "second/Cargo.toml",
+                "--plugin-option",
+                "manifest-path=first/Cargo.toml",
+                "--plugin-option",
+                "manifest-path=second/Cargo.toml",
             ],
         )
         .env("CARGO_HOME", &home),
@@ -535,13 +539,7 @@ fn local_version_changes_keep_snapshots_bounded_and_feature_variants_warm() {
         success(&mut flux(
             root,
             &[
-                "storage",
-                "save",
-                "--compiler",
-                "--key",
-                "local",
-                "--path",
-                "target",
+                "storage", "save", "--plugin", "cargo", "--key", "local", "--path", "target",
             ],
         ));
         fs::remove_dir_all(root.join("target")).unwrap();
@@ -563,13 +561,7 @@ fn local_version_changes_keep_snapshots_bounded_and_feature_variants_warm() {
         success(&mut flux(
             root,
             &[
-                "storage",
-                "save",
-                "--compiler",
-                "--key",
-                "local",
-                "--path",
-                "target",
+                "storage", "save", "--plugin", "cargo", "--key", "local", "--path", "target",
             ],
         ));
         fs::remove_dir_all(root.join("target")).unwrap();
@@ -646,13 +638,7 @@ fn recorded_check_and_test_units_remain_warm() {
     success(&mut flux(
         root,
         &[
-            "storage",
-            "save",
-            "--compiler",
-            "--key",
-            "modes",
-            "--path",
-            "target",
+            "storage", "save", "--plugin", "cargo", "--key", "modes", "--path", "target",
         ],
     ));
     fs::remove_dir_all(root.join("target")).unwrap();
@@ -712,13 +698,7 @@ fn local_patch_version_changes_discard_previous_compiler_units() {
         success(&mut flux(
             root,
             &[
-                "storage",
-                "save",
-                "--compiler",
-                "--key",
-                "patch",
-                "--path",
-                "target",
+                "storage", "save", "--plugin", "cargo", "--key", "patch", "--path", "target",
             ],
         ));
         fs::remove_dir_all(root.join("target")).unwrap();
@@ -813,13 +793,7 @@ fn unknown_vendor_units_do_not_protect_obsolete_recorded_versions() {
         success(&mut flux(
             root,
             &[
-                "storage",
-                "save",
-                "--compiler",
-                "--key",
-                "vendor",
-                "--path",
-                "target",
+                "storage", "save", "--plugin", "cargo", "--key", "vendor", "--path", "target",
             ],
         ));
         fs::remove_dir_all(root.join("target")).unwrap();
@@ -886,13 +860,7 @@ fn compiler_snapshots_accept_missing_or_invalid_optional_provenance() {
         success(&mut flux(
             root,
             &[
-                "storage",
-                "save",
-                "--compiler",
-                "--key",
-                "optional",
-                "--path",
-                "target",
+                "storage", "save", "--plugin", "cargo", "--key", "optional", "--path", "target",
             ],
         ));
         fs::remove_dir_all(root.join("target")).unwrap();

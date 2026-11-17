@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 pub(crate) struct UvPlugin;
 
 impl ManifestPlugin for UvPlugin {
+    fn name(&self) -> &'static str {
+        "uv"
+    }
+
     fn discover_manifests(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let manifest_path = root.join("pyproject.toml");
         if !manifest_path.exists() {

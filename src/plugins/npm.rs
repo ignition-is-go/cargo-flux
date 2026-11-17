@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 pub(crate) struct PackageJsonPlugin;
 
 impl ManifestPlugin for PackageJsonPlugin {
+    fn name(&self) -> &'static str {
+        "npm"
+    }
+
     fn discover_manifests(&self, root: &Path) -> Result<Vec<PathBuf>> {
         let manifest_path = root.join("package.json");
         let pnpm_workspace_path = root.join("pnpm-workspace.yaml");

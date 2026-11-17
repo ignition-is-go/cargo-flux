@@ -43,7 +43,7 @@ pub(super) fn save(
     root: &Path,
     output: &mut fs::File,
     manifest: Manifest,
-    compiler: bool,
+    include_empty_directories: bool,
 ) -> Result<()> {
     let workers = hash_workers(manifest.files.len()).clamp(1, MAX_SHARDS);
     let mut groups = vec![BTreeSet::new(); workers];
@@ -76,7 +76,7 @@ pub(super) fn save(
     for path in &manifest.paths {
         directories(root, path, &mut dirs)?;
     }
-    if compiler {
+    if !include_empty_directories {
         let mut retained = manifest.paths.iter().cloned().collect::<BTreeSet<_>>();
         for file in manifest.files.keys() {
             retained.extend(file.ancestors().skip(1).map(Path::to_owned));
@@ -402,14 +402,7 @@ mod tests {
         }
         fs::create_dir(consumer.path().join("dist"))?;
         fs::write(consumer.path().join("dist/original"), "retained")?;
-        super::super::save(
-            producer.path(),
-            &store,
-            "malformed",
-            &["dist".into()],
-            false,
-            &[],
-        )?;
+        super::super::save(producer.path(), &store, "malformed", &["dist".into()], None)?;
         let object = objects
             .path()
             .join(format!("{}.tar", object_key("malformed")?));
@@ -551,8 +544,7 @@ mod tests {
             &Store::default(),
             "shared",
             &["dist".into()],
-            false,
-            &[],
+            None,
         )?;
         assert_eq!(fs::read(&object)?, legacy_bytes);
         fs::remove_dir_all(root.path().join("dist"))?;
