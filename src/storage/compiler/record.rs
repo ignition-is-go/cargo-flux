@@ -3,6 +3,10 @@ use super::*;
 use std::io::{BufRead, BufReader, IsTerminal};
 use std::process::Stdio;
 
+mod capture;
+
+pub(crate) use capture::compiler_entry;
+
 const FILE: &str = ".flux-compiler-units.json";
 
 struct CargoChild(std::process::Child);
@@ -19,6 +23,8 @@ pub(super) struct Record {
     pub(super) manifest: PathBuf,
     pub(super) package: String,
     pub(super) fingerprints: BTreeSet<u64>,
+    #[serde(default)]
+    producer_recorded: bool,
 }
 
 pub(super) const LOCK: &str = ".flux-compiler.lock";
@@ -66,7 +72,9 @@ pub(super) fn load(root: &Path, paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, R
                 let saved: BTreeMap<PathBuf, Record> = serde_json::from_reader(file)?;
                 for (key, record) in saved {
                     relative(&key)?;
-                    records.insert(path.join(key), record);
+                    if record.producer_recorded {
+                        records.insert(path.join(key), record);
+                    }
                 }
             }
             Err(error)
@@ -84,7 +92,6 @@ pub(super) fn load(root: &Path, paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, R
 struct Artifact {
     package_id: String,
     manifest_path: PathBuf,
-    filenames: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +107,7 @@ pub(crate) struct Recording {
     root: PathBuf,
     paths: Vec<PathBuf>,
     forward_json: bool,
+    capture: capture::Capture,
     _locks: Vec<fs::File>,
 }
 
@@ -135,7 +143,7 @@ pub(in crate::storage) fn prepare(
     if Path::new(program).file_stem()?.to_str()? != "cargo"
         || !matches!(
             args.first()?.as_str(),
-            "build" | "check" | "test" | "bench" | "clippy" | "rustc"
+            "build" | "check" | "test" | "bench" | "rustc"
         )
     {
         return None;
@@ -228,12 +236,14 @@ pub(in crate::storage) fn prepare(
     }
     let mut command = Command::new(program);
     command.current_dir(cwd).envs(variables).args(arguments);
+    let capture = capture::Capture::prepare(&mut command, cwd, variables, &args[..position])?;
     Some(Recording {
         command,
         cwd: cwd.to_owned(),
         root,
         paths,
         forward_json: format.is_some(),
+        capture,
         _locks: locks,
     })
 }
@@ -311,7 +321,10 @@ impl Recording {
         if let Some(error) = artifact_error {
             eprintln!("compiler provenance unavailable: {error}");
         } else if !artifacts.is_empty()
-            && let Err(error) = record(&self.root, &self.paths, artifacts)
+            && let Err(error) = self
+                .capture
+                .receipts()
+                .and_then(|receipts| record(&self.root, &self.paths, artifacts, receipts))
         {
             eprintln!("compiler provenance unavailable: {error}");
         }
@@ -319,7 +332,12 @@ impl Recording {
     }
 }
 
-fn record(root: &Path, paths: &[PathBuf], artifacts: Vec<Artifact>) -> Result<()> {
+fn record(
+    root: &Path,
+    paths: &[PathBuf],
+    artifacts: Vec<Artifact>,
+    receipts: Vec<capture::Receipt>,
+) -> Result<()> {
     let manifests = artifacts
         .iter()
         .map(|artifact| artifact.manifest_path.clone())
@@ -333,17 +351,11 @@ fn record(root: &Path, paths: &[PathBuf], artifacts: Vec<Artifact>) -> Result<()
         .iter()
         .filter_map(|path| fingerprint_location(path).map(|value| value.0))
         .collect::<BTreeSet<_>>();
-    // Capture identities while Cargo's output aliases still point at this invocation's units.
+    // Cargo locks protect fingerprint reads. Producer receipts establish ownership.
     let _locks = lock_profiles(root, &profiles, &mut files)?;
     let mut units = BTreeMap::<(PathBuf, String), BTreeSet<u64>>::new();
-    let mut identities =
-        std::collections::HashMap::<file_id::FileId, BTreeSet<(PathBuf, String)>>::new();
     for path in &files {
         if let Some(id) = unit_id(path, &profiles) {
-            identities
-                .entry(file_id::get_file_id(root.join(path))?)
-                .or_default()
-                .insert(id.clone());
             let values = units.entry(id).or_default();
             if path
                 .extension()
@@ -366,37 +378,44 @@ fn record(root: &Path, paths: &[PathBuf], artifacts: Vec<Artifact>) -> Result<()
         .map(|(profile, hash)| profile.join(hash))
         .collect::<BTreeSet<_>>();
     records.retain(|key, _| current.contains(key));
-    for artifact in artifacts {
-        let manifest = artifact.manifest_path.canonicalize()?;
+    let reports = artifacts
+        .into_iter()
+        .map(|artifact| Ok((artifact.manifest_path.canonicalize()?, artifact.package_id)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for receipt in receipts {
+        let manifest = receipt.manifest.canonicalize()?;
+        let Some(package) = reports.get(&manifest) else {
+            continue;
+        };
         ensure!(
-            sources.current_identity(&manifest, &artifact.package_id) == Some(true),
-            "Cargo artifact package identity does not match its manifest"
+            sources.matches_compilation(&manifest, package, &receipt.name, &receipt.version),
+            "compiler receipt does not match Cargo's package report"
         );
-        let mut reported = BTreeSet::new();
-        for file in artifact.filenames {
-            if let Some(ids) = identities.get(&file_id::get_file_id(file)?) {
-                reported.extend(ids.iter().cloned());
-            }
-        }
+        let reported = units
+            .keys()
+            .filter(|(profile, hash)| {
+                *hash == receipt.hash && receipt.out_dir.starts_with(root.join(profile))
+            })
+            .collect::<Vec<_>>();
         ensure!(
             reported.len() == 1,
-            "Cargo artifact must identify one compiler unit in the declared cache paths"
+            "compiler receipt must identify one compiler unit"
         );
-        for id in reported {
-            let fingerprints = units[&id].clone();
-            ensure!(
-                !fingerprints.is_empty(),
-                "Cargo artifact has no completed fingerprint"
-            );
-            records.insert(
-                id.0.join(id.1),
-                Record {
-                    manifest: manifest.clone(),
-                    package: artifact.package_id.clone(),
-                    fingerprints,
-                },
-            );
-        }
+        let id = reported[0];
+        let fingerprints = units[id].clone();
+        ensure!(
+            !fingerprints.is_empty(),
+            "compiler receipt has no completed fingerprint"
+        );
+        records.insert(
+            id.0.join(&id.1),
+            Record {
+                manifest,
+                package: package.clone(),
+                fingerprints,
+                producer_recorded: true,
+            },
+        );
     }
     for path in paths {
         let selected = records
@@ -443,5 +462,86 @@ mod tests {
             worker.join().unwrap()?;
             Ok(())
         })
+    }
+    #[test]
+    fn legacy_alias_provenance_stays_unknown() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join(FILE),
+            r#"{"debug/0123456789abcdef":{"manifest":"/earlier/Cargo.toml","package":"path+file:///earlier#0.1.0","fingerprints":[1]}}"#,
+        )?;
+        assert!(load(directory.path(), &[PathBuf::from(".")])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_report_does_not_follow_an_alias_rebound_by_plain_cargo() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let target = root.join("target");
+        let paths = vec![PathBuf::from("target")];
+        let _coordination = lock(&root, &paths)?;
+        let mut reports = Vec::new();
+        let mut receipt = None;
+        for name in ["a", "b"] {
+            let project = root.join(name);
+            fs::create_dir_all(project.join("src"))?;
+            fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname='alias-owner'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+            )?;
+            fs::write(project.join("src/main.rs"), "fn main() {}\n")?;
+            let output = Command::new("cargo")
+                .current_dir(&project)
+                .args(["build", "--offline", "--message-format=json"])
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_INCREMENTAL", "0")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let message = String::from_utf8(output.stdout)?
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|message| message["reason"] == "compiler-artifact")
+                .context("Cargo artifact")?;
+            let artifact = serde_json::from_value::<Artifact>(message)?;
+            if name == "a" {
+                let mut files = BTreeSet::new();
+                collect(&root, &paths[0], &mut files)?;
+                let (profile, _, hash) = files
+                    .iter()
+                    .find_map(|path| fingerprint_location(path))
+                    .context("compiler unit")?;
+                receipt = Some(capture::Receipt {
+                    manifest: artifact.manifest_path.clone(),
+                    name: "alias-owner".into(),
+                    version: "0.1.0".into(),
+                    out_dir: root.join(profile).join("deps"),
+                    hash,
+                });
+            }
+            reports.push(artifact);
+        }
+        let first = reports.remove(0);
+        let later_manifest = reports[0].manifest_path.canonicalize()?;
+        assert_ne!(first.manifest_path.canonicalize()?, later_manifest);
+        let result = record(
+            &root,
+            &paths,
+            vec![first],
+            vec![receipt.context("producer receipt")?],
+        );
+        result?;
+        let records = load(&root, &paths)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records.values().next().unwrap().manifest,
+            root.join("a/Cargo.toml")
+        );
+        assert_ne!(records.values().next().unwrap().manifest, later_manifest);
+        Ok(())
     }
 }

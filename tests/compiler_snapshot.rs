@@ -1061,3 +1061,122 @@ fn optional_recording_failure_does_not_fail_a_successful_task() {
             .all(|artifact| artifact["fresh"] == true)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn compiler_capture_preserves_existing_wrappers_and_warm_unit_hashes() {
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [
+        "environment",
+        "configuration",
+        "workspace",
+        "build-environment",
+        "home-configuration",
+        "relative-home",
+    ] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let home = root.join("cargo-home");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='wrapper-proof'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("flux.toml"), "").unwrap();
+        let wrapper = root.join("existing wrapper");
+        let log = root.join("wrapper.log");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nprintf 'invoked\\n' >> \"$WRAPPER_LOG\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        if matches!(
+            mode,
+            "configuration" | "home-configuration" | "relative-home"
+        ) {
+            let config = if mode == "configuration" {
+                root.join(".cargo/config.toml")
+            } else {
+                home.join("config.toml")
+            };
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(
+                config,
+                format!(
+                    "[build]\nrustc-wrapper={}\n",
+                    toml::Value::String(wrapper.to_string_lossy().into_owned())
+                ),
+            )
+            .unwrap();
+        }
+        let configure = |command: &mut Command| {
+            command
+                .current_dir(root)
+                .env("CARGO_HOME", &home)
+                .env("CARGO_TARGET_DIR", root.join("target"))
+                .env("CARGO_INCREMENTAL", "0")
+                .env("WRAPPER_LOG", &log)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+            if mode == "relative-home" {
+                command.env("CARGO_HOME", "cargo-home");
+            }
+            if mode == "build-environment" {
+                command.env("CARGO_BUILD_RUSTC_WRAPPER", &wrapper);
+            }
+            if mode == "environment" {
+                command.env("RUSTC_WRAPPER", &wrapper);
+            }
+            if mode == "workspace" {
+                command.env("RUSTC_WORKSPACE_WRAPPER", &wrapper);
+            }
+        };
+        let mut original = Command::new("cargo");
+        original.args(["build", "--offline", "--message-format=json"]);
+        configure(&mut original);
+        success(&mut original);
+        assert!(log.exists());
+        let count = fingerprint_count(&root.join("target"));
+        let mut task = cargo_task(root, &["build", "--offline", "--message-format=json"]);
+        configure(&mut task);
+        let warm = artifacts(&success(&mut task));
+        assert!(!warm.is_empty());
+        assert!(
+            warm.iter().all(|artifact| artifact["fresh"] == true),
+            "{mode}"
+        );
+        assert_eq!(fingerprint_count(&root.join("target")), count, "{mode}");
+        fs::remove_file(&log).unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"updated\"); }\n",
+        )
+        .unwrap();
+        success(&mut task);
+        assert!(log.exists(), "existing wrapper must execute in {mode}");
+        let mut direct = Command::new("cargo");
+        direct.args(["build", "--offline", "--message-format=json"]);
+        configure(&mut direct);
+        assert!(
+            artifacts(&success(&mut direct))
+                .iter()
+                .all(|artifact| artifact["fresh"] == true),
+            "{mode}"
+        );
+        let ledger = root.join("target/.flux-compiler-units.json");
+        if mode == "environment" {
+            let records: Value = serde_json::from_slice(&fs::read(ledger).unwrap()).unwrap();
+            assert_eq!(records.as_object().unwrap().len(), 1);
+        } else {
+            assert!(
+                !ledger.exists(),
+                "unsupported capture must preserve normal wrapper resolution"
+            );
+        }
+    }
+}

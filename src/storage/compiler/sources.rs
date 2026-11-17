@@ -10,6 +10,7 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    version: String,
     manifest_path: PathBuf,
     targets: Vec<Target>,
     features: BTreeMap<String, serde_json::Value>,
@@ -38,6 +39,12 @@ pub(super) struct LockPackage {
     pub(super) source: Option<String>,
 }
 
+struct PackageIdentity {
+    id: String,
+    name: String,
+    version: String,
+}
+
 struct Owner {
     name: String,
     features: BTreeSet<String>,
@@ -48,7 +55,7 @@ pub(super) struct Sources {
     targets: BTreeMap<PathBuf, Vec<Owner>>,
     package_roots: BTreeMap<String, BTreeSet<PathBuf>>,
     manifests: BTreeSet<PathBuf>,
-    identities: BTreeMap<PathBuf, String>,
+    identities: BTreeMap<PathBuf, PackageIdentity>,
     registry: BTreeSet<(String, String)>,
     git: BTreeSet<(String, String)>,
     cargo_home: Option<PathBuf>,
@@ -183,9 +190,14 @@ impl Sources {
                     .entry(package.name.clone())
                     .or_default()
                     .insert(consuming_root.clone());
-                sources
-                    .identities
-                    .insert(package.manifest_path.canonicalize()?, package.id);
+                sources.identities.insert(
+                    package.manifest_path.canonicalize()?,
+                    PackageIdentity {
+                        id: package.id,
+                        name: package.name.clone(),
+                        version: package.version,
+                    },
+                );
                 sources.manifests.insert(
                     package
                         .manifest_path
@@ -208,7 +220,19 @@ impl Sources {
     pub(super) fn current_identity(&self, manifest: &Path, package: &str) -> Option<bool> {
         self.identities
             .get(manifest)
-            .map(|current| current == package)
+            .map(|current| current.id == package)
+    }
+
+    pub(super) fn matches_compilation(
+        &self,
+        manifest: &Path,
+        package: &str,
+        name: &str,
+        version: &str,
+    ) -> bool {
+        self.identities.get(manifest).is_some_and(|current| {
+            current.id == package && current.name == name && current.version == version
+        })
     }
 
     pub(super) fn roots_for(&self, package: Option<&str>) -> &BTreeSet<PathBuf> {

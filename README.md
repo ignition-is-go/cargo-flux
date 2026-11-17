@@ -438,9 +438,14 @@ Cargo tasks use the same execution path. Standard output and task-output capture
 retain their existing behavior. Interactive execution and opaque shell commands
 continue through their existing paths.
 
-The records bind Cargo's package identities to actual output file identities
-and compiler fingerprints in `.flux-compiler-units.json` inside each compiler
-cache directory. Failed builds preserve prior records. Unavailable or unwritable
+An internal compiler adapter captures Cargo's manifest, package version and
+unit hash at compilation time. The executor checks these against Cargo's package
+reports and compiler fingerprints before writing `.flux-compiler-units.json`
+inside each compiler cache directory. Mutable output aliases provide no ownership
+proof. Earlier alias-based records remain unknown. Environment compiler wrappers
+are forwarded. Configured wrappers, workspace wrappers, custom compilers, explicit
+Cargo config overrides and Clippy use their existing execution paths with unknown
+provenance. Failed builds preserve prior records. Unavailable or unwritable
 provenance leaves successful builds successful. Missing or invalid records leave
 unit identities unknown during snapshot selection. No new build command is
 required.

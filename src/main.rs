@@ -21,6 +21,7 @@ use std::io::{IsTerminal, Write};
 use tasks::{ResolvedRootTask, TaskCommand, TaskRegistry};
 
 fn main() -> Result<()> {
+    storage::compiler_entry()?;
     let cli = Cli::parse_from(normalize_args(std::env::args_os()));
     if let Command::Report { command } = &cli.command {
         match command {

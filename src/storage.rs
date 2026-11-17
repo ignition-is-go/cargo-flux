@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::cache::Store;
 
 mod compiler;
+pub(crate) use compiler::record::compiler_entry;
 mod parallel;
 pub(crate) mod space;
 
