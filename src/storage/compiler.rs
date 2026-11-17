@@ -149,11 +149,13 @@ pub(super) fn select(
     manifests: &[PathBuf],
 ) -> Result<Vec<fs::File>> {
     let sources = sources::Sources::load(root, manifests)?;
-    let records = record::load(root, paths)?;
-    ensure!(
-        !records.is_empty(),
-        "compiler snapshots require recorded builds; use storage cargo --path <target> -- <cargo command>"
-    );
+    let records = record::load(root, paths).unwrap_or_else(|error| {
+        eprintln!("compiler provenance unavailable: {error}");
+        BTreeMap::new()
+    });
+    for path in paths {
+        files.remove(&path.join(record::LOCK));
+    }
     let mut profiles = BTreeSet::new();
     for path in files.iter() {
         if let Some((profile, _, _)) = fingerprint_location(path) {
@@ -206,7 +208,7 @@ pub(super) fn select(
     let mut protected = BTreeSet::new();
     let mut protected_values = BTreeSet::new();
     for (id, unit) in &units {
-        let statuses = unit
+        let mut statuses = unit
             .sources
             .iter()
             .map(|source| match &unit.package {
@@ -214,10 +216,14 @@ pub(super) fn select(
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
-        let provenance = records
+        let recorded = records
             .get(&id.0.join(&id.1))
-            .filter(|record| record.fingerprints == unit.values)
-            .and_then(|record| sources.current_record(record));
+            .filter(|record| record.fingerprints == unit.values);
+        let provenance =
+            recorded.and_then(|record| sources.current_identity(&record.manifest, &record.package));
+        if recorded.is_some() && provenance.is_none() {
+            statuses.push(None);
+        }
         if provenance == Some(false) {
             obsolete_versions.insert(id.clone());
         }

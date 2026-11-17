@@ -239,9 +239,14 @@ fn transfer(
     }
 }
 
-pub fn cargo(root: &Path, paths: &[PathBuf], args: &[String]) -> Result<()> {
-    validate_paths(paths)?;
-    compiler::record::run(root, paths, args)
+pub fn prepare_cargo(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    variables: &BTreeMap<String, String>,
+    capture_stdout: bool,
+) -> Option<compiler::record::Recording> {
+    compiler::record::prepare(program, args, cwd, variables, capture_stdout)
 }
 
 pub fn save(
@@ -254,6 +259,9 @@ pub fn save(
 ) -> Result<()> {
     validate_paths(paths)?;
     let _cache_locks = if compiler {
+        for path in paths {
+            ensure!(root.join(path).exists(), "storage input does not exist");
+        }
         compiler::record::lock(root, paths)?
     } else {
         Vec::new()

@@ -120,13 +120,6 @@ pub enum ReportCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum StorageCommand {
-    /// Run a Cargo build and record its compiler-unit package identities for snapshots.
-    Cargo {
-        #[arg(long = "path", default_value = "target")]
-        paths: Vec<PathBuf>,
-        #[arg(last = true, required = true)]
-        args: Vec<String>,
-    },
     /// Print compiler/flags/scope compatibility without keying on source hashes.
     CargoKey {
         #[arg(long)]

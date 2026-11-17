@@ -211,11 +211,6 @@ impl Sources {
             .map(|current| current == package)
     }
 
-    pub(super) fn current_record(&self, record: &super::record::Record) -> Option<bool> {
-        self.current_identity(&record.manifest, &record.package)
-            .or_else(|| self.roots.contains(&record.workspace).then_some(false))
-    }
-
     pub(super) fn roots_for(&self, package: Option<&str>) -> &BTreeSet<PathBuf> {
         package
             .and_then(|name| self.package_roots.get(name))

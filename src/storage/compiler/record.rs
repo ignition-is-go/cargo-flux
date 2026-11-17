@@ -1,6 +1,6 @@
 //! Compiler-unit provenance reported by a successful Cargo invocation.
 use super::*;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::process::Stdio;
 
 const FILE: &str = ".flux-compiler-units.json";
@@ -17,42 +17,42 @@ impl Drop for CargoChild {
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Record {
     pub(super) manifest: PathBuf,
-    pub(super) workspace: PathBuf,
     pub(super) package: String,
     pub(super) fingerprints: BTreeSet<u64>,
 }
 
+pub(super) const LOCK: &str = ".flux-compiler.lock";
+
 pub(in crate::storage) fn lock(root: &Path, paths: &[PathBuf]) -> Result<Vec<fs::File>> {
-    let directory = root.join(".flux/locks/compiler");
-    let mut ancestor = directory.as_path();
-    while !ancestor.exists() {
-        ancestor = ancestor
-            .parent()
-            .context("compiler lock directory parent")?;
-    }
-    ensure!(
-        ancestor.canonicalize()?.starts_with(root),
-        "compiler lock directory leaves workspace"
-    );
-    fs::create_dir_all(&directory)?;
-    ensure!(
-        directory.canonicalize()?.starts_with(root),
-        "compiler lock directory leaves workspace"
-    );
     let mut locks = Vec::new();
     for path in paths.iter().collect::<BTreeSet<_>>() {
-        let name = format!(
-            "{:x}.lock",
-            Sha256::digest(path.to_string_lossy().as_bytes())
+        let directory = root.join(path);
+        if directory.is_file() {
+            continue;
+        }
+        let mut ancestor = directory.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().context("compiler cache parent")?;
+        }
+        ensure!(
+            ancestor.canonicalize()?.starts_with(root),
+            "compiler cache leaves workspace"
+        );
+        fs::create_dir_all(&directory)?;
+        ensure!(
+            !directory
+                .join(LOCK)
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+            "compiler lock must not be a symlink"
         );
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(directory.join(name))?;
-        file.lock()
-            .with_context(|| format!("locking compiler cache: {}", path.display()))?;
+            .open(directory.join(LOCK))?;
+        file.lock().context("locking compiler cache")?;
         locks.push(file);
     }
     Ok(locks)
@@ -62,10 +62,18 @@ pub(super) fn load(root: &Path, paths: &[PathBuf]) -> Result<BTreeMap<PathBuf, R
     let mut records = BTreeMap::new();
     for path in paths {
         match fs::File::open(root.join(path).join(FILE)) {
-            Ok(file) => records.extend(serde_json::from_reader::<_, BTreeMap<PathBuf, Record>>(
-                file,
-            )?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Ok(file) => {
+                let saved: BTreeMap<PathBuf, Record> = serde_json::from_reader(file)?;
+                for (key, record) in saved {
+                    relative(&key)?;
+                    records.insert(path.join(key), record);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -79,14 +87,64 @@ struct Artifact {
     filenames: Vec<PathBuf>,
 }
 
-pub(in crate::storage) fn run(root: &Path, paths: &[PathBuf], args: &[String]) -> Result<()> {
-    let _locks = lock(root, paths)?;
-    let mut arguments = args.to_vec();
-    let position = arguments
+#[derive(Deserialize)]
+struct CargoMetadata {
+    workspace_root: PathBuf,
+    target_directory: PathBuf,
+    build_directory: Option<PathBuf>,
+}
+
+pub(crate) struct Recording {
+    command: Command,
+    cwd: PathBuf,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+    forward_json: bool,
+    _locks: Vec<fs::File>,
+}
+
+fn future_canonical(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        suffix.push(
+            ancestor
+                .file_name()
+                .context("compiler cache name")?
+                .to_owned(),
+        );
+        ancestor = ancestor.parent().context("compiler cache parent")?;
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+pub(in crate::storage) fn prepare(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    variables: &BTreeMap<String, String>,
+    capture_stdout: bool,
+) -> Option<Recording> {
+    if !capture_stdout && std::io::stdout().is_terminal() {
+        return None;
+    }
+    if Path::new(program).file_stem()?.to_str()? != "cargo"
+        || !matches!(
+            args.first()?.as_str(),
+            "build" | "check" | "test" | "bench" | "clippy" | "rustc"
+        )
+    {
+        return None;
+    }
+    let position = args
         .iter()
         .position(|arg| arg == "--")
-        .unwrap_or(arguments.len());
-    let format = arguments[..position]
+        .unwrap_or(args.len());
+    let format = args[..position]
         .iter()
         .enumerate()
         .find_map(|(index, arg)| {
@@ -94,97 +152,174 @@ pub(in crate::storage) fn run(root: &Path, paths: &[PathBuf], args: &[String]) -
                 .map(str::to_owned)
                 .or_else(|| {
                     (arg == "--message-format")
-                        .then(|| arguments.get(index + 1).cloned())
+                        .then(|| args.get(index + 1).cloned())
                         .flatten()
                 })
         });
-    let forward_json = format.is_some();
-    if let Some(format) = format {
-        ensure!(
-            format.split(',').any(|part| part.starts_with("json")),
-            "storage cargo requires a JSON message format"
-        );
-    } else {
-        arguments.insert(position, "--message-format=json-render-diagnostics".into());
+    if format
+        .as_ref()
+        .is_some_and(|format| !format.split(',').any(|part| part.starts_with("json")))
+    {
+        return None;
     }
-    let mut child = CargoChild(
-        Command::new("cargo")
-            .current_dir(root)
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?,
-    );
-    let mut output = BufReader::new(child.0.stdout.take().context("Cargo stdout")?);
-    let mut artifacts = Vec::new();
-    let mut line = Vec::new();
-    while output.read_until(b'\n', &mut line)? != 0 {
-        let message = serde_json::from_slice::<serde_json::Value>(&line).ok();
-        let cargo_message = message
-            .as_ref()
-            .and_then(|message| message["reason"].as_str())
-            .is_some_and(|reason| {
-                matches!(
-                    reason,
-                    "compiler-artifact"
-                        | "build-script-executed"
-                        | "build-finished"
-                        | "compiler-message"
-                )
-            });
-        if forward_json || !cargo_message {
-            std::io::stdout().write_all(&line)?;
+    let mut metadata = Command::new(program);
+    metadata.current_dir(cwd).envs(variables).args([
+        "metadata",
+        "--no-deps",
+        "--offline",
+        "--locked",
+        "--format-version=1",
+    ]);
+    let mut target = None;
+    for (index, arg) in args[..position].iter().enumerate() {
+        if let Some(path) = arg.strip_prefix("--target-dir=") {
+            target = Some(cwd.join(path));
         }
-        if let Some(message) = message
-            && message["reason"] == "compiler-artifact"
-        {
-            let artifact: Artifact = serde_json::from_value(message)?;
-            if artifact.package_id.starts_with("path+") {
-                artifacts.push(artifact);
+        if arg == "--target-dir" {
+            target = Some(cwd.join(args.get(index + 1)?));
+        }
+        for option in ["--manifest-path", "--config"] {
+            if arg == option {
+                metadata.arg(option).arg(args.get(index + 1)?);
+            }
+            if arg.starts_with(&format!("{option}=")) {
+                metadata.arg(arg);
             }
         }
-        line.clear();
     }
-    ensure!(
-        child.0.wait()?.success(),
-        "Cargo compilation failed; compiler provenance was not updated"
-    );
-    ensure!(
-        !artifacts.is_empty(),
-        "Cargo emitted no local compiler artifacts; use a JSON message format"
-    );
-    let mut locate = Command::new("cargo");
-    locate
-        .current_dir(root)
-        .args(["locate-project", "--workspace", "--message-format=plain"]);
-    for (index, arg) in args.iter().enumerate() {
-        if let Some(path) = arg.strip_prefix("--manifest-path=") {
-            locate.arg("--manifest-path").arg(path);
-        } else if arg == "--manifest-path" {
-            locate
-                .arg("--manifest-path")
-                .arg(args.get(index + 1).context("Cargo manifest path")?);
-        }
-        if arg == "--" {
-            break;
+    if let Some(target) = target {
+        metadata.env("CARGO_TARGET_DIR", target);
+    }
+    let output = metadata.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: CargoMetadata = serde_json::from_slice(&output.stdout).ok()?;
+    let workspace = metadata.workspace_root.canonicalize().ok()?;
+    let mut absolute = vec![future_canonical(&metadata.target_directory).ok()?];
+    if let Some(build) = metadata.build_directory {
+        absolute.push(future_canonical(&build).ok()?);
+    }
+    let mut root = cwd.canonicalize().ok()?;
+    for path in absolute.iter().chain(std::iter::once(&workspace)) {
+        while !path.starts_with(&root) {
+            root = root.parent()?.to_owned();
         }
     }
-    let project = locate.output()?;
-    ensure!(project.status.success(), "Cargo workspace location failed");
-    let manifest = PathBuf::from(String::from_utf8(project.stdout)?.trim());
-    let workspace = manifest
-        .parent()
-        .context("Cargo workspace parent")?
-        .canonicalize()?;
-    record(root, paths, artifacts, &workspace)
+    let mut paths = absolute
+        .iter()
+        .map(|path| path.strip_prefix(&root).ok().map(Path::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    paths.sort();
+    paths.dedup();
+    if validate_paths(&paths).is_err() {
+        return None;
+    }
+    let locks = match lock(&root, &paths) {
+        Ok(locks) => locks,
+        Err(error) => {
+            eprintln!("compiler provenance unavailable: {error}");
+            return None;
+        }
+    };
+    let mut arguments = args.to_vec();
+    if format.is_none() {
+        arguments.insert(position, "--message-format=json-render-diagnostics".into());
+    }
+    let mut command = Command::new(program);
+    command.current_dir(cwd).envs(variables).args(arguments);
+    Some(Recording {
+        command,
+        cwd: cwd.to_owned(),
+        root,
+        paths,
+        forward_json: format.is_some(),
+        _locks: locks,
+    })
 }
 
-fn record(
-    root: &Path,
-    paths: &[PathBuf],
-    artifacts: Vec<Artifact>,
-    workspace: &Path,
-) -> Result<()> {
+impl Recording {
+    pub(crate) fn execute(mut self, capture_stdout: bool) -> Result<Option<String>> {
+        let mut child = CargoChild(
+            self.command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()?,
+        );
+        let mut captured = Vec::new();
+        let mut artifact_error = None;
+        let mut compilation_finished = false;
+        let mut output = BufReader::new(child.0.stdout.take().context("Cargo stdout")?);
+        let mut artifacts = Vec::new();
+        let mut line = Vec::new();
+        while output.read_until(b'\n', &mut line)? != 0 {
+            let message = if compilation_finished {
+                None
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&line).ok()
+            };
+            if message
+                .as_ref()
+                .is_some_and(|message| message["reason"] == "build-finished")
+            {
+                compilation_finished = true;
+            }
+            let cargo_message = message
+                .as_ref()
+                .and_then(|message| message["reason"].as_str())
+                .is_some_and(|reason| {
+                    matches!(
+                        reason,
+                        "compiler-artifact"
+                            | "build-script-executed"
+                            | "build-finished"
+                            | "compiler-message"
+                    )
+                });
+            if self.forward_json || !cargo_message {
+                std::io::stdout().write_all(&line)?;
+                if capture_stdout {
+                    captured.extend_from_slice(&line);
+                }
+            }
+            if let Some(message) = message
+                && message["reason"] == "compiler-artifact"
+            {
+                match serde_json::from_value::<Artifact>(message) {
+                    Ok(artifact) if artifact.package_id.starts_with("path+") => {
+                        artifacts.push(artifact)
+                    }
+                    Ok(_) => (),
+                    Err(error) => artifact_error = Some(error),
+                }
+            }
+            line.clear();
+        }
+        ensure!(
+            child.0.wait()?.success(),
+            "task execution failed in {}",
+            self.cwd.display()
+        );
+        let captured = if capture_stdout {
+            if !captured.is_empty() && !captured.ends_with(b"\n") {
+                writeln!(std::io::stdout())?;
+            }
+            Some(String::from_utf8(captured).context("task stdout was not UTF-8")?)
+        } else {
+            None
+        };
+        if let Some(error) = artifact_error {
+            eprintln!("compiler provenance unavailable: {error}");
+        } else if !artifacts.is_empty()
+            && let Err(error) = record(&self.root, &self.paths, artifacts)
+        {
+            eprintln!("compiler provenance unavailable: {error}");
+        }
+        Ok(captured)
+    }
+}
+
+fn record(root: &Path, paths: &[PathBuf], artifacts: Vec<Artifact>) -> Result<()> {
     let manifests = artifacts
         .iter()
         .map(|artifact| artifact.manifest_path.clone())
@@ -222,7 +357,10 @@ fn record(
             }
         }
     }
-    let mut records = load(root, paths)?;
+    let mut records = load(root, paths).unwrap_or_else(|error| {
+        eprintln!("compiler provenance unavailable: {error}");
+        BTreeMap::new()
+    });
     let current = units
         .keys()
         .map(|(profile, hash)| profile.join(hash))
@@ -254,7 +392,6 @@ fn record(
                 id.0.join(id.1),
                 Record {
                     manifest: manifest.clone(),
-                    workspace: workspace.to_owned(),
                     package: artifact.package_id.clone(),
                     fingerprints,
                 },
@@ -264,9 +401,17 @@ fn record(
     for path in paths {
         let selected = records
             .iter()
-            .filter(|(key, _)| key.starts_with(path))
+            .filter_map(|(key, record)| key.strip_prefix(path).ok().map(|key| (key, record)))
             .collect::<BTreeMap<_, _>>();
-        let mut pending = tempfile::NamedTempFile::new_in(root.join(path))?;
+        let builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        let builder = {
+            let mut builder = builder;
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o666));
+            builder
+        };
+        let mut pending = builder.tempfile_in(root.join(path))?;
         serde_json::to_writer(pending.as_file_mut(), &selected)?;
         pending.persist(root.join(path).join(FILE))?;
     }

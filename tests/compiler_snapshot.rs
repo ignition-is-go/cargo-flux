@@ -20,11 +20,41 @@ fn flux(root: &Path, args: &[&str]) -> Command {
     command
 }
 
+fn cargo_task(root: &Path, args: &[&str]) -> Command {
+    use sha2::{Digest, Sha256};
+    let name = format!(
+        "fixture-{:x}",
+        Sha256::digest(serde_json::to_vec(args).unwrap())
+    );
+    let file = root.join("flux.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let tasks = config
+        .as_table_mut()
+        .unwrap()
+        .entry("tasks")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .unwrap();
+    if !tasks.contains_key(&name) {
+        let command = std::iter::once("cargo")
+            .chain(args.iter().copied())
+            .map(|arg| toml::Value::String(arg.into()))
+            .collect();
+        tasks.insert(
+            name.clone(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "root".into(),
+                toml::Value::Array(command),
+            )])),
+        );
+        fs::write(file, toml::to_string(&config).unwrap()).unwrap();
+    }
+    flux(root, &["run", &name])
+}
+
 fn cargo(root: &Path, home: &Path, args: &[&str]) -> Output {
-    let mut command = if args.first() == Some(&"build") {
-        let mut command = flux(root, &["storage", "cargo", "--path", "target", "--"]);
-        command.args(args);
-        command
+    let mut command = if matches!(args.first(), Some(&"build" | &"check" | &"test")) {
+        cargo_task(root, args)
     } else {
         let mut command = Command::new("cargo");
         command.args(args);
@@ -580,19 +610,16 @@ fn failed_build_preserves_previous_compiler_provenance() {
     fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     let output = cargo(root, &home, &["build"]);
     assert!(
-        output.stdout.is_empty(),
+        !String::from_utf8_lossy(&output.stdout).contains("compiler-artifact"),
         "default Cargo output should retain its human format"
     );
     let recorded = fs::read(root.join("target/.flux-compiler-units.json")).unwrap();
     fs::write(root.join("src/main.rs"), "invalid rust\n").unwrap();
-    let result = flux(
-        root,
-        &["storage", "cargo", "--path", "target", "--", "build"],
-    )
-    .env("CARGO_HOME", home)
-    .env("CARGO_TARGET_DIR", root.join("target"))
-    .output()
-    .unwrap();
+    let result = cargo_task(root, &["build"])
+        .env("CARGO_HOME", home)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .output()
+        .unwrap();
     assert!(!result.status.success());
     assert_eq!(
         recorded,
@@ -614,13 +641,7 @@ fn recorded_check_and_test_units_remain_warm() {
     .unwrap();
     fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     for args in [&["check"][..], &["test", "--no-run"][..]] {
-        success(
-            flux(root, &["storage", "cargo", "--path", "target", "--"])
-                .args(args)
-                .env("CARGO_HOME", &home)
-                .env("CARGO_INCREMENTAL", "0")
-                .env("CARGO_TARGET_DIR", root.join("target")),
-        );
+        cargo(root, &home, args);
     }
     success(&mut flux(
         root,
@@ -832,4 +853,211 @@ fn unknown_vendor_units_do_not_protect_obsolete_recorded_versions() {
         );
     }
     assert_eq!(counts, vec![3, 3]);
+}
+
+#[test]
+fn compiler_snapshots_accept_missing_or_invalid_optional_provenance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='optional-records'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let output = success(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["build", "--message-format=json"])
+            .env("CARGO_HOME", &home)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .env("CARGO_INCREMENTAL", "0"),
+    );
+    assert!(!artifacts(&output).is_empty());
+    let file = root.join("target/.flux-compiler-units.json");
+    assert!(!file.exists());
+    for contents in [None, Some("invalid optional metadata")] {
+        if let Some(contents) = contents {
+            fs::write(&file, contents).unwrap();
+        }
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "save",
+                "--compiler",
+                "--key",
+                "optional",
+                "--path",
+                "target",
+            ],
+        ));
+        fs::remove_dir_all(root.join("target")).unwrap();
+        success(&mut flux(
+            root,
+            &[
+                "storage",
+                "restore",
+                "--key",
+                "optional",
+                "--path",
+                "target",
+                "--required",
+            ],
+        ));
+        let output = success(
+            Command::new("cargo")
+                .current_dir(root)
+                .args(["build", "--message-format=json"])
+                .env("CARGO_HOME", &home)
+                .env("CARGO_TARGET_DIR", root.join("target"))
+                .env("CARGO_INCREMENTAL", "0"),
+        );
+        assert!(
+            artifacts(&output)
+                .iter()
+                .all(|artifact| artifact["fresh"] == true)
+        );
+    }
+    // Normal Flux execution also succeeds and regenerates optional records from real reports.
+    build(root, &home, false, true);
+    assert!(serde_json::from_slice::<Value>(&fs::read(file).unwrap()).is_ok());
+}
+
+#[test]
+fn automatic_recording_preserves_build_script_freshness() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='observer-freshness'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
+    build(root, &home, false, false);
+    for _ in 0..3 {
+        build(root, &home, false, true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let reference = root.join("target/reference-permissions");
+        fs::write(&reference, "").unwrap();
+        let expected = fs::metadata(reference).unwrap().permissions().mode() & 0o777;
+        let actual = fs::metadata(root.join("target/.flux-compiler-units.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn cargo_test_program_json_and_captured_stdout_are_preserved() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='stdout-protocol'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), r##"#[test] fn emits_program_json() { println!("\n{}", r#"{"reason":"compiler-artifact","value":"program output"}"#); }"##).unwrap();
+    let args = ["test", "--", "--nocapture", "--test-threads=1"];
+    let mut command = cargo_task(root, &args);
+    let path = root.join("flux.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for (_, task) in config["tasks"].as_table_mut().unwrap().iter_mut() {
+        task.as_table_mut().unwrap().insert(
+            "outputs".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "text".into(),
+                toml::Value::String("stdout".into()),
+            )])),
+        );
+    }
+    fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    let report = root.join("report.json");
+    let output = success(
+        command
+            .arg("--report")
+            .arg(&report)
+            .env("CARGO_HOME", &home)
+            .env("CARGO_TARGET_DIR", root.join("target")),
+    );
+    let sentinel = r#"{"reason":"compiler-artifact","value":"program output"}"#;
+    assert!(String::from_utf8_lossy(&output.stdout).contains(sentinel));
+    let report: Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+    let captured = report["task_outputs"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    assert!(captured.contains(sentinel));
+    assert!(!captured.contains("build-finished"));
+}
+
+#[test]
+fn normal_batched_cargo_tasks_capture_optional_package_identities() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['one','two']\nresolver='2'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("flux.toml"),
+        "[tasks.build]\ncargo=['cargo','build','--message-format=json']\n",
+    )
+    .unwrap();
+    for name in ["one", "two"] {
+        fs::create_dir_all(root.join(name).join("src")).unwrap();
+        fs::write(root.join(name).join("Cargo.toml"), format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n[package.metadata.flux]\ntasks=['build']\n")).unwrap();
+        fs::write(root.join(name).join("src/main.rs"), "fn main() {}\n").unwrap();
+    }
+    success(flux(root, &["run", "build"]).env("CARGO_TARGET_DIR", root.join("target")));
+    let records: Value =
+        serde_json::from_slice(&fs::read(root.join("target/.flux-compiler-units.json")).unwrap())
+            .unwrap();
+    assert_eq!(records.as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn optional_recording_failure_does_not_fail_a_successful_task() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let home = root.join("cargo-home");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("target/.flux-compiler-units.json")).unwrap();
+    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='unavailable-records'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let output = cargo(root, &home, &["build", "--message-format=json"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("compiler provenance unavailable"));
+    assert!(root.join("target/.flux-compiler-units.json").is_dir());
+    // The build itself completed normally, and its real outputs remain reusable.
+    let output = cargo(root, &home, &["build", "--message-format=json"]);
+    assert!(
+        artifacts(&output)
+            .iter()
+            .all(|artifact| artifact["fresh"] == true)
+    );
 }

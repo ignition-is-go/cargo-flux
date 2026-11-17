@@ -10,7 +10,7 @@ mod storage;
 mod tasks;
 mod version;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command, ReportCommand};
 use graph::WorkspaceGraph;
@@ -34,7 +34,6 @@ fn main() -> Result<()> {
     if let Command::Storage { command } = &cli.command {
         let tasks = TaskRegistry::load(&root)?;
         match command {
-            cli::StorageCommand::Cargo { paths, args } => storage::cargo(&root, paths, args)?,
             cli::StorageCommand::CargoKey {
                 scope,
                 selection,
@@ -837,6 +836,11 @@ fn execute_task_with_output(
             let (program, args) = command
                 .split_first()
                 .ok_or_else(|| anyhow::anyhow!("resolved task command was empty"))?;
+            if let Some(recording) =
+                storage::prepare_cargo(program, args, cwd, variables, capture_stdout)
+            {
+                return recording.execute(capture_stdout);
+            }
             let mut cmd = std::process::Command::new(program);
             cmd.args(args);
             cmd
@@ -959,30 +963,12 @@ fn execute_unit(unit: &ExecutionUnit, _root: &std::path::Path) -> Result<()> {
             &resolved.variables,
         ),
         ExecutionUnit::Batch(batch) => {
-            let status = match &batch.command {
-                TaskCommand::Shell(command) => std::process::Command::new("sh")
-                    .arg("-lc")
-                    .arg(command)
-                    .current_dir(&batch.working_dir)
-                    .envs(&batch.variables)
-                    .status()?,
-                TaskCommand::Argv(command) => {
-                    let (program, args) = command
-                        .split_first()
-                        .ok_or_else(|| anyhow::anyhow!("batched task command was empty"))?;
-                    std::process::Command::new(program)
-                        .args(args)
-                        .current_dir(&batch.working_dir)
-                        .envs(&batch.variables)
-                        .status()?
-                }
-            };
-            anyhow::ensure!(
-                status.success(),
-                "batched task execution failed in {}",
-                batch.working_dir.display()
-            );
-            Ok(())
+            execute_task(&batch.command, &batch.working_dir, &batch.variables).with_context(|| {
+                format!(
+                    "batched task execution failed in {}",
+                    batch.working_dir.display()
+                )
+            })
         }
     }
 }

@@ -409,7 +409,7 @@ For compiler snapshots and cross-job artifacts, explicit storage operations use
 the same configured store, compressed archives and native S3 transport:
 
 ```bash
-cargo flux storage cargo --path target -- build --release
+cargo flux run build
 cargo flux storage save --compiler --key compiler-compatible-scope --path target
 cargo flux storage restore --key compiler-compatible-scope --path target
 cargo flux storage save --key artifacts/run-123/linux --path dist --path target/release/server
@@ -432,13 +432,18 @@ directly into one temporary snapshot; an index supports parallel extraction
 without temporary shard copies. Restored files are verified before promotion.
 All temporary archives and staging are removed on success or failure.
 
-Run each Cargo compilation through `storage cargo --path target -- <command>`
-to capture Cargo's JSON artifact reports before output aliases are replaced by
-another build. It preserves Cargo output and records successful local package
-identities with their actual compiler-unit fingerprints in
-`target/.flux-compiler-units.json`. Failed commands preserve prior provenance.
-Compiler saves require these records. Regular artifact saves keep their existing
-command syntax.
+Flux's existing task executor records optional package provenance for structured,
+non-interactive Cargo compilation commands. Root tasks, package tasks and batched
+Cargo tasks use the same execution path. Standard output and task-output capture
+retain their existing behavior. Interactive execution and opaque shell commands
+continue through their existing paths.
+
+The records bind Cargo's package identities to actual output file identities
+and compiler fingerprints in `.flux-compiler-units.json` inside each compiler
+cache directory. Failed builds preserve prior records. Unavailable or unwritable
+provenance leaves successful builds successful. Missing or invalid records leave
+unit identities unknown during snapshot selection. No new build command is
+required.
 
 Compiler snapshots saved with `--compiler` select Cargo units using declared
 package sources, enabled features and fingerprint dependency relationships.
