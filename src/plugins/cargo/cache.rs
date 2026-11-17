@@ -324,21 +324,28 @@ pub(super) struct Policy {
     manifests: Vec<PathBuf>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct Options {
+    #[serde(alias = "manifest-path")]
+    manifest_paths: Vec<PathBuf>,
+}
+
 impl Policy {
-    pub(super) fn from_options(options: &[String]) -> Result<Self> {
-        let mut manifests = Vec::new();
-        for option in options {
-            let (key, value) = option
-                .split_once('=')
-                .context("Cargo snapshot options must be KEY=VALUE")?;
-            ensure!(
-                key == "manifest-path",
-                "unknown Cargo snapshot option `{key}`"
-            );
-            ensure!(!value.is_empty(), "Cargo manifest-path must not be empty");
-            manifests.push(PathBuf::from(value));
-        }
-        Ok(Self { manifests })
+    pub(super) fn from_options(options: &toml::Table) -> Result<Self> {
+        let options: Options = toml::Value::Table(options.clone())
+            .try_into()
+            .context("invalid Cargo snapshot options")?;
+        ensure!(
+            options
+                .manifest_paths
+                .iter()
+                .all(|path| !path.as_os_str().is_empty()),
+            "Cargo manifest-path must not be empty"
+        );
+        Ok(Self {
+            manifests: options.manifest_paths,
+        })
     }
 }
 

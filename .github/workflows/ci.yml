@@ -61,6 +61,7 @@ jobs:
           cargo test --release --locked --target x86_64-pc-windows-msvc --bin cargo-flux storage::tests::timestamp_update_preserves_read_only_contents
           cargo test --release --locked --target x86_64-pc-windows-msvc --bin cargo-flux plugins::tests
           cargo test --release --locked --target x86_64-pc-windows-msvc --test storage artifact_cli_works_without_a_language_workspace
+          cargo test --release --locked --target x86_64-pc-windows-msvc --test storage named_snapshot
           cargo test --release --locked --target x86_64-pc-windows-msvc --test storage source_timestamp_restore_preserves_unchanged_sources_and_invalidates_older_changed_inputs
           cargo test --release --locked --target x86_64-pc-windows-msvc --test compiler_snapshot
       - uses: ignition-is-go/pulse-actions/actions/report-resources@2c94ebf4fedd47f0c36d491e0dee5ad446a071b5 # v1.0.0

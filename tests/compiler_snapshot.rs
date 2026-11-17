@@ -379,7 +379,14 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
             &["build", "--manifest-path", &format!("{name}/Cargo.toml")],
         );
     }
-    fs::write(root.join("flux.toml"), "").unwrap();
+    fs::write(root.join("flux.toml"), "[snapshots.shared]\nplugin='cargo'\npaths=['target']\n[snapshots.shared.options]\nmanifest_paths=['first/Cargo.toml','second/Cargo.toml']\n").unwrap();
+    success(
+        flux(
+            root,
+            &["storage", "save", "--snapshot", "shared", "--key", "shared"],
+        )
+        .env("CARGO_HOME", &home),
+    );
     success(
         flux(
             root,
@@ -389,7 +396,7 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
                 "--plugin",
                 "cargo",
                 "--key",
-                "shared",
+                "shared-cli",
                 "--path",
                 "target",
                 "--plugin-option",
@@ -408,8 +415,8 @@ fn shared_target_preserves_declared_workspaces_and_build_script_outputs() {
             "restore",
             "--key",
             "shared",
-            "--path",
-            "target",
+            "--snapshot",
+            "shared",
             "--required",
         ],
     ));

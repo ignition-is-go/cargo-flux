@@ -14,6 +14,7 @@ pub struct TaskRegistry {
     selections: BTreeMap<String, PackageSelection>,
     cache: crate::cache::Store,
     artifacts: BTreeMap<String, Vec<PathBuf>>,
+    snapshots: BTreeMap<String, crate::snapshot::Definition>,
 }
 
 impl TaskRegistry {
@@ -22,6 +23,12 @@ impl TaskRegistry {
             .get(name)
             .map(Vec::as_slice)
             .ok_or_else(|| anyhow!("undefined artifact contract `{name}`"))
+    }
+
+    pub(crate) fn snapshot(&self, name: &str) -> Result<&crate::snapshot::Definition> {
+        self.snapshots
+            .get(name)
+            .ok_or_else(|| anyhow!("undefined snapshot contract `{name}`"))
     }
 
     pub fn cache_store(&self) -> &crate::cache::Store {
@@ -49,6 +56,11 @@ impl TaskRegistry {
             .with_context(|| format!("failed to read task config {}", path.display()))?;
         let config = toml::from_str::<FluxConfig>(&content)
             .with_context(|| format!("failed to parse task config {}", path.display()))?;
+        for (name, snapshot) in &config.snapshots {
+            snapshot
+                .validate()
+                .with_context(|| format!("invalid snapshot contract `{name}`"))?;
+        }
         Ok(Self {
             tasks: config.tasks.unwrap_or_default(),
             channels: config.channels,
@@ -56,6 +68,7 @@ impl TaskRegistry {
             selections: config.selections,
             cache: config.cache,
             artifacts: config.artifacts,
+            snapshots: config.snapshots,
         })
     }
 
@@ -586,6 +599,8 @@ struct FluxConfig {
     cache: crate::cache::Store,
     #[serde(default)]
     artifacts: BTreeMap<String, Vec<PathBuf>>,
+    #[serde(default)]
+    snapshots: BTreeMap<String, crate::snapshot::Definition>,
     channels: Option<toml::Value>,
     #[serde(default)]
     affected: AffectedConfig,

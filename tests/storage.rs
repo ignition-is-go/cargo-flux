@@ -363,3 +363,152 @@ fn invalid_snapshot_provider_is_rejected_before_storage_changes() {
         );
     }
 }
+
+#[test]
+fn named_snapshots_round_trip_without_a_language_workspace() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let objects = tempfile::tempdir().unwrap();
+    let store = format!(
+        "[cache]\ndirectory={:?}\n",
+        objects.path().to_string_lossy()
+    );
+    fs::write(
+        source.path().join("flux.toml"),
+        format!("{store}[snapshots.bundle]\npaths=['dist']\n"),
+    )
+    .unwrap();
+    // Restore only consumes paths, even when a provider is unavailable and its
+    // opaque options have structured types rather than CLI string values.
+    fs::write(destination.path().join("flux.toml"), format!("{store}[snapshots.bundle]\npaths=['dist']\nplugin='unavailable'\n[snapshots.bundle.options]\nenabled=true\nsettings={{ count=2 }}\n")).unwrap();
+    fs::create_dir_all(source.path().join("dist/empty")).unwrap();
+    fs::write(source.path().join("dist/output"), "payload").unwrap();
+    flux(
+        source.path(),
+        &["storage", "save", "--snapshot", "bundle", "--key", "bundle"],
+    );
+    flux(
+        destination.path(),
+        &[
+            "storage",
+            "restore",
+            "--snapshot",
+            "bundle",
+            "--key",
+            "bundle",
+            "--required",
+            "--destination",
+            "prebuilt",
+        ],
+    );
+    assert_eq!(
+        fs::read(destination.path().join("prebuilt/dist/output")).unwrap(),
+        b"payload"
+    );
+    assert!(destination.path().join("prebuilt/dist/empty").is_dir());
+    assert!(source.path().join("dist/output").is_file());
+}
+
+#[test]
+fn invalid_named_snapshot_contracts_preserve_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("dist")).unwrap();
+    fs::write(root.path().join("dist/input"), "retained").unwrap();
+    for (config, message) in [
+        (
+            "[snapshots.bad]\npaths=[]\n",
+            "declare at least one storage path",
+        ),
+        ("[snapshots.bad]\npaths=['../dist']\n", "without traversal"),
+        (
+            "[snapshots.bad]\npaths=['dist']\n[snapshots.bad.options]\nanything=true\n",
+            "options require a plugin",
+        ),
+        (
+            "[snapshots.bad]\npaths=['dist']\nplguin='cargo'\n",
+            "unknown field",
+        ),
+        (
+            "[snapshots.bad]\npaths=['dist']\nplugin='missing'\n",
+            "unknown ecosystem plugin",
+        ),
+        (
+            "[snapshots.bad]\npaths=['dist']\nplugin='cargo'\n[snapshots.bad.options]\nmanifest_paths=true\n",
+            "invalid Cargo snapshot options",
+        ),
+        (
+            "[snapshots.bad]\npaths=['dist']\nplugin='cargo'\n[snapshots.bad.options]\nmanifest_pahts=['Cargo.toml']\n",
+            "invalid Cargo snapshot options",
+        ),
+        ("", "undefined snapshot contract"),
+    ] {
+        fs::write(root.path().join("flux.toml"), config).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-flux"))
+            .arg("--root")
+            .arg(root.path())
+            .args(["storage", "save", "--snapshot", "bad", "--key", "bad"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {config}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!root.path().join(".flux/cache").exists());
+        assert_eq!(
+            fs::read(root.path().join("dist/input")).unwrap(),
+            b"retained"
+        );
+    }
+}
+
+#[test]
+fn named_snapshot_contracts_cannot_be_mixed_with_inline_flags() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("flux.toml"),
+        "[snapshots.bundle]\npaths=['dist']\n",
+    )
+    .unwrap();
+    for command in ["save", "restore"] {
+        let flags = if command == "save" {
+            vec![
+                vec!["--path", "dist"],
+                vec!["--artifact", "bundle"],
+                vec!["--plugin", "cargo"],
+                vec![
+                    "--plugin",
+                    "cargo",
+                    "--plugin-option",
+                    "manifest-path=Cargo.toml",
+                ],
+            ]
+        } else {
+            vec![vec!["--path", "dist"], vec!["--artifact", "bundle"]]
+        };
+        for flags in flags {
+            let output = Command::new(env!("CARGO_BIN_EXE_cargo-flux"))
+                .arg("--root")
+                .arg(root.path())
+                .args([
+                    "storage",
+                    command,
+                    "--snapshot",
+                    "bundle",
+                    "--key",
+                    "bundle",
+                ])
+                .args(flags)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!root.path().join(".flux/cache").exists());
+        }
+    }
+}

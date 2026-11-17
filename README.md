@@ -441,6 +441,39 @@ verification and upload. Repeated `--plugin-option KEY=VALUE` arguments belong t
 the selected plugin; unsupported providers and options fail explicitly. Restore
 uses the archive alone and does not require a language plugin.
 
+Declare reusable snapshot contracts in `flux.toml` to share paths, plugin choice
+and plugin-owned options across invocations:
+
+```toml
+[snapshots.rust-build]
+plugin = "cargo"
+paths = ["target"]
+
+[snapshots.rust-build.options]
+manifest_paths = ["Cargo.toml"]
+
+[snapshots.assets]
+paths = ["dist"]
+```
+
+```bash
+cargo flux storage save --snapshot rust-build --key compiler-compatible-scope
+cargo flux storage restore --snapshot rust-build --key compiler-compatible-scope
+cargo flux storage save --snapshot assets --key artifacts/run-123/assets
+```
+
+Snapshot paths are relative to the workspace root. `--snapshot NAME` uses the
+whole named contract and cannot be combined with `--path` or `--artifact`, or
+with inline `--plugin`/`--plugin-option` save flags. Inline saves remain available
+for one-off use. A contract without a plugin includes all declared files and
+empty directories. The `options` table is passed intact to the selected plugin;
+Cargo accepts `manifest_paths` as an array, including multiple independent
+workspaces sharing one target directory. Unknown Cargo options and invalid types
+fail explicitly. CLI `manifest-path=PATH` remains supported as a repeated option.
+Restore reads only the named paths, without instantiating the plugin or requiring
+its metadata. Saving a snapshot does not delete local build outputs or schedule
+cleanup.
+
 The Cargo plugin records optional package provenance for structured,
 non-interactive Cargo compilation commands. Root tasks, package tasks and batched
 Cargo tasks use the same execution path. Standard output and task-output capture

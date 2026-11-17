@@ -37,7 +37,7 @@ impl ManifestPlugin for CargoPlugin {
 
     fn snapshot_policy(
         &self,
-        options: &[String],
+        options: &toml::Table,
     ) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
         Ok(Box::new(cache::Policy::from_options(options)?))
     }

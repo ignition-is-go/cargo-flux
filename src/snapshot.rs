@@ -18,3 +18,44 @@ pub(crate) struct SnapshotPlan {
     pub(crate) files: BTreeSet<PathBuf>,
     pub(crate) include_empty_directories: bool,
 }
+
+/// Generic snapshot contract. Only the selected plugin interprets `options`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Definition {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) plugin: Option<String>,
+    #[serde(default)]
+    pub(crate) options: toml::Table,
+}
+
+impl Definition {
+    pub(crate) fn validate(&self) -> Result<()> {
+        crate::storage::validate_paths(&self.paths)?;
+        anyhow::ensure!(
+            self.plugin.is_some() || self.options.is_empty(),
+            "snapshot options require a plugin"
+        );
+        Ok(())
+    }
+}
+
+/// CLI options are string lists; manifests can supply any plugin-defined TOML
+/// types. Repetition preserves every value, including manifest paths with '='.
+pub(crate) fn cli_options(options: &[String]) -> Result<toml::Table> {
+    use anyhow::Context;
+    let mut table = toml::Table::new();
+    for option in options {
+        let (key, value) = option
+            .split_once('=')
+            .context("snapshot options must be KEY=VALUE")?;
+        anyhow::ensure!(!key.is_empty(), "snapshot option key must not be empty");
+        table
+            .entry(key)
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("CLI options are lists")
+            .push(toml::Value::String(value.into()));
+    }
+    Ok(table)
+}

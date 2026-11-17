@@ -31,7 +31,7 @@ pub(crate) trait ManifestPlugin {
 
     fn snapshot_policy(
         &self,
-        _options: &[String],
+        _options: &toml::Table,
     ) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
         anyhow::bail!(
             "plugin `{}` does not support snapshot selection",
@@ -74,7 +74,7 @@ pub(crate) fn dispatch_entrypoint() -> Result<()> {
 
 pub(crate) fn snapshot_policy(
     name: &str,
-    options: &[String],
+    options: &toml::Table,
 ) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
     snapshot_policy_with(&default_plugins(), name, options)
 }
@@ -82,7 +82,7 @@ pub(crate) fn snapshot_policy(
 fn snapshot_policy_with(
     plugins: &[Box<dyn ManifestPlugin>],
     name: &str,
-    options: &[String],
+    options: &toml::Table,
 ) -> Result<Box<dyn crate::snapshot::SnapshotPolicy>> {
     plugins
         .iter()

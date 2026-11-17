@@ -86,15 +86,28 @@ fn main() -> Result<()> {
                 artifact,
                 plugin,
                 plugin_options,
+                snapshot,
             } => {
-                let paths = artifact
+                let contract = snapshot
                     .as_deref()
-                    .map(|name| tasks.artifact_paths(name))
-                    .transpose()?
-                    .unwrap_or(paths);
+                    .map(|name| tasks.snapshot(name))
+                    .transpose()?;
+                let paths = if let Some(contract) = contract {
+                    &contract.paths
+                } else {
+                    artifact
+                        .as_deref()
+                        .map(|name| tasks.artifact_paths(name))
+                        .transpose()?
+                        .unwrap_or(paths)
+                };
+                let cli_options = snapshot::cli_options(plugin_options)?;
+                let (plugin, options) = match contract {
+                    Some(contract) => (contract.plugin.as_deref(), &contract.options),
+                    None => (plugin.as_deref(), &cli_options),
+                };
                 let policy = plugin
-                    .as_deref()
-                    .map(|name| plugins::snapshot_policy(name, plugin_options))
+                    .map(|name| plugins::snapshot_policy(name, options))
                     .transpose()?;
                 storage::save(&root, tasks.cache_store(), key, paths, policy.as_deref())?;
             }
@@ -105,12 +118,17 @@ fn main() -> Result<()> {
                 destination,
                 required,
                 reserve_bytes,
+                snapshot,
             } => {
-                let paths = artifact
-                    .as_deref()
-                    .map(|name| tasks.artifact_paths(name))
-                    .transpose()?
-                    .unwrap_or(paths);
+                let paths = if let Some(name) = snapshot {
+                    &tasks.snapshot(name)?.paths
+                } else {
+                    artifact
+                        .as_deref()
+                        .map(|name| tasks.artifact_paths(name))
+                        .transpose()?
+                        .unwrap_or(paths)
+                };
                 storage::restore_into(
                     &root,
                     tasks.cache_store(),

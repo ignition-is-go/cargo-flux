@@ -48,10 +48,10 @@ impl ManifestPlugin for FixturePlugin {
         })
     }
 
-    fn snapshot_policy(&self, options: &[String]) -> Result<Box<dyn SnapshotPolicy>> {
+    fn snapshot_policy(&self, options: &toml::Table) -> Result<Box<dyn SnapshotPolicy>> {
         Ok(Box::new(FixturePolicy {
             state: self.state.clone(),
-            escape: options.iter().any(|option| option == "escape"),
+            escape: options.contains_key("escape"),
         }))
     }
 }
@@ -197,7 +197,7 @@ fn non_cargo_snapshot_policy_selects_files_without_changing_producer() -> Result
     std::fs::create_dir_all(source.path().join("dist/empty"))?;
     std::fs::write(source.path().join("dist/keep"), "useful")?;
     std::fs::write(source.path().join("dist/obsolete"), "old")?;
-    let policy = snapshot_policy_with(&plugins, "fixture", &[])?;
+    let policy = snapshot_policy_with(&plugins, "fixture", &toml::Table::new())?;
     crate::storage::save(
         &source.path().canonicalize()?,
         &store,
@@ -232,7 +232,7 @@ fn snapshot_policy_cannot_add_undeclared_files() -> Result<()> {
     std::fs::create_dir(source.path().join("dist"))?;
     std::fs::write(source.path().join("dist/keep"), "useful")?;
     std::fs::write(source.path().join("outside.txt"), "private")?;
-    let policy = snapshot_policy_with(&plugins, "fixture", &["escape".into()])?;
+    let policy = snapshot_policy_with(&plugins, "fixture", &toml::toml! { escape = true })?;
     let error = crate::storage::save(
         &source.path().canonicalize()?,
         &Default::default(),
@@ -249,10 +249,12 @@ fn snapshot_policy_cannot_add_undeclared_files() -> Result<()> {
 
 #[test]
 fn unsupported_capabilities_and_invalid_options_fail_explicitly() {
-    assert!(snapshot_policy("missing", &[]).is_err());
-    assert!(snapshot_policy("npm", &[]).is_err());
-    assert!(snapshot_policy("uv", &[]).is_err());
-    assert!(snapshot_policy("cargo", &["unknown=value".into()]).is_err());
-    assert!(snapshot_policy("cargo", &["manifest-path=".into()]).is_err());
-    assert!(snapshot_policy("cargo", &["manifest-path".into()]).is_err());
+    let empty = toml::Table::new();
+    assert!(snapshot_policy("missing", &empty).is_err());
+    assert!(snapshot_policy("npm", &empty).is_err());
+    assert!(snapshot_policy("uv", &empty).is_err());
+    assert!(snapshot_policy("cargo", &toml::toml! { unknown = ["value"] }).is_err());
+    assert!(snapshot_policy("cargo", &toml::toml! { manifest_paths = [""] }).is_err());
+    assert!(snapshot_policy("cargo", &toml::toml! { manifest_paths = true }).is_err());
+    assert!(crate::snapshot::cli_options(&["manifest-path".into()]).is_err());
 }
