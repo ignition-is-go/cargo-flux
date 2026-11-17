@@ -22,10 +22,12 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Normally wait for Linux `check`, `windows-check` and workflow validation to pass
-on the commit being merged. The [CI workflow](.github/workflows/ci.yml) defines
-the platform and published-binary compatibility checks. For platform-specific
-changes, record coverage for each affected platform.
+Normally wait for Linux `check` and `windows-check` to pass on the commit being
+merged. For workflow or action changes, also check
+[workflow validation](.github/workflows/workflow-validation.yml).
+The [CI workflow](.github/workflows/ci.yml) defines the platform and
+published-binary compatibility checks. For platform-specific changes, record
+coverage for each affected platform.
 
 For affected behavior, verify existing commands, configuration, cache keys and
 archive-reader compatibility. Check that reusable outputs stay warm and that
