@@ -1155,3 +1155,101 @@ fn compiler_capture_preserves_existing_wrappers_and_warm_unit_hashes() {
         }
     }
 }
+
+#[test]
+fn plain_cargo_snapshots_prune_removed_targets_and_keep_live_outputs_warm() {
+    let temporary = tempfile::Builder::new()
+        .prefix("flux plain Cargo layout ")
+        .tempdir()
+        .unwrap();
+    let root = temporary.path().join("project");
+    let target = root.join("target");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("examples")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\n[package]\nname='layout-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn value() -> u32 { 7 }\n").unwrap();
+    fs::write(root.join("examples/retired.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        root.join("flux.toml"),
+        format!(
+            "[cache]\ndirectory={:?}\n",
+            temporary.path().join("objects")
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("client/src")).unwrap();
+    fs::write(
+        root.join("client/Cargo.toml"),
+        "[workspace]\n[package]\nname='client-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(root.join("client/src/lib.rs"), "pub fn client() {}\n").unwrap();
+    success(
+        Command::new("cargo")
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_INCREMENTAL", "0")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .args(["test", "--offline", "--manifest-path", "client/Cargo.toml"]),
+    );
+    let mut build = Command::new("cargo");
+    build
+        .current_dir(&root)
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_INCREMENTAL", "0")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .args(["build", "--offline", "--message-format=json"]);
+    let initial = artifacts(&success(build.arg("--examples")));
+    let retired = initial
+        .iter()
+        .find(|artifact| artifact["target"]["name"] == "retired")
+        .unwrap();
+    let executable = retired["executable"].as_str().unwrap();
+    assert!(Path::new(executable).is_file());
+    fs::remove_file(root.join("examples/retired.rs")).unwrap();
+    let saved = success(&mut flux(
+        &root,
+        &[
+            "storage",
+            "save",
+            "--plugin",
+            "cargo",
+            "--plugin-option",
+            "manifest-path=Cargo.toml",
+            "--plugin-option",
+            "manifest-path=client/Cargo.toml",
+            "--key",
+            "layout",
+            "--path",
+            "target",
+        ],
+    ));
+    fs::remove_dir_all(&target).unwrap();
+    success(&mut flux(
+        &root,
+        &["storage", "restore", "--key", "layout", "--path", "target"],
+    ));
+    assert!(
+        !Path::new(executable).exists(),
+        "retired executable survived snapshot: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let warm = success(
+        Command::new("cargo")
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_INCREMENTAL", "0")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .args(["build", "--lib", "--offline", "--message-format=json"]),
+    );
+    let live = artifacts(&warm);
+    assert!(!live.is_empty());
+    assert!(live.iter().all(|artifact| artifact["fresh"] == true));
+}
